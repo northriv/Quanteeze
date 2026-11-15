@@ -109,6 +109,11 @@ class Prefetcher:
         self.advise = advise
         self._pool = ThreadPoolExecutor(threads, thread_name_prefix='ple-prefetch') if threads else None
 
+    def close(self):
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
+
     def _advised(self, located):
         if self._pool is None or not (_advising() if self.advise is None else self.advise):
             return False
@@ -310,6 +315,17 @@ def let_go():
     """Stop reading the host's copy of the tables; what was read stays with the model's tables."""
     while _HELD:
         _HELD.pop().close()
+
+
+def close_all():
+    """Stop active `HostCopy` readers and `Prefetcher` worker pools."""
+    let_go()
+    seen = set()
+    for p in list(_USED.values()):
+        if id(p) not in seen:
+            seen.add(id(p))
+            p.close()
+    _USED.clear()
 
 
 def _kept(rows):

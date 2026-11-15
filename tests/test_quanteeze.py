@@ -1403,6 +1403,156 @@ def test_host_copy_whole_and_by_rows(tmp_path):
         q2_experts.let_go(tmp_path)
 
 
+def test_uniform_bf16_on_demand_cached_checkpoint_and_host_copy(tmp_path, monkeypatch):
+    """Uniform bf16 on-demand materializes `QuantCache`, holds quantized experts in `HostCopy`, and
+    serves them (`host_served > 0`) matching `requant.lower_model` bit-for-bit."""
+    import mlx.nn as nn
+    from quanteeze import demand, q2_experts
+
+    monkeypatch.setenv('QUANTEEZE_QUANT_CACHE', str(tmp_path / 'qcache'))
+    mx.random.seed(404)
+    tensors = {}
+    for layer in range(2):
+        sw = SwitchGLU(input_dims=256, hidden_dims=256, num_experts=16, bias=False)
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            p = getattr(sw, proj)
+            p.weight = p.weight.astype(mx.bfloat16)
+            tensors[f'layers.{layer}.mlp.switch_mlp.{proj}.weight'] = p.weight
+    mx.eval(*tensors.values())
+    ckpt_dir = tmp_path / 'bf16_ckpt'
+    ckpt_dir.mkdir()
+    (ckpt_dir / 'config.json').write_text('{}', encoding='utf-8')
+    mx.save_safetensors(str(ckpt_dir / 'model.safetensors'), tensors)
+    bf16_bytes = sum(a.nbytes for a in tensors.values())
+
+    def make_bf16_model():
+        m = nn.Module()
+        m.layers = []
+        for _ in range(2):
+            sw = SwitchGLU(input_dims=256, hidden_dims=256, num_experts=16, bias=False)
+            for proj in ('gate_proj', 'up_proj', 'down_proj'):
+                p = getattr(sw, proj)
+                p.weight = p.weight.astype(mx.bfloat16)
+            mlp = nn.Module()
+            mlp.switch_mlp = sw
+            layer = nn.Module()
+            layer.mlp = mlp
+            m.layers.append(layer)
+        return m
+
+    m_ref = make_bf16_model()
+    cached = requant.cached_checkpoint(m_ref.layers, ckpt_dir, 4, 64)
+    assert isinstance(cached, requant.CachedCheckpoint)
+    for layer in range(2):
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            done_path = cached.path / f'{layer}.{proj}.done.npy'
+            assert done_path.exists()
+            assert bool(np.load(done_path).all())
+
+    calls = [0]
+    orig_quantize = requant.quantize
+
+    def counted_quantize(*args, **kwargs):
+        calls[0] += 1
+        return orig_quantize(*args, **kwargs)
+
+    monkeypatch.setattr(requant, 'quantize', counted_quantize)
+    cached2 = requant.cached_checkpoint(m_ref.layers, ckpt_dir, 4, 64)
+    assert isinstance(cached2, requant.CachedCheckpoint)
+    assert calls[0] == 0
+
+    requant.lower_model(m_ref.layers, ckpt_dir, 4, 64)
+    for layer in m_ref.layers:
+        expert_qmv.install_switch(layer.mlp.switch_mlp)
+
+    cached_bytes = sum(cached.nbytes(n) for n in cached.routed())
+    budget = int(cached_bytes * 12 // 16 + 1024)
+    m_ssd = make_bf16_model()
+    held = q2_experts.hold(cached, budget=budget, workers=2, by_rows=True)
+    dem = None
+    try:
+        held.wait()
+        assert held.by_rows
+        assert held.total < bf16_bytes // 2
+        assert list(held.expert_in[0]) == list(range(12))
+        dem = demand.Demand(m_ssd, cached, budget_bytes=1, workers=2)
+        assert dem._host() is held
+
+        x_host = mx.random.normal((1, 1, 256)).astype(mx.bfloat16)
+        idx_host = mx.array([[[8, 9, 10, 11]]], dtype=mx.uint32)
+        mx.eval(x_host, idx_host)
+        for layer_idx in range(2):
+            y_ref = m_ref.layers[layer_idx].mlp.switch_mlp(x_host, idx_host)
+            y_ssd = m_ssd.layers[layer_idx].mlp.switch_mlp(x_host, idx_host)
+            mx.eval(y_ref, y_ssd)
+            assert np.array_equal(
+                np.array(y_ssd.astype(mx.float32)),
+                np.array(y_ref.astype(mx.float32)),
+            )
+        assert dem.host_served == 8
+
+        x_disk = mx.random.normal((1, 1, 256)).astype(mx.bfloat16)
+        idx_disk = mx.array([[[12, 13, 14, 15]]], dtype=mx.uint32)
+        mx.eval(x_disk, idx_disk)
+        for layer_idx in range(2):
+            y_ref = m_ref.layers[layer_idx].mlp.switch_mlp(x_disk, idx_disk)
+            y_ssd = m_ssd.layers[layer_idx].mlp.switch_mlp(x_disk, idx_disk)
+            mx.eval(y_ref, y_ssd)
+            assert np.array_equal(
+                np.array(y_ssd.astype(mx.float32)),
+                np.array(y_ref.astype(mx.float32)),
+            )
+        assert dem.host_served == 8
+        assert dem.misses == 16
+    finally:
+        if dem is not None:
+            dem.close()
+        q2_experts.let_go(cached.path)
+
+
+def test_idle_false_during_host_copy_and_clean_shutdown_helpers(tmp_path, monkeypatch):
+    """`serve._idle()` stays False during active `HostCopy`, `Keeper.close()` joins promptly, and
+    `serve._terminated()` uses exit code 0 after graceful shutdown signalling."""
+    import concurrent.futures
+    import signal
+    import time
+    from quanteeze import guards, q2_experts, serve, shutdown
+
+    fut = concurrent.futures.Future()
+    fake_held = type('FakeHeld', (), {'reading': lambda self: not fut.done(), 'close': lambda self: None})()
+    monkeypatch.setitem(q2_experts._HELD, tmp_path / 'fake', fake_held)
+    monkeypatch.setitem(serve.control._SWITCH, 'inflight', 0)
+    monkeypatch.setitem(serve.control._SWITCH, 'busy', False)
+    monkeypatch.setattr(serve.progress, 'state', lambda: {'loading': False})
+    monkeypatch.setattr(serve.ngram_prefetch, 'unread', lambda: 0)
+
+    assert q2_experts.reading()
+    assert not serve._idle()
+    fut.set_result(None)
+    assert not q2_experts.reading()
+    assert serve._idle()
+
+    keeper = guards.Keeper(limit=100e9, poll=60.0, log=lambda _msg: None).start()
+    try:
+        assert keeper._thread.is_alive()
+    finally:
+        t0 = time.monotonic()
+        keeper.close()
+        elapsed = time.monotonic() - t0
+    assert not keeper._thread.is_alive()
+    assert elapsed < 2.0
+
+    monkeypatch.setitem(shutdown._STATE, 'signalled', True)
+    with pytest.raises(SystemExit) as exc_graceful:
+        serve._terminated(signal.SIGTERM, None)
+    assert exc_graceful.value.code == 0
+
+    monkeypatch.setitem(shutdown._STATE, 'signalled', False)
+    with pytest.raises(SystemExit) as exc_ungraceful:
+        serve._terminated(signal.SIGTERM, None)
+    assert exc_ungraceful.value.code == 128 + signal.SIGTERM
+
+
 
 
 

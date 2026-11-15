@@ -6,6 +6,7 @@ the least-used slots with exponential decay.
 """
 from concurrent.futures import ThreadPoolExecutor
 import sys
+import threading
 import time
 
 import mlx.core as mx
@@ -154,6 +155,8 @@ class Demand:
         self.workers = max(1, int(workers))
         self.prompt_room = None if not prompt_room else float(prompt_room)
         self._pool = ThreadPoolExecutor(self.workers, thread_name_prefix='demand-read')
+        self._stream_threads = set()
+        self._stream_lock = threading.Lock()
         self._free_least = cuda_ple.free_least()
         self._decode_steps = 0
         self._after_prefill = False
@@ -221,7 +224,7 @@ class Demand:
                     p_bits, p_gs, p_mode = _proj_meta(w, s, checkpoint.bits)
                 else:
                     p_mode = self.base.mode(l, p) or 'affine'
-                    _, in_d = _proj_dims(getattr(first_switch, p))
+                    _, in_d = _proj_dims(getattr(old_switch, p))
                     p_gs, p_bits = self.base.quantization(l, p, in_d)
                 projs[p] = Projection(w, s, b, p_gs, p_bits, mode=p_mode)
                 mx.eval(projs[p].parameters())
@@ -247,6 +250,8 @@ class Demand:
         return held if held is not None and held.by_rows else None
 
     def _read_one(self, layer, expert, worker_slot):
+        with self._stream_lock:
+            self._stream_threads.add(threading.get_ident())
         out = {}
         for p in PROJECTIONS:
             buf = self.buffers[(layer, p)][worker_slot]
@@ -432,5 +437,33 @@ class Demand:
         }
 
     def close(self):
-        self.base.forget()
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        if hasattr(self.base, 'close'):
+            self.base.close()
+        else:
+            self.base.forget()
+        clear = getattr(mx, 'clear_streams', None)
+        with self._stream_lock:
+            n = len(self._stream_threads)
+            self._stream_threads.clear()
+        if clear is not None and n > 0:
+            barrier = threading.Barrier(n, timeout=1.0)
+
+            def _release():
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    pass
+                clear()
+
+            futs = []
+            for _ in range(n):
+                try:
+                    futs.append(self._pool.submit(_release))
+                except RuntimeError:
+                    break
+            for fut in futs:
+                try:
+                    fut.result(timeout=2.0)
+                except Exception:
+                    pass
+        self._pool.shutdown(wait=True, cancel_futures=True)

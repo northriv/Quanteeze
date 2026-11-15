@@ -306,6 +306,6 @@ def ensure_active(argv=None):
     args = sys.argv[1:] if argv is None else list(argv)
     os.execve(
         sys.executable,
-        [sys.executable, '-c', 'from quanteeze.serve import main; main()', *args],
+        [sys.executable, '-m', 'quanteeze.serve', *args],
         env,
     )

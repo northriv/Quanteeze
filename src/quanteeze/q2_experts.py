@@ -230,6 +230,13 @@ class Checkpoint:
             pending.cancel()
         self._ahead.clear()
 
+    def close(self):
+        """Cancel pending read-ahead tasks and shut down the read-ahead worker pool."""
+        self.forget()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
+
     def held(self):
         """The host's copy of this checkpoint's experts (hold()), or None."""
         return _HELD.get(self.path)
@@ -294,6 +301,7 @@ class HostCopy:
         self.lock = threading.RLock()
         self.by_rows = bool(by_rows)
         self.layer_of, self.expert_in, self.slot_of, self.experts = {}, {}, {}, {}
+        self._layer_names = {}
         routed = [(layer, n) for layer, n in checkpoint.routed(layers=True) if layers is None or layer in layers]
         names = [n for _, n in routed]
         self.total = sum(checkpoint.nbytes(name) for name in names)
@@ -331,6 +339,7 @@ class HostCopy:
             self.slot_of[layer][ids] = np.arange(ids.size)
             if not ids.size:
                 continue
+            self._layer_names[layer] = tuple(layer_names)
             for name in layer_names:
                 _, dtype, shape, _ = checkpoint.tensors[name]
                 self.layer_of[name] = layer
@@ -382,10 +391,16 @@ class HostCopy:
         return slot_of is not None and slot_of[expert] >= 0
 
     def held_in(self, layer, experts):
-        """Of `experts`, those this copy holds in layer (by row; a whole tensor's copy: [])."""
+        """Of `experts`, those this copy holds and has finished reading in `layer` (by row)."""
         slot_of = self.slot_of.get(layer)
         experts = np.asarray(experts, np.int64).reshape(-1)
-        return experts[slot_of[experts] >= 0] if slot_of is not None else experts[:0]
+        if slot_of is None or not all(self._ready(n) for n in self._layer_names.get(layer, ())):
+            return experts[:0]
+        return experts[slot_of[experts] >= 0]
+
+    def reading(self):
+        """Whether any background read into `self.arrays` is still in flight."""
+        return any(not p.done() for p in list(self.pending.values()))
 
     def read(self):
         """Bytes held and read so far."""
@@ -404,12 +419,19 @@ class HostCopy:
 
 
 def hold(path, budget, workers, layers=None, by_rows=False):
-    """Hold checkpoint `path`'s routed experts in the host's memory (HostCopy), as many as `budget`
-    bytes take: one copy a checkpoint, whichever Checkpoint reads it."""
-    path = Path(path).expanduser().resolve()
-    if path not in _HELD:
-        _HELD[path] = HostCopy(Checkpoint(path), budget, workers, layers, by_rows)
-    return _HELD[path]
+    """Hold `path`'s (or a `Checkpoint` instance's) routed experts in the host's memory (`HostCopy`),
+    as many as `budget` bytes take: one copy per checkpoint path."""
+    ckpt = path if isinstance(path, Checkpoint) else None
+    resolved = ckpt.path if ckpt is not None else Path(path).expanduser().resolve()
+    if resolved not in _HELD:
+        _HELD[resolved] = HostCopy(ckpt if ckpt is not None else Checkpoint(resolved),
+                                   budget, workers, layers, by_rows)
+    return _HELD[resolved]
+
+
+def reading():
+    """Whether any checkpoint's `HostCopy` is still reading into host memory."""
+    return any(held.reading() for held in list(_HELD.values()))
 
 
 def let_go(path=None):

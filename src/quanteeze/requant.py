@@ -427,6 +427,23 @@ class QuantCache:
             p.result()
         return outs
 
+    def _write_rows(self, layer, projection, subset, arrays, total, done, done_path):
+        """Write computed `arrays` for `subset` rows to per-tensor `.npy` memmaps and update `done`."""
+        for name, a in zip(self.NAMES, arrays):
+            if a is None:
+                continue
+            rows = np.array(a.view(mx.uint16) if a.dtype == mx.bfloat16 else a)
+            path = self._path(layer, projection, name)
+            kept = np.load(path, mmap_mode='r+') if path.exists() else np.lib.format.open_memmap(
+                path, mode='w+', dtype=rows.dtype, shape=(total,) + rows.shape[1:])
+            kept[subset] = rows
+            kept.flush()
+            del kept
+        done[subset] = True
+        tmp = self.dir / f'{layer}.{projection}.done.{os.getpid()}.npy'
+        np.save(tmp, done)
+        os.replace(tmp, done_path)
+
     def get(self, layer, projection, experts, total, compute):
         experts = np.asarray(experts, np.int64)
         with open(self.dir / f'{layer}.{projection}.lock', 'a') as lock:
@@ -435,21 +452,7 @@ class QuantCache:
             done = np.load(done_path) if done_path.exists() else np.zeros(total, bool)
             missing = np.unique(experts[~done[experts]])
             if missing.size:
-                arrays = compute(missing)
-                for name, a in zip(self.NAMES, arrays):
-                    if a is None:
-                        continue
-                    rows = np.array(a.view(mx.uint16) if a.dtype == mx.bfloat16 else a)
-                    path = self._path(layer, projection, name)
-                    kept = np.load(path, mmap_mode='r+') if path.exists() else np.lib.format.open_memmap(
-                        path, mode='w+', dtype=rows.dtype, shape=(total,) + rows.shape[1:])
-                    kept[missing] = rows
-                    kept.flush()
-                    del kept
-                done[missing] = True
-                tmp = self.dir / f'{layer}.{projection}.done.{os.getpid()}.npy'
-                np.save(tmp, done)
-                os.replace(tmp, done_path)
+                self._write_rows(layer, projection, missing, compute(missing), total, done, done_path)
             present_names = [name for name in self.NAMES if self._path(layer, projection, name).exists()]
             loaded = dict(zip(present_names, self._rows([self._path(layer, projection, n) for n in present_names], experts)))
         weight_mx = mx.array(loaded['weight'])
@@ -459,6 +462,22 @@ class QuantCache:
         biases_mx = (None if biases_np is None
                      else (mx.array(biases_np).view(mx.bfloat16) if biases_np.dtype == np.uint16 else mx.array(biases_np)))
         return [weight_mx, scales_mx, biases_mx]
+
+    def ensure(self, layer, projection, total, compute, chunk=32):
+        """Ensure all `0..total-1` expert rows for `(layer, projection)` are materialized on disk."""
+        with open(self.dir / f'{layer}.{projection}.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            done_path = self._path(layer, projection, 'done')
+            done = np.load(done_path) if done_path.exists() else np.zeros(total, bool)
+            missing = np.flatnonzero(~done)
+            for start in range(0, missing.size, chunk):
+                sub = missing[start:start + chunk]
+                self._write_rows(layer, projection, sub, compute(sub), total, done, done_path)
+
+    def close(self):
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
 
 
 class Reader:
@@ -532,11 +551,12 @@ class Flat:
     _quantization = Reader._quantization
 
     def buffers(self, layer, projection):
-        return None
+        return self.base.buffers(layer, projection)
 
     def expert(self, layer, projection, expert, out=None, cache=True):
         """One expert's `[weight, scales, biases]` `[1, ...]` at `self.bits`, evaluated here."""
-        arrays = self.base.expert(layer, projection, expert, self.base.buffers(layer, projection), cache=cache)
+        buf = self.base.buffers(layer, projection) if out is None else out
+        arrays = self.base.expert(layer, projection, expert, buf, cache=cache)
         mode, group_size, bits = self._quantization(layer, projection)
         with self._lock:
             w = arrays[0] if mode is None else dequantize(*arrays, group_size=group_size, bits=bits, mode=mode)
@@ -574,7 +594,7 @@ def lower_model(layers, path, bits, group_size=None, on_layer=None):
             if not isinstance(proj, QuantizedSwitchLinear):
                 init_gs = eff_gs if eff_gs in (32, 64, 128) else 64
                 init_bits = eff_bits if eff_bits in (2, 3, 4, 8) else 4
-                proj = QuantizedSwitchLinear(n_experts, in_dims, out_dims, bias=False,
+                proj = QuantizedSwitchLinear(in_dims, out_dims, n_experts, bias=False,
                                              group_size=init_gs, bits=init_bits, mode='affine')
                 setattr(switch, p, proj)
             proj.weight = w
@@ -590,3 +610,76 @@ def lower_model(layers, path, bits, group_size=None, on_layer=None):
         mx.clear_cache()
         if on_layer is not None:
             on_layer(idx + 1, len(moe_layers))
+
+
+_NPY_TO_SAFETENSORS = {
+    np.dtype(np.uint8): 'U8',
+    np.dtype(np.uint16): 'BF16',
+    np.dtype(np.uint32): 'U32',
+    np.dtype(np.float16): 'F16',
+    np.dtype(np.float32): 'F32',
+}
+
+
+class CachedCheckpoint(q2_experts.Checkpoint):
+    """A materialized `QuantCache` directory exposed as a `q2_experts.Checkpoint` so `Demand` and
+    `HostCopy` stream and hold lowered `[weight, scales, biases]` directly."""
+
+    def __init__(self, reader, moe_indices):
+        self.base_path = reader.path
+        self.path = reader.cache.dir.resolve()
+        self.bits = reader.bits
+        self.group_size = reader.group_size
+        self.origin = reader.origin
+        self.template = reader.base.template
+        self.tensors = {}
+        self._pool, self._ahead = None, {}
+        for layer_idx in moe_indices:
+            for proj in PROJECTIONS:
+                for part in QuantCache.NAMES:
+                    npy_path = reader.cache._path(layer_idx, proj, part)
+                    if not npy_path.exists():
+                        continue
+                    offset, shape, dtype = reader.cache._header(npy_path)
+                    st_dtype = _NPY_TO_SAFETENSORS[np.dtype(dtype)]
+                    self.tensors[self.name(layer_idx, proj, part)] = (
+                        npy_path, st_dtype, tuple(shape), offset,
+                    )
+
+    def mode(self, layer, projection):
+        w_shape = self.tensors[self.name(layer, projection, 'weight')][2]
+        return self.bits if len(w_shape) == 4 else 'affine'
+
+    def quantization(self, layer, projection, input_dims):
+        from . import ggml_quants
+        w_shape = self.tensors[self.name(layer, projection, 'weight')][2]
+        if len(w_shape) == 4:
+            return 256, ggml_quants.FORMAT_BITS[self.bits]
+        eff_bits = ggml_quants.FORMAT_BITS[self.bits] if self.bits in GGML_MODES else int(self.bits)
+        scales_shape = self.tensors[self.name(layer, projection, 'scales')][2]
+        return input_dims // scales_shape[-1], eff_bits
+
+
+def cached_checkpoint(layers, path, bits, group_size=None, on_layer=None):
+    """Materialize uniform `bits` expert arrays for `layers` in `QuantCache` and return a
+    `CachedCheckpoint` (or `None` when `QUANTEEZE_QUANT_CACHE=off`)."""
+    from . import fitting
+    bits_spec = _norm_bits(bits)
+    gs_default = fitting.group_size(bits_spec) if group_size is None else int(group_size)
+    reader = Reader(path, bits_spec, gs_default)
+    if reader.cache is None:
+        return None
+    moe_indices = [i for i, layer in enumerate(layers) if arch.switch_of(layer) is not None]
+    for idx, layer_idx in enumerate(moe_indices):
+        n_experts = reader.count(layer_idx, 'gate_proj')
+        for p in PROJECTIONS:
+            reader.cache.ensure(
+                layer_idx, p, n_experts,
+                lambda ids, l=layer_idx, proj=p: reader._computed(l, proj, ids),
+                chunk=reader.chunk,
+            )
+        mx.clear_cache()
+        if on_layer is not None:
+            on_layer(idx + 1, len(moe_indices))
+    reader.cache.close()
+    return CachedCheckpoint(reader, moe_indices)

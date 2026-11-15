@@ -358,6 +358,8 @@ class Keeper:
         self.stopped = None
         self.sheds = 0
         self.peak = 0
+        self._stop_event = None
+        self._thread = None
 
     @classmethod
     def from_env(cls, **kwargs):
@@ -450,16 +452,31 @@ class Keeper:
 
     def start(self):
         import threading
+        self._stop_event = threading.Event()
 
         def run():
-            while True:
+            while not self._stop_event.is_set():
                 try:
                     self.check()
                 except Exception as e:
                     self.log(f'quanteeze: memory: the keeper\'s reading failed ({type(e).__name__}: {e})')
-                time.sleep(self.poll)
-        threading.Thread(target=run, name='quanteeze-keeper', daemon=True).start()
+                self._stop_event.wait(self.poll)
+            clear = getattr(__import__('mlx.core', fromlist=['clear_streams']), 'clear_streams', None)
+            if clear is not None:
+                try:
+                    clear()
+                except Exception:
+                    pass
+
+        self._thread = threading.Thread(target=run, name='quanteeze-keeper', daemon=True)
+        self._thread.start()
         return self
+
+    def close(self):
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive() and self._thread is not __import__('threading').current_thread():
+            self._thread.join(timeout=2.0)
 
     def state(self):
         held = self.readings.footprint()

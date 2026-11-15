@@ -387,9 +387,26 @@ def _load_serving(*args, **kwargs):
         expert_bytes = experts_bytes / (len(switches) * n_experts)
         if _ADMISSION[0] is not None:
             _ADMISSION[0].fixed = 2 * expert_bytes * n_experts
-        source = (experts_gguf if experts_gguf is not None
-                  else requant.Flat(path, *uniform) if uniform
-                  else q2_experts.Checkpoint(path))
+        if experts_gguf is not None:
+            source = experts_gguf
+        elif uniform:
+            t0 = time.time()
+            progress.phase('experts', len(switches), 'MoE layers')
+            source = requant.cached_checkpoint(
+                layers, path, *uniform,
+                on_layer=lambda done, _total: progress.advance(done),
+            )
+            if source is not None:
+                mx.clear_cache()
+                print(
+                    f'quanteeze: lowered experts for {len(switches)} MoE layers of {kind} at '
+                    f'{_uniform_label(uniform)} cached in {source.path} ({time.time() - t0:.1f} s)',
+                    file=sys.stderr, flush=True,
+                )
+            else:
+                source = requant.Flat(path, *uniform)
+        else:
+            source = q2_experts.Checkpoint(path)
         prompt_room = (None if variables.off('QUANTEEZE_DEMAND_PROMPT_GB')
                        else variables.number('QUANTEEZE_DEMAND_PROMPT_GB') * 1e9)
         served = demand.Demand(
@@ -416,8 +433,8 @@ def _load_serving(*args, **kwargs):
             prefill.widen(PromptProcessingBatch, layered)
             print(f'quanteeze: on demand, a prompt goes through the model a layer at a time, up to '
                   f'{layered} tokens at once', file=sys.stderr, flush=True)
-        if experts_gguf is None:
-            _hold_experts(path, 2 * expert_bytes * n_experts)
+        if isinstance(source, q2_experts.Checkpoint):
+            _hold_experts(source, 2 * expert_bytes * n_experts)
         mx.clear_cache()
         print(
             f'quanteeze: serving {kind} '
@@ -610,7 +627,38 @@ def _served(model):
     return any(c.get('model') is model for c in caches)
 
 
-atexit.register(lambda: [fn() for fn in list(_AT_EXIT.values())])
+def _run_exit_summaries():
+    fns = list(_AT_EXIT.values())
+    _AT_EXIT.clear()
+    for fn in fns:
+        fn()
+
+
+def _shutdown_serving():
+    _run_exit_summaries()
+    if _KEEPER[0] is not None:
+        _KEEPER[0].close()
+        _KEEPER[0] = None
+    try:
+        vlm = importlib.import_module('mlx_vlm.server.app')
+        vlm.unload_model_sync()
+    except Exception:
+        pass
+    _let_go()
+    ngram_prefetch.close_all()
+    try:
+        mx.synchronize()
+    except Exception:
+        pass
+    clear = getattr(mx, 'clear_streams', None)
+    if clear is not None:
+        try:
+            clear()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_serving)
 
 
 def _failures_let_go(gen):
@@ -658,12 +706,14 @@ def _host_by_rows(path, by=None):
     return not (value == 'layers' or (value == 'auto' and q2_experts.on_network(path)))
 
 
-def _hold_experts(path, passing=0):
+def _hold_experts(source_or_path, passing=0):
+    ckpt = source_or_path if isinstance(source_or_path, q2_experts.Checkpoint) else None
+    check_path = str(ckpt.path) if ckpt is not None else source_or_path
     value = (variables.get('QUANTEEZE_HOST_EXPERTS_GB') or 'auto').strip().lower()
     if value == 'off':
         return None
     if value == 'auto':
-        if mx.metal.is_available() or mx.default_device() != mx.gpu or q2_experts.in_memory(path):
+        if mx.metal.is_available() or mx.default_device() != mx.gpu or q2_experts.in_memory(check_path):
             return None
         budget = (fitting.host_room() or 0) - ngram_prefetch.unread() - passing - HELD_AFTER
         if budget <= 0:
@@ -671,9 +721,9 @@ def _hold_experts(path, passing=0):
     else:
         budget = float(value) * 1e9
     t = time.time()
-    by_rows = _host_by_rows(path)
-    held = q2_experts.hold(path, budget, variables.integer('QUANTEEZE_READ_THREADS'),
-                           parallel.owned(), by_rows)
+    by_rows = _host_by_rows(check_path)
+    held = q2_experts.hold(ckpt if ckpt is not None else check_path, budget,
+                           variables.integer('QUANTEEZE_READ_THREADS'), parallel.owned(), by_rows)
     if not held.bytes:
         return None
     if held.by_rows:
@@ -946,7 +996,13 @@ def _cache_eval_when_batched(generator_cls):
 
 
 def _idle():
-    return control._SWITCH['inflight'] == 0 and not control._SWITCH['busy'] and not progress.state()['loading']
+    return (
+        control._SWITCH['inflight'] == 0
+        and not control._SWITCH['busy']
+        and not progress.state()['loading']
+        and not q2_experts.reading()
+        and not ngram_prefetch.unread()
+    )
 
 
 def _shed():
@@ -979,7 +1035,7 @@ def _keep_memory():
 
 
 def _terminated(sig, frame):
-    raise SystemExit(128 + sig)
+    raise SystemExit(0 if shutdown._STATE['signalled'] else 128 + sig)
 
 
 def _numpy_huge_pages():
@@ -1050,6 +1106,12 @@ def _extract_cli_flags(argv):
 def main():
     sys.argv = _extract_cli_flags(sys.argv)
     alloc_msg = allocator.ensure_active(sys.argv[1:])
+    if sys.platform.startswith('linux'):
+        try:
+            import ctypes
+            ctypes.CDLL(None).prctl(15, b'quanteeze', 0, 0, 0)
+        except Exception:
+            pass
     signal.signal(signal.SIGTERM, _terminated)
     import faulthandler
     faulthandler.register(signal.SIGUSR1, all_threads=True)
@@ -1224,7 +1286,10 @@ def main():
     print(f'quanteeze: control routes ask for a token; Browser UI at '
           f'{page.replace(control.PAGE_PATH, control.HOME_PATH, 1)}, all settings at {page}',
           file=sys.stderr, flush=True)
-    _serve()
+    try:
+        _serve()
+    finally:
+        _shutdown_serving()
 
 
 if __name__ == '__main__':
