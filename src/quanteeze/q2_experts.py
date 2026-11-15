@@ -379,10 +379,11 @@ class HostCopy:
             if slots is None:
                 return None
             held = self.arrays[name]
-            if rows is None and self.layer_of.get(name) is None:
+            layer = self.layer_of.get(name)
+            if rows is None and (layer is None or held.shape[0] == self.slot_of[layer].size):
                 if out is None:
                     return held.copy()
-                out[...] = held
+                out[:held.shape[0]] = held
                 return out
             return np.take(held, slots, axis=0, out=out, mode='clip')
 
@@ -397,6 +398,54 @@ class HostCopy:
         if slot_of is None or not all(self._ready(n) for n in self._layer_names.get(layer, ())):
             return experts[:0]
         return experts[slot_of[experts] >= 0]
+
+    def holds_layer(self, layer):
+        """Whether this `by_rows` copy holds every expert of `layer` and has finished reading it."""
+        with self.lock:
+            slot_of = self.slot_of.get(layer)
+            names = self._layer_names.get(layer, ())
+            if slot_of is None or not names:
+                return False
+            return (
+                self.arrays[names[0]].shape[0] == slot_of.size
+                and all(self._ready(n) for n in names)
+            )
+
+    def copy_layer(self, layer, experts, targets):
+        """Copy `experts` (all of `layer` when None) into `[(tensor_name, out_view), ...]` under one
+        lock acquisition; returns True when every target was copied or False if any is missing."""
+        if not targets:
+            return True
+        with self.lock:
+            slot_of = self.slot_of.get(layer)
+            if slot_of is None or not all(self._ready(name) for name, _ in targets):
+                return False
+            if experts is None:
+                slots = slot_of
+            else:
+                exp_arr = np.asarray(experts, np.int64).reshape(-1)
+                if exp_arr.size and (exp_arr.min() < 0 or exp_arr.max() >= slot_of.size):
+                    raise IndexError(
+                        f'{self.path}: layer {layer}: rows {exp_arr.min()}..{exp_arr.max()} of {slot_of.size}'
+                    )
+                slots = slot_of[exp_arr] if exp_arr.size else exp_arr
+            if (slots < 0).any():
+                return False
+            m = int(slots.size)
+            if m == 0:
+                return True
+            first_held = self.arrays[targets[0][0]]
+            is_full = (
+                m == first_held.shape[0]
+                and (experts is None or np.array_equal(slots, np.arange(m, dtype=np.int64)))
+            )
+            for name, out in targets:
+                held = self.arrays[name]
+                if is_full:
+                    out[:m] = held
+                else:
+                    np.take(held, slots, axis=0, out=out[:m], mode='clip')
+            return True
 
     def reading(self):
         """Whether any background read into `self.arrays` is still in flight."""

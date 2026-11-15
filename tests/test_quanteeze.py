@@ -1691,6 +1691,256 @@ def test_advise_host_staging_and_cuda_experts_projection(monkeypatch):
     assert cuda_experts._projection(proj, 128, mx.bfloat16) is True
 
 
+def test_prefill_layer_reuse_no_ahead_leak_and_cuda_device_donate(tmp_path, monkeypatch):
+    """Layer-at-a-time prefill loads each MoE layer once across windows, frees `_ahead` / staging
+    buffers after the last layer, and separates `prefill_read_s` from decode `read_s`."""
+    import mlx.nn as nn
+    from quanteeze import demand, prefill, q2_experts
+
+    class DummyCache:
+        def __init__(self):
+            self.offset = 0
+            self.max_size = None
+
+    class SplitMoELayer(nn.Module):
+        def __init__(self, sw):
+            super().__init__()
+            mlp = nn.Module()
+            mlp.switch_mlp = sw
+            mlp.top_k = 4
+            self.mlp = mlp
+
+        def _pre(self, x, idx, cache=None):
+            if cache is not None:
+                cache.offset += x.shape[1]
+            return x, idx
+
+        def _post(self, x, idx):
+            return self.mlp.switch_mlp(x, idx).sum(axis=-2)
+
+        def __call__(self, x, idx, cache=None):
+            h, i = self._pre(x, idx, cache=cache)
+            return self._post(h, i)
+
+    class ToyLM(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.layers = layers
+
+        def make_cache(self):
+            return [DummyCache() for _ in self.layers]
+
+    prefill.split(SplitMoELayer, SplitMoELayer._pre, SplitMoELayer._post)
+
+    mx.random.seed(606)
+    tensors = {}
+    for layer_idx in range(2):
+        sw = SwitchGLU(input_dims=256, hidden_dims=256, num_experts=16, bias=False)
+        nn.quantize(sw, group_size=64, bits=4)
+        for p_name in ('gate_proj', 'up_proj', 'down_proj'):
+            p = getattr(sw, p_name)
+            for part in ('weight', 'scales', 'biases'):
+                tensors[f'layers.{layer_idx}.mlp.switch_mlp.{p_name}.{part}'] = getattr(p, part)
+    mx.eval(*tensors.values())
+    (tmp_path / 'config.json').write_text('{}', encoding='utf-8')
+    mx.save_safetensors(str(tmp_path / 'model.safetensors'), tensors)
+
+    def make_model():
+        layers = []
+        for layer_idx in range(2):
+            sw = SwitchGLU(input_dims=256, hidden_dims=256, num_experts=16, bias=False)
+            nn.quantize(sw, group_size=64, bits=4)
+            for p_name in ('gate_proj', 'up_proj', 'down_proj'):
+                p = getattr(sw, p_name)
+                for part in ('weight', 'scales', 'biases'):
+                    setattr(p, part, tensors[f'layers.{layer_idx}.mlp.switch_mlp.{p_name}.{part}'])
+            layers.append(SplitMoELayer(sw))
+        return ToyLM(layers)
+
+    m_ref = make_model()
+    for layer_mod in m_ref.layers:
+        expert_qmv.install_switch(layer_mod.mlp.switch_mlp)
+
+    m_ssd = make_model()
+    ckpt = q2_experts.Checkpoint(tmp_path)
+    held = q2_experts.hold(ckpt, budget=10**9, workers=2, by_rows=True)
+    dem = None
+    prefill.JOINS.clear()
+    prefill.times(reset=True)
+    monkeypatch.setenv('QUANTEEZE_PROMPT_MOE_TOKENS', '32')
+    monkeypatch.setattr(demand.mx.metal, 'is_available', lambda: False)
+    try:
+        held.wait()
+        assert held.holds_layer(0) and held.holds_layer(1)
+
+        sample_key = ckpt.name(0, 'gate_proj', 'weight')
+        full_buf = np.empty_like(held.arrays[sample_key])
+        assert held.copy_layer(0, None, [(sample_key, full_buf)]) is True
+        assert np.array_equal(full_buf, np.asarray(tensors[sample_key]))
+        sub_buf = np.empty((3,) + held.arrays[sample_key].shape[1:], dtype=held.arrays[sample_key].dtype)
+        assert held.copy_layer(0, [2, 5, 11], [(sample_key, sub_buf)]) is True
+        assert np.array_equal(sub_buf, np.asarray(tensors[sample_key])[[2, 5, 11]])
+
+        dem = demand.Demand(m_ssd, ckpt, budget_bytes=1, workers=2)
+        assert dem.slots == 8
+        prefill.install(m_ssd.layers, chunk=16, enabled=lambda: True)
+
+        prompt_len = 68
+        x = mx.random.normal((1, prompt_len, 256)).astype(mx.bfloat16)
+        idx = mx.array((np.arange(prompt_len * 4, dtype=np.uint32).reshape(1, prompt_len, 4)) % 16)
+        mx.eval(x, idx)
+
+        c_ref = m_ref.make_cache()
+        c_ref_parts = m_ref.make_cache()
+        c_ssd = m_ssd.make_cache()
+        h_ref, h_ref_parts, h_ssd = x, x, x
+        parts = [(0, 16), (16, 32), (32, 48), (48, 64), (64, 68)]
+        for l_idx in range(2):
+            h_ref = m_ref.layers[l_idx](h_ref, idx, cache=c_ref[l_idx])
+            h_ref_parts = mx.concatenate(
+                [
+                    m_ref.layers[l_idx](h_ref_parts[:, a:b], idx[:, a:b], cache=c_ref_parts[l_idx])
+                    for a, b in parts
+                ],
+                axis=1,
+            )
+            h_ssd = m_ssd.layers[l_idx](h_ssd, idx, cache=c_ssd[l_idx])
+        mx.eval(h_ref, h_ref_parts, h_ssd)
+        np.testing.assert_allclose(
+            np.array(h_ssd.astype(mx.float32)),
+            np.array(h_ref.astype(mx.float32)),
+            rtol=2e-2,
+            atol=2e-4,
+        )
+        assert np.array_equal(
+            np.array(h_ssd.astype(mx.float32)),
+            np.array(h_ref_parts.astype(mx.float32)),
+        )
+
+        assert dem.prefill_layers == 2
+        assert dem.hits == 0 and dem.misses == 0
+        assert dem.read_s == 0.0
+        assert dem.prefill_read_s > 0.0
+        assert 'prefill_read_s' in dem.summary()
+        assert len(ckpt._ahead) == 0
+        assert len(dem._prefill_stage) == 0
+        assert len(dem._prefill_dev) == 0
+        assert dem._prefill_active is None
+
+        # Decode step on uncached experts records decode read_s and misses separately.
+        x_dec = mx.random.normal((1, 1, 256)).astype(mx.bfloat16)
+        uncached_exps = sorted(set(range(16)) - set(int(e) for e in dem.switches[0].experts))[:4]
+        idx_dec = mx.array([[uncached_exps]], dtype=mx.uint32)
+        mx.eval(x_dec, idx_dec)
+        y_dec_ref = m_ref.layers[0].mlp.switch_mlp(x_dec, idx_dec)
+        y_dec_ssd = m_ssd.layers[0].mlp.switch_mlp(x_dec, idx_dec)
+        mx.eval(y_dec_ref, y_dec_ssd)
+        assert np.array_equal(
+            np.array(y_dec_ssd.astype(mx.float32)),
+            np.array(y_dec_ref.astype(mx.float32)),
+        )
+        assert dem.misses == 4
+        assert dem.host_served == 4
+        assert dem.read_s > 0.0
+    finally:
+        prefill.release()
+        if dem is not None:
+            dem.close()
+        q2_experts.let_go(ckpt.path)
+
+
+def test_efforts_qwen36_preopened_response_template_and_chat_template_kwargs():
+    """`efforts.install` propagates `chat_template_kwargs.enable_thinking` and supplies the
+    pre-opened `<think>\\n` prefix to `response_template` streaming and non-streaming parsers."""
+    import importlib
+    from mlx_vlm.server import generation
+    from mlx_vlm.server.schemas import ChatRequest
+    from transformers.utils.chat_parsing.response_parser import ResponseParser
+    from quanteeze import efforts
+
+    efforts.install(generation.GenerationArguments)
+    efforts.install(generation.GenerationArguments)
+
+    app_mod = importlib.import_module('mlx_vlm.server.app')
+    openai_mod = importlib.import_module('mlx_vlm.server.openai')
+    resp_state = importlib.import_module('mlx_vlm.server.responses_state')
+
+    req_on = ChatRequest(
+        model='qwen3.6',
+        messages=[{'role': 'user', 'content': 'solve'}],
+        chat_template_kwargs={'enable_thinking': True},
+    )
+    assert app_mod._build_gen_args(req_on).enable_thinking is True
+
+    req_explicit_off = ChatRequest(
+        model='qwen3.6',
+        messages=[{'role': 'user', 'content': 'solve'}],
+        enable_thinking=False,
+        chat_template_kwargs={'enable_thinking': True},
+    )
+    assert app_mod._build_gen_args(req_explicit_off).enable_thinking is False
+
+    qwen36_template = {
+        'version': 1,
+        'start_anchor': '<|im_start|>assistant\n',
+        'defaults': {'content': None, 'reasoning_content': None},
+        'fields': {
+            'reasoning_content': {
+                'open': '<think>\n',
+                'close': '</think>\n\n',
+                'optional': True,
+            },
+            'content': {},
+        },
+    }
+
+    class FakeTokenizer:
+        response_template = qwen36_template
+
+        def get_response_parser(self, prefix=None):
+            return ResponseParser(self.response_template, prefix=prefix)
+
+        def parse_response(self, text, prefix=None):
+            parser = self.get_response_parser(prefix=prefix)
+            parser.feed(text)
+            parsed, _ = parser.finalize()
+            return parsed
+
+    processor = type('FakeProcessor', (), {'tokenizer': FakeTokenizer()})()
+
+    state = openai_mod.make_response_stream_state(processor, enable_thinking=True)
+    reasoning_parts, content_parts = [], []
+    closed = False
+    chunks = ['Let us ', 'compute 5+5=10.\n', '</think>', '\n\n', '10']
+    for i, tok in enumerate(chunks):
+        delta = state.feed(tok, last=(i == len(chunks) - 1))
+        if delta.reasoning:
+            reasoning_parts.append(delta.reasoning)
+        if delta.content:
+            content_parts.append(delta.content)
+        if delta.thinking_closed:
+            closed = True
+    assert ''.join(reasoning_parts) == 'Let us compute 5+5=10.\n'
+    assert closed is True
+    assert ''.join(content_parts) == '10'
+
+    state_off = openai_mod.make_response_stream_state(processor, enable_thinking=False)
+    delta_off = state_off.feed('10', last=True)
+    assert delta_off.reasoning is None
+    assert delta_off.content == '10'
+
+    full_text = 'Let us compute 5+5=10.\n</think>\n\n10'
+    assert app_mod._split_thinking(full_text, starts_in_thinking=True, processor=processor) == (
+        'Let us compute 5+5=10.', '10'
+    )
+    assert resp_state._split_thinking(full_text, starts_in_thinking=True, processor=processor) == (
+        'Let us compute 5+5=10.', '10'
+    )
+    assert app_mod._split_thinking(full_text, starts_in_thinking=False, processor=processor) == (
+        'Let us compute 5+5=10.', '10'
+    )
+
+
 
 
 

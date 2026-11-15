@@ -14,7 +14,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx_vlm.models.linear import DECODE_BLOCK_SIZE
 
-from . import arch, expert_qmv, q2_experts, requant
+from . import arch, expert_qmv, prefill, q2_experts, requant
 from .q2_experts import NAMES, PROJECTIONS
 
 DECAY = 0.999
@@ -64,7 +64,7 @@ class Projection(nn.Module):
                              sorted_indices=sorted_indices)
 
 
-_STAGE_RING = 4
+_STAGE_RING = 8
 
 
 def _to_device(arr):
@@ -99,8 +99,23 @@ class DemandSwitchGLU(nn.Module):
         self.experts = np.array(experts, dtype=np.int64, copy=True)
         self.route = np.full(num_experts, -1, np.int64)
         self.route[self.experts] = np.arange(self.experts.size)
-        self._local = _to_device(mx.array(np.maximum(self.route, 0).astype(np.uint32)))
+        self._identity = (
+            demand is None
+            and self.experts.size == num_experts
+            and np.array_equal(self.experts, np.arange(num_experts, dtype=np.int64))
+        )
+        if self._identity:
+            self._local = None
+        elif demand is None:
+            self._local = mx.array(np.maximum(self.route, 0).astype(np.uint32))
+        else:
+            self._local = _to_device(mx.array(np.maximum(self.route, 0).astype(np.uint32)))
         self.freeze()
+
+    def _local_indices(self, indices):
+        if self._identity:
+            return indices if indices.dtype == mx.uint32 else indices.astype(mx.uint32)
+        return self._local[indices]
 
     def place_many(self, slots, experts, arrays_by_proj):
         """Write `arrays_by_proj` (`{proj: [weight, scales, biases]}`) for `experts` into `slots`
@@ -149,6 +164,7 @@ class DemandSwitchGLU(nn.Module):
         self.experts = np.array(experts, dtype=np.int64, copy=True)
         self.route.fill(-1)
         self.route[self.experts] = np.arange(self.experts.size)
+        self._identity = False
         written = []
         for p in PROJECTIONS:
             proj = getattr(self, p)
@@ -286,7 +302,11 @@ class Demand:
         self.misses = 0
         self.prefill_layers = 0
         self.read_s = 0.0
+        self.prefill_read_s = 0.0
         self.host_served = 0
+        self._prefill_stage = {}
+        self._prefill_dev = {}
+        self._prefill_active = None
 
         init_ids = np.arange(self.slots, dtype=np.int64)
         reader = requant.Reader(self.base.path, checkpoint.bits, gs) if isinstance(checkpoint, requant.Flat) else self.base
@@ -346,6 +366,7 @@ class Demand:
         m = int(in_host.size)
         cap = max(8, 1 << max(0, m - 1).bit_length())
         copied = {}
+        targets = []
         for p in PROJECTIONS:
             parts = []
             for part in NAMES:
@@ -368,10 +389,246 @@ class Demand:
                     entry = (mlx_arr, np_view, adv)
                     self._stage_ring[ring][key] = entry
                 mlx_arr, np_view, _ = entry
-                self.base._read(t_name, in_host, cache=True, out=np_view[:m])
+                targets.append((t_name, np_view[:m]))
                 parts.append(q2_experts._as_mlx(mlx_arr[:m], st_dtype))
             copied[p] = parts
+        host = self._host()
+        if targets:
+            if host is None or not host.copy_layer(layer, in_host, targets):
+                for t_name, out_view in targets:
+                    self.base._read(t_name, in_host, cache=True, out=out_view)
         return ring, copied
+
+    def _has_tensor_table(self):
+        return (
+            not isinstance(self.checkpoint, requant.Flat)
+            and hasattr(self.base, 'tensors')
+            and hasattr(self.base, '_read')
+        )
+
+    def _prefill_cap(self):
+        prompt_cap = self.num_experts if not self.prompt_room else max(1, int(self.prompt_room // self.per_expert))
+        if not mx.metal.is_available() and mx.default_device() == mx.gpu:
+            from . import cuda_ple
+            if not self._prefill_dev:
+                mx.clear_cache()
+            room = cuda_ple.gpu_room()
+            if room is not None:
+                held_dev = sum(int(a.nbytes) for a in self._prefill_dev.values())
+                avail = int(room[0]) + int(room[1]) + held_dev
+                reserve = max(int(self._free_least or 0), 256 << 20)
+                usable = avail - reserve if avail > reserve else avail // 2
+                vram_cap = max(8, self.slots // 2, int(usable // self.per_expert))
+                return min(prompt_cap, vram_cap)
+        return prompt_cap
+
+    def _load_prefill_projs(self, layer, switch, expert_ids, cap_rows):
+        from . import cuda_ple
+        exp_ids = np.asarray(expert_ids, np.int64).reshape(-1)
+        m = int(exp_ids.size)
+        cap_rows = max(m, int(cap_rows))
+        on_cuda = not mx.metal.is_available() and mx.default_device() == mx.gpu
+        t_read = time.perf_counter()
+        if not self._has_tensor_table():
+            reader = (
+                requant.Reader(self.base.path, self.checkpoint.bits, self.checkpoint.group_size)
+                if isinstance(self.checkpoint, requant.Flat) else self.base
+            )
+            projs = {}
+            for p in PROJECTIONS:
+                w, s, b = reader.experts(layer, p, exp_ids)
+                if on_cuda:
+                    w, s, b = _to_device(w), _to_device(s), _to_device(b)
+                ref = getattr(switch, p)
+                projs[p] = Projection(w, s, b, ref.group_size, ref.bits, mode=ref.mode)
+            mx.eval([
+                a for pr in projs.values()
+                for a in (pr.weight, pr.get('scales'), pr.get('biases')) if a is not None
+            ])
+            self.prefill_read_s += time.perf_counter() - t_read
+            return projs
+
+        is_all = (m == self.num_experts and np.array_equal(exp_ids, np.arange(self.num_experts, dtype=np.int64)))
+        rows_arg = None if is_all else exp_ids
+        ahead_map = getattr(self.base, '_ahead', None)
+        remaining_targets = []
+        stage_meta = {}
+        for p in PROJECTIONS:
+            for part in NAMES:
+                if not self.base.has(layer, p, part):
+                    continue
+                t_name = self.base.name(layer, p, part)
+                _, st_dtype, full_shape, _ = self.base.tensors[t_name]
+                tail = tuple(full_shape[1:])
+                np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
+                key = (p, part, tail, st_dtype)
+                entry = self._prefill_stage.get(key)
+                if on_cuda:
+                    if entry is None or entry[0] is None or entry[0].shape[0] < cap_rows:
+                        if entry is not None and entry[2]:
+                            cuda_ple.advise_host_staging(entry[1], enable=False)
+                        mlx_arr = mx.zeros((cap_rows,) + tail, q2_experts._MLX[np_dt], stream=mx.cpu)
+                        mx.eval(mlx_arr)
+                        np_view = np.asarray(mlx_arr)
+                        adv = cuda_ple.advise_host_staging(np_view, enable=True)
+                        entry = (mlx_arr, np_view, adv)
+                        self._prefill_stage[key] = entry
+                else:
+                    if entry is None or entry[1].shape[0] < cap_rows:
+                        np_view = np.empty((cap_rows,) + tail, np_dt)
+                        entry = (None, np_view, False)
+                        self._prefill_stage[key] = entry
+                np_view = entry[1]
+                stage_meta[(p, part)] = (key, st_dtype, tail, np_dt, entry)
+                pending = None
+                pending_all = None
+                if ahead_map is not None:
+                    pending = ahead_map.pop(self.base._key(t_name, rows_arg), None)
+                    if pending is None and not is_all:
+                        pending_all = ahead_map.pop(self.base._key(t_name, None), None)
+                if pending is not None:
+                    np_view[:m] = pending.result()[:m]
+                elif pending_all is not None:
+                    np.take(pending_all.result(), exp_ids, axis=0, out=np_view[:m], mode='clip')
+                else:
+                    remaining_targets.append((t_name, np_view[:m]))
+
+        if remaining_targets:
+            host = self._host()
+            if host is None or not host.copy_layer(layer, rows_arg, remaining_targets):
+                for t_name, out_view in remaining_targets:
+                    self.base._read(t_name, rows_arg, cache=False, out=out_view)
+
+        projs = {}
+        for p in PROJECTIONS:
+            parts = []
+            for part in NAMES:
+                meta = stage_meta.get((p, part))
+                if meta is None:
+                    parts.append(None)
+                    continue
+                key, st_dtype, tail, np_dt, entry = meta
+                stage_mlx, stage_np, _ = entry
+                if on_cuda:
+                    dev_arr = self._prefill_dev.pop(key, None)
+                    if dev_arr is None or dev_arr.shape[0] < cap_rows:
+                        dev_arr = mx.zeros((cap_rows,) + tail, q2_experts._MLX[np_dt])
+                        mx.eval(dev_arr)
+                    idx = mx.arange(m, dtype=mx.int32)
+                    dev_arr[idx] = stage_mlx[:m]
+                    self._prefill_dev[key] = dev_arr
+                    raw_dev = dev_arr if m == dev_arr.shape[0] else dev_arr[:m]
+                    parts.append(q2_experts._as_mlx(raw_dev, st_dtype))
+                else:
+                    parts.append(q2_experts._as_mlx(mx.array(stage_np[:m]), st_dtype))
+            w, s, b = parts
+            ref = getattr(switch, p)
+            projs[p] = Projection(w, s, b, ref.group_size, ref.bits, mode=ref.mode)
+
+        mx.eval([
+            a for pr in projs.values()
+            for a in (pr.weight, pr.get('scales'), pr.get('biases')) if a is not None
+        ])
+        self.prefill_read_s += time.perf_counter() - t_read
+        return projs
+
+    def _update_bank_after_prefill(self, switch, seen_experts, source_ids, source_projs):
+        """Promote highest-weight experts seen during prefill into `switch`'s resident bank once."""
+        layer = switch.layer
+        candidates = np.union1d(switch.experts, seen_experts)
+        top = np.sort(candidates[np.argsort(-self.weight[layer][candidates], kind='stable')[:self.slots]])
+        new_exps = top[switch.route[top] < 0]
+        if not new_exps.size:
+            return
+        self._drain_layer_inflight(layer)
+        top_set = set(int(t) for t in top)
+        gone = [s for s, e in enumerate(switch.experts) if int(e) not in top_set]
+        last_map = {int(e): idx for idx, e in enumerate(source_ids)} if source_ids is not None else {}
+        to_read = np.array([int(e) for e in new_exps if int(e) not in last_map], dtype=np.int64)
+        if to_read.size == 0 and source_projs is not None:
+            take_idx = mx.array([last_map[int(e)] for e in new_exps], dtype=mx.int32)
+            stacked = {
+                p: [
+                    None if getattr(source_projs[p], part, None) is None
+                    else mx.take(getattr(source_projs[p], part), take_idx, axis=0)
+                    for part in NAMES
+                ]
+                for p in PROJECTIONS
+            }
+            written = switch.place_many(gone[:new_exps.size], new_exps, stacked)
+            if written:
+                mx.eval(written)
+            del stacked, written
+            return
+
+        reader = (
+            requant.Reader(self.base.path, self.checkpoint.bits, self.checkpoint.group_size)
+            if isinstance(self.checkpoint, requant.Flat) else self.base
+        )
+        t_read = time.perf_counter()
+        fetched = ({p: reader.experts(layer, p, to_read) for p in PROJECTIONS} if to_read.size else None)
+        self.prefill_read_s += time.perf_counter() - t_read
+        fetch_map = {int(e): idx for idx, e in enumerate(to_read)}
+        slot_arrays = {p: [[], [], []] for p in PROJECTIONS}
+        for e in new_exps:
+            e_int = int(e)
+            if e_int in last_map:
+                j = last_map[e_int]
+                for p in PROJECTIONS:
+                    lp = source_projs[p]
+                    arrs = (
+                        lp.weight[j:j + 1],
+                        lp.scales[j:j + 1] if getattr(lp, 'scales', None) is not None else None,
+                        lp.biases[j:j + 1] if getattr(lp, 'biases', None) is not None else None,
+                    )
+                    for idx_part, val in enumerate(arrs):
+                        slot_arrays[p][idx_part].append(val)
+            else:
+                j = fetch_map[e_int]
+                for p in PROJECTIONS:
+                    for idx_part, a in enumerate(fetched[p]):
+                        slot_arrays[p][idx_part].append(None if a is None else a[j:j + 1])
+        stacked = {
+            p: [
+                None if slot_arrays[p][idx_part][0] is None
+                else (slot_arrays[p][idx_part][0] if new_exps.size == 1
+                      else mx.concatenate(slot_arrays[p][idx_part], axis=0))
+                for idx_part in range(len(NAMES))
+            ]
+            for p in PROJECTIONS
+        }
+        written = switch.place_many(gone[:new_exps.size], new_exps, stacked)
+        if written:
+            mx.eval(written)
+        del stacked, written, fetched
+
+    def _release_prefill_buffers(self):
+        from . import cuda_ple
+        self._prefill_active = None
+        for _, np_view, adv in self._prefill_stage.values():
+            if adv:
+                cuda_ple.advise_host_staging(np_view, enable=False)
+        self._prefill_stage.clear()
+        self._prefill_dev.clear()
+        self.base.forget()
+        mx.clear_cache()
+        self._room_back()
+
+    def end_layer_prefill(self, switch, ok=True):
+        """Finish a chunked layer prefill pass: update `switch`'s resident bank from the
+        layer-wide expert weights and release layer/prompt temporary buffers."""
+        active = self._prefill_active
+        self._prefill_active = None
+        if active is not None:
+            act_layer, projs, temp, seen_set = active
+            if ok and act_layer == switch.layer and seen_set:
+                seen_arr = np.array(sorted(seen_set), dtype=np.int64)
+                self._update_bank_after_prefill(switch, seen_arr, temp.experts, projs)
+            del active, projs, temp, seen_set
+        if switch.layer == self.moe_indices[-1]:
+            self._release_prefill_buffers()
+        else:
+            mx.clear_cache()
 
     def _read_one(self, layer, expert, worker_slot):
         with self._stream_lock:
@@ -397,44 +654,65 @@ class Demand:
         self.weight[layer] *= DECAY
         np.add.at(self.weight[layer], ids, w_scores)
 
+        if self._prefill_active is not None:
+            if self._prefill_active[0] == layer and prefill.in_layer():
+                self._after_prefill = True
+                self._decode_steps = 0
+                _, _, temp, seen_set = self._prefill_active
+                seen_set.update(int(e) for e in np.unique(ids))
+                y = expert_qmv.stock(temp, x, temp._local_indices(indices), scores if switch.weighs else None)
+                mx.eval(y)
+                return y
+            self._prefill_active = None
+
         if not is_decode:
             self._after_prefill = True
             self._decode_steps = 0
             needed = np.unique(ids)
             missing = needed[switch.route[needed] < 0]
             if needed.size > self.slots:
+                cap = self._prefill_cap()
+                in_layer_mode = prefill.in_layer() and self.num_experts <= cap
                 nxt = self.next_moe.get(layer)
-                if nxt is not None and not isinstance(self.checkpoint, requant.Flat):
+                host = self._host()
+                if (in_layer_mode and nxt is not None and self._has_tensor_table()
+                        and not (host is not None and host.holds_layer(nxt))):
                     self.base.ahead([
                         (self.base.name(nxt, p, part), None)
                         for p in PROJECTIONS for part in NAMES if self.base.has(nxt, p, part)
                     ])
-                reader = (requant.Reader(self.base.path, self.checkpoint.bits, self.checkpoint.group_size)
-                          if isinstance(self.checkpoint, requant.Flat) else self.base)
-                cap = needed.size if not self.prompt_room else max(1, int(self.prompt_room // self.per_expert))
+                if in_layer_mode:
+                    all_ids = np.arange(self.num_experts, dtype=np.int64)
+                    projs = self._load_prefill_projs(layer, switch, all_ids, self.num_experts)
+                    temp = DemandSwitchGLU(
+                        layer, projs['gate_proj'], projs['up_proj'], projs['down_proj'],
+                        all_ids, self.num_experts, switch.activation, None,
+                    )
+                    self._prefill_active = (layer, projs, temp, set(int(e) for e in needed))
+                    self.prefill_layers += 1
+                    y = expert_qmv.stock(temp, x, temp._local_indices(indices), scores if switch.weighs else None)
+                    mx.eval(y)
+                    return y
+
                 batches = [needed[k:k + cap] for k in range(0, needed.size, cap)]
                 indices_np = np.array(indices) if len(batches) > 1 else None
                 y = None
                 last_batch, last_projs = None, None
                 for k, batch in enumerate(batches):
-                    t_read = time.perf_counter()
-                    batch_projs = {}
-                    for p in PROJECTIONS:
-                        w, s, b = reader.experts(layer, p, batch)
-                        ref = getattr(switch, p)
-                        batch_projs[p] = Projection(w, s, b, ref.group_size, ref.bits, mode=ref.mode)
-                    mx.eval([a for pr in batch_projs.values()
-                             for a in (pr.weight, pr.get('scales'), pr.get('biases')) if a is not None])
-                    self.read_s += time.perf_counter() - t_read
+                    cap_rows = min(
+                        cap,
+                        max(int(batch.size), min(self.num_experts, 1 << max(0, int(batch.size) - 1).bit_length())),
+                    )
+                    batch_projs = self._load_prefill_projs(layer, switch, batch, cap_rows)
                     temp = DemandSwitchGLU(
                         layer, batch_projs['gate_proj'], batch_projs['up_proj'], batch_projs['down_proj'],
                         batch, self.num_experts, switch.activation, None,
                     )
                     if len(batches) == 1:
-                        y = expert_qmv.stock(temp, x, temp._local[indices], scores if switch.weighs else None)
+                        y = expert_qmv.stock(temp, x, temp._local_indices(indices), scores if switch.weighs else None)
                     else:
                         inside = np.isin(indices_np, batch)
-                        stand_in = mx.where(mx.array(inside), temp._local[indices],
+                        stand_in = mx.where(mx.array(inside), temp._local_indices(indices),
                                             mx.zeros_like(indices, dtype=mx.uint32))
                         part = expert_qmv.stock(temp, x, stand_in, scores if switch.weighs else None)
                         y = part if y is None else mx.where(mx.array(inside)[..., None], part, y)
@@ -447,55 +725,12 @@ class Demand:
                     del temp
                 self.prefill_layers += 1
 
-                candidates = np.union1d(switch.experts, needed)
-                top = np.sort(candidates[np.argsort(-self.weight[layer][candidates], kind='stable')[:self.slots]])
-                new_exps = top[switch.route[top] < 0]
-                if new_exps.size:
-                    self._drain_layer_inflight(layer)
-                    top_set = set(int(t) for t in top)
-                    gone = [s for s, e in enumerate(switch.experts) if int(e) not in top_set]
-                    last_map = {int(e): idx for idx, e in enumerate(last_batch)} if last_batch is not None else {}
-                    to_read = np.array([int(e) for e in new_exps if int(e) not in last_map], dtype=np.int64)
-                    t_read = time.perf_counter()
-                    fetched = ({p: reader.experts(layer, p, to_read) for p in PROJECTIONS}
-                               if to_read.size else None)
-                    self.read_s += time.perf_counter() - t_read
-                    fetch_map = {int(e): idx for idx, e in enumerate(to_read)}
-                    slot_arrays = {p: [[], [], []] for p in PROJECTIONS}
-                    for e in new_exps:
-                        e_int = int(e)
-                        if e_int in last_map:
-                            j = last_map[e_int]
-                            for p in PROJECTIONS:
-                                lp = last_projs[p]
-                                arrs = (
-                                    lp.weight[j:j + 1],
-                                    lp.scales[j:j + 1] if getattr(lp, 'scales', None) is not None else None,
-                                    lp.biases[j:j + 1] if getattr(lp, 'biases', None) is not None else None,
-                                )
-                                for idx_part, val in enumerate(arrs):
-                                    slot_arrays[p][idx_part].append(val)
-                        else:
-                            j = fetch_map[e_int]
-                            for p in PROJECTIONS:
-                                for idx_part, a in enumerate(fetched[p]):
-                                    slot_arrays[p][idx_part].append(None if a is None else a[j:j + 1])
-                    stacked = {
-                        p: [
-                            None if slot_arrays[p][idx_part][0] is None
-                            else (slot_arrays[p][idx_part][0] if new_exps.size == 1
-                                  else mx.concatenate(slot_arrays[p][idx_part], axis=0))
-                            for idx_part in range(len(NAMES))
-                        ]
-                        for p in PROJECTIONS
-                    }
-                    written = switch.place_many(gone[:new_exps.size], new_exps, stacked)
-                    if written:
-                        mx.eval(written)
+                self._update_bank_after_prefill(switch, needed, last_batch, last_projs)
                 del last_batch, last_projs
-                mx.clear_cache()
-                if layer == self.moe_indices[-1]:
-                    self._room_back()
+                if layer == self.moe_indices[-1] and not prefill.in_layer():
+                    self._release_prefill_buffers()
+                else:
+                    mx.clear_cache()
                 return y
 
         active_ids = np.unique(ids)
@@ -527,8 +762,10 @@ class Demand:
             disk_missing = missing[in_host.size:]
             if disk_missing.size == 0:
                 if written:
-                    self._stage_inflight[ring] = (layer, written)
-                    mx.async_eval(*written)
+                    if is_decode:
+                        self._stage_inflight[ring] = (layer, written)
+                    else:
+                        mx.eval(written)
                     del written
             else:
                 if written:
@@ -559,9 +796,13 @@ class Demand:
                         mx.eval(batch_written)
             if in_host.size:
                 self.host_served += int(in_host.size)
-            self.read_s += time.perf_counter() - t0
+            elapsed = time.perf_counter() - t0
+            if is_decode:
+                self.read_s += elapsed
+            else:
+                self.prefill_read_s += elapsed
 
-        local = switch._local[indices]
+        local = switch._local_indices(indices)
         weights = scores if switch.weighs else None
         if is_decode:
             out = expert_qmv.decode(switch, x, local, weights)
@@ -585,6 +826,7 @@ class Demand:
             'misses': self.misses,
             'hit_rate': round(self.hits / total, 4) if total else 1.0,
             'prefill_layers': self.prefill_layers,
+            'prefill_read_s': round(self.prefill_read_s, 2),
             'read_s': round(self.read_s, 2),
             'host_served': self.host_served,
             'trimmed': self.trimmed,
@@ -592,6 +834,12 @@ class Demand:
 
     def close(self):
         from . import cuda_ple
+        self._prefill_active = None
+        for _, np_view, adv in self._prefill_stage.values():
+            if adv:
+                cuda_ple.advise_host_staging(np_view, enable=False)
+        self._prefill_stage.clear()
+        self._prefill_dev.clear()
         for k, entry in enumerate(self._stage_inflight):
             if entry is not None:
                 try:

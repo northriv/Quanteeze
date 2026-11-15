@@ -59,6 +59,11 @@ class Settings:
 SETTINGS = Settings()
 
 
+def in_layer():
+    """Whether the current thread is executing inside a chunked single-layer prefill pass."""
+    return bool(getattr(_STATE, 'in_layer', False))
+
+
 def window_parts(n):
     """While a joined MoE window of `n` tokens runs: the tuple of its constituent chunk lengths; else `None`."""
     parts = getattr(_STATE, 'window_parts', None)
@@ -314,6 +319,7 @@ def _chunked(cls):
         windows = _windows(parts, self) if sp is not None else None
         _STATE.in_layer = True
         whole = None
+        ok = False
         try:
             if windows is not None and any(len(w) > 1 for w in windows):
                 whole = _in_two(self, x, n, parts, cuts, windows, sp)
@@ -325,8 +331,14 @@ def _chunked(cls):
                     whole = _put(whole, out, a, b)
                     mx.eval(whole)
                     del out
+            ok = True
         finally:
             _STATE.in_layer = False
+            from . import arch
+            sw = arch.switch_of(self)
+            dem = getattr(sw, 'demand', None) if sw is not None else None
+            if dem is not None:
+                dem.end_layer_prefill(sw, ok=ok)
         return whole
 
     return type(f'Chunked{cls.__name__}', (cls,), {'__call__': __call__, '_quanteeze_chunked': True})
