@@ -184,7 +184,7 @@ SOURCE = r"""
     const int lane = warp.thread_rank();
     const int t = lane & 3;
     float c[PAIR ? 2 : 1][4];
-    qz_expert_rows<N, K, GS, PAIR>(c, x + (SHARED_X ? 0 : static_cast<size_t>(j) * K), w, scales, biases, w2,
+    qz_expert_rows<N, K, GS, PAIR>(c, x + static_cast<size_t>(X_DIV ? j / X_DIV : 0) * K, w, scales, biases, w2,
                                    scales2, biases2, static_cast<int>(idx[j]), n0);
     if (lane < 4) {
       for (int i = 0; i < 2; ++i) {
@@ -230,8 +230,9 @@ STAGED_SOURCE = r"""
     const uint32_t* wsrc = (m ? w2 : w) + grow * (K / 8);
     const __nv_bfloat16* ssrc = (m ? scales2 : scales) + grow * (K / GS);
     const __nv_bfloat16* bsrc = (m ? biases2 : biases) + grow * (K / GS);
+    const __nv_bfloat16* xj = x + static_cast<size_t>(j / TOP_K) * K;
     for (int p = tid; p < K / 8; p += 128) {
-      qz_cp16(xs + p * 8, x + p * 8);
+      qz_cp16(xs + p * 8, xj + p * 8);
     }
     auto stage = [&](int s) {
       if (s < NS) {
@@ -315,34 +316,37 @@ def _kernel():
                                ['y'], SOURCE, HEADER)
 
 
-def _run(x, proj, idx, shared_x, pair=None):
+def _run(x, proj, idx, x_div, pair=None):
     slots, n, k = idx.size, proj.weight.shape[1], x.shape[-1]
     second = pair or proj
     return _kernel()(
-        inputs=[x, proj.weight, proj.scales, proj.biases, idx, second.weight, second.scales, second.biases],
-        template=[('N', n), ('K', k), ('GS', int(proj.group_size)), ('SLOTS', slots), ('SHARED_X', bool(shared_x)),
+        inputs=[mx.contiguous(x), proj.weight, proj.scales, proj.biases, idx, second.weight, second.scales,
+                second.biases],
+        template=[('N', n), ('K', k), ('GS', int(proj.group_size)), ('SLOTS', slots), ('X_DIV', int(x_div)),
                   ('PAIR', pair is not None)],
         grid=(32 * slots * (n // 8), 1, 1), threadgroup=(256, 1, 1), output_shapes=[(slots, n)],
         output_dtypes=[x.dtype])[0]
 
 
 def gate_up(switch, x, idx):
-    """swiglu(gate_proj(x), up_proj(x)) of each slot's expert for one token x [K]: [slots, inner]."""
+    """swiglu(gate_proj(x), up_proj(x)) of each slot's expert for token rows `x`: `[slots, inner]`."""
     gate, up = switch.gate_proj, switch.up_proj
     slots, n, k, gs = idx.size, gate.weight.shape[1], x.shape[-1], int(gate.group_size)
+    rows = max(1, x.size // k)
+    top_k = max(1, slots // rows)
     if not staged(n, k, gs):
-        return _run(x, gate, idx, True, pair=up)
+        return _run(x, gate, idx, 0 if rows == 1 else top_k, pair=up)
     return _staged_kernel(k, gs)(
         inputs=[mx.contiguous(x.reshape(-1)), gate.weight, gate.scales, gate.biases, idx, up.weight, up.scales,
                 up.biases],
-        template=[('N', n), ('K', k), ('GS', gs), ('SLOTS', slots)],
+        template=[('N', n), ('K', k), ('GS', gs), ('SLOTS', slots), ('TOP_K', top_k)],
         grid=(128 * slots * (n // 32), 1, 1), threadgroup=(128, 1, 1), output_shapes=[(slots, n)],
         output_dtypes=[x.dtype])[0]
 
 
 def down(switch, h, idx):
     """down_proj of each slot's expert on its own row of h [slots, inner]: [slots, hidden]."""
-    return _run(h, switch.down_proj, idx, False)
+    return _run(h, switch.down_proj, idx, 1)
 
 
 def _projection(p, k, dtype):
@@ -354,10 +358,12 @@ def _projection(p, k, dtype):
 
 
 def takes(switch, x, indices):
-    """Whether switch_glu() computes this step's experts as MLX's qmm_sm80 does: on CUDA, one token of
-    bfloat16, 8 to 64 experts (fewer go to gather_qmv), 4-bit affine projections with biases, a
-    SwiGLU between them."""
-    if not cuda_kernels.available() or x.dtype != mx.bfloat16 or x.ndim != 3 or x.shape[:2] != (1, 1):
+    """Whether switch_glu() computes this step's experts as MLX's qmm_sm80 does: on CUDA, bfloat16
+    single-token steps (B=1..8, T=1), 8 to 64 total slots (fewer go to gather_qmv), 4-bit affine
+    projections with biases, a SwiGLU between them."""
+    if not cuda_kernels.available() or x.dtype != mx.bfloat16 or x.ndim != 3 or x.shape[1] != 1 or not 1 <= x.shape[0] <= 8:
+        return False
+    if indices.ndim != 3 or indices.shape[:2] != x.shape[:2] or indices.shape[-1] <= 0:
         return False
     if not all(hasattr(switch, name) for name in ('gate_proj', 'up_proj', 'down_proj', 'activation')):
         return False
@@ -371,17 +377,19 @@ def takes(switch, x, indices):
 
 
 def decode(switch, x, indices, fallback):
-    """`fallback()` or custom CUDA `gate_up()` + `down()` for `[1, 1, k, hidden]` once bit-verified."""
+    """`fallback()` or custom CUDA `gate_up()` + `down()` for `[B, 1, k, hidden]` once bit-verified."""
     if not ON[0] or not takes(switch, x, indices):
         return fallback()
-    k = indices.size
+    b, top_k = x.shape[0], indices.shape[-1]
 
     def mine():
-        idx = indices.reshape(-1).astype(mx.uint32)
-        h = gate_up(switch, x.reshape(1, -1), idx)
-        return down(switch, h, idx).reshape(1, 1, k, -1)
+        idx = mx.contiguous(indices.reshape(-1).astype(mx.uint32))
+        h = gate_up(switch, x.reshape(b, -1), idx)
+        return down(switch, h, idx).reshape(b, 1, top_k, -1)
 
-    key = (k, x.shape[-1], switch.gate_proj.weight.shape[1], int(switch.gate_proj.group_size))
+    key = ((top_k, x.shape[-1], switch.gate_proj.weight.shape[1], int(switch.gate_proj.group_size))
+           if b == 1 else
+           (b, top_k, x.shape[-1], switch.gate_proj.weight.shape[1], int(switch.gate_proj.group_size)))
     choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
     if choice is not None and seen >= CHECKS:
         if choice:

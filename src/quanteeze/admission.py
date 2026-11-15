@@ -55,8 +55,9 @@ class Admission:
     """The rows a prefill may take: within `limit` bytes of what MLX holds, a pass costing `fixed`
     besides its tokens; at most `most` rows."""
 
-    def __init__(self, limit, fixed=0, most=8, ahead=0):
+    def __init__(self, limit, fixed=0, most=8, ahead=0, batch_fixed=None):
         self.limit, self.fixed, self.most, self.ahead = limit, fixed, most, ahead
+        self.batch_fixed = batch_fixed
         self.per_token = self.kv_token = None
         self.stats = {'measured': 0, 'admitted': 0, 'held_back': 0, 'rows_most': 0, 'decode_measured': 0}
 
@@ -78,11 +79,12 @@ class Admission:
             return 0.0
         return self.kv_token * sum(min(max(0, int(r)), self.ahead) for r in remaining)
 
-    def rows(self, pending, free_rows, step, busy, held=None, remaining=(), lengths=None):
+    def rows(self, pending, free_rows, step, busy, held=None, remaining=(), lengths=None, wanted=None):
         """How many of `pending` waiting prompts to take: within `free_rows` places to decode, each
         prefilled `step` tokens at a time and then decoding; `busy`, whether others decode
         meanwhile, `remaining` the tokens each of them may still generate; `held`, what MLX holds
-        now (bytes); `lengths`, the waiting prompts' tokens, the first come first."""
+        now (bytes); `lengths`, the waiting prompts' tokens, the first come first; `wanted`, the
+        maximum tokens each may generate."""
         if pending <= 0 or free_rows <= 0:
             return 0
         most = min(self.most, pending, free_rows)
@@ -95,8 +97,21 @@ class Admission:
                 n += 1
             return max(1, n)
         held = mx.get_active_memory() if held is None else held
-        room = self.limit - held - self.fixed - self.reserved(remaining)
-        fit = int(room // max(1.0, self.per_token * step + self.reserved([self.ahead])))
+        base_room = self.limit - held - self.reserved(remaining)
+        short_fixed = self.fixed if self.batch_fixed is None else self.batch_fixed
+        fit = 0
+        used = 0.0
+        for idx in range(most):
+            raw_len = int(lengths[idx]) if (lengths is not None and idx < len(lengths)) else step
+            eff_len = min(max(1, raw_len), step)
+            want = self.ahead if (wanted is None or idx >= len(wanted) or wanted[idx] is None) else int(wanted[idx])
+            cost = max(1.0, self.per_token * eff_len + self.reserved([want]))
+            req_fixed = short_fixed if (idx >= 1 or (lengths is not None and raw_len <= step)) else self.fixed
+            if used + cost <= base_room - req_fixed:
+                used += cost
+                fit += 1
+            else:
+                break
         if fit >= 1:
             return min(most, fit)
         return 0 if busy else 1
@@ -185,7 +200,8 @@ def install(generator_cls, admission):
             admission.most = own
             first = sorted(self._unprocessed_sequences, key=lambda sequence: sequence[0])
             rows = admission.rows(pending, free, self.prefill_step_size or 2048, len(self._generation_batch) > 0,
-                                  remaining=_remaining(self._generation_batch), lengths=[len(q[1]) for q in first])
+                                  remaining=_remaining(self._generation_batch), lengths=[len(q[1]) for q in first],
+                                  wanted=[q[2] for q in first])
             rows = parallel.least(rows)             # over several GPUs, what every one's memory holds
             if rows:
                 admission.stats['admitted'] += rows

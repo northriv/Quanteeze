@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0
-"""Metal gather-qmv and tiled gather-mm kernels for raw GGUF / ggml block expert projections.
+"""Metal and CUDA gather-qmv and tiled gather-mm kernels for raw GGUF / ggml block expert projections.
 
 Runs pre-distributed and uniform GGUF expert tensors (`IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 `IQ3_XXS`, `IQ4_NL`, `IQ4_XS`, `Q2_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q4_0`, `Q4_1`,
 `Q5_0`, `Q5_1`, `Q8_0`, `F16`, `BF16`) directly from stacked uint8 ggml blocks without unpacking
 weights to bfloat16/float32 memory.
 
-Decode / verify (`takes` / `gather`): one SIMD group (32 lanes) per routed slot and `ROWS` outputs.
-Prefill (`takes_rows` / `gather_rows`): tiled 32x32 threadgroup `simdgroup_matrix` kernel over
-expert-sorted rows.  Every shape & ggml type is checked against `unpacked()` for the first `CHECKS`
-calls (`TOLERANCE = 1e-2`) before serving directly.
+Decode / verify (`takes` / `gather`): one SIMD group / warp (32 lanes) per routed slot and `ROWS`
+outputs.  Prefill (`takes_rows` / `gather_rows`): tiled 32x32 threadgroup/block kernel over
+expert-sorted rows (`simdgroup_matrix` on Metal, 128-thread register-tiled FP32 GEMM on CUDA).
+Every shape & ggml type is checked against `unpacked()` for the first `CHECKS` calls
+(`TOLERANCE = 1e-2`) before serving directly.
 """
 import sys
 from functools import lru_cache
@@ -17,12 +18,13 @@ from functools import lru_cache
 import mlx.core as mx
 import numpy as np
 
-from . import iq_experts
+from . import cuda_kernels, iq_experts
 
 CHECKS = 3
 TOLERANCE = 1e-2
 MAX_ROWS = 256
 ROWS = 4
+WARPS = 4
 TILE = 32
 ON = [True]                                     # synced with QUANTEEZE_KQUANT_QMV in serve
 STATS = dict(served=0, checked=0, mismatched=0)
@@ -341,8 +343,321 @@ def _grid_for(kind):
     if kind in grids:
         return grids[kind]
     if _DUMMY_GRID is None:
-        _DUMMY_GRID = mx.zeros((1,), dtype=mx.uint16)
+        _DUMMY_GRID = mx.zeros((8,), dtype=mx.uint16)
+        mx.eval(_DUMMY_GRID)
     return _DUMMY_GRID
+
+
+def _gpu_available():
+    return mx.default_device() == mx.gpu and (mx.metal.is_available() or cuda_kernels.available())
+
+
+_CUDA_HEADER = r"""
+template <typename P>
+__device__ __forceinline__ uint16_t qz_u16_le(P p) {
+  return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+template <typename P>
+__device__ __forceinline__ uint32_t qz_u32_le(P p) {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+      | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+template <typename P>
+__device__ __forceinline__ float qz_f16_le(P p) {
+  return __half2float(__ushort_as_half(qz_u16_le(p)));
+}
+__device__ __forceinline__ uint32_t qz_ksign_byte(uint32_t s7) {
+  return s7 | ((static_cast<uint32_t>(__popc(s7)) & 1u) << 7);
+}
+
+template <int KIND, typename BlkPtr, typename GridPtr>
+__device__ __forceinline__ void qz_decode_octad(BlkPtr blk, GridPtr grid, uint32_t octad, float* w8) {
+  constexpr float IQ2_MAG[4] = {8.0f, 25.0f, 43.0f, 0.0f};
+  constexpr float IQ3_MAG[8] = {4.0f, 12.0f, 20.0f, 28.0f, 36.0f, 44.0f, 52.0f, 62.0f};
+  constexpr float IQ4NL_MAG[16] = {
+      -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+      1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
+  };
+  const uint32_t v0 = octad * 8u;
+  if constexpr (KIND == 1) {                             // F16 (block 32)
+    for (int i = 0; i < 8; ++i) w8[i] = qz_f16_le(blk + 2u * (v0 + i));
+  } else if constexpr (KIND == 30) {                     // BF16 (block 32)
+    for (int i = 0; i < 8; ++i) {
+      w8[i] = __uint_as_float(static_cast<uint32_t>(qz_u16_le(blk + 2u * (v0 + i))) << 16);
+    }
+  } else if constexpr (KIND == 2) {                      // Q4_0 (block 32)
+    const float d = qz_f16_le(blk);
+    BlkPtr qs = blk + 2u + (octad < 2u ? v0 : v0 - 16u);
+    const uint32_t shift = octad < 2u ? 0u : 4u;
+    for (int i = 0; i < 8; ++i) w8[i] = d * static_cast<float>(static_cast<int>((qs[i] >> shift) & 15u) - 8);
+  } else if constexpr (KIND == 3) {                      // Q4_1 (block 32)
+    const float d = qz_f16_le(blk), m = qz_f16_le(blk + 2u);
+    BlkPtr qs = blk + 4u + (octad < 2u ? v0 : v0 - 16u);
+    const uint32_t shift = octad < 2u ? 0u : 4u;
+    for (int i = 0; i < 8; ++i) w8[i] = d * static_cast<float>((qs[i] >> shift) & 15u) + m;
+  } else if constexpr (KIND == 6) {                      // Q5_0 (block 32)
+    const float d = qz_f16_le(blk);
+    const uint32_t qhb = blk[2u + octad];
+    BlkPtr qs = blk + 6u + (octad < 2u ? v0 : v0 - 16u);
+    const uint32_t shift = octad < 2u ? 0u : 4u;
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t q = ((qs[i] >> shift) & 15u) | (((qhb >> i) & 1u) << 4);
+      w8[i] = d * static_cast<float>(static_cast<int>(q) - 16);
+    }
+  } else if constexpr (KIND == 7) {                      // Q5_1 (block 32)
+    const float d = qz_f16_le(blk), m = qz_f16_le(blk + 2u);
+    const uint32_t qhb = blk[4u + octad];
+    BlkPtr qs = blk + 8u + (octad < 2u ? v0 : v0 - 16u);
+    const uint32_t shift = octad < 2u ? 0u : 4u;
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t q = ((qs[i] >> shift) & 15u) | (((qhb >> i) & 1u) << 4);
+      w8[i] = d * static_cast<float>(q) + m;
+    }
+  } else if constexpr (KIND == 8) {                      // Q8_0 (block 32)
+    const float d = qz_f16_le(blk);
+    for (int i = 0; i < 8; ++i) w8[i] = d * static_cast<float>(static_cast<int8_t>(blk[2u + v0 + i]));
+  } else if constexpr (KIND == 20) {                     // IQ4_NL (block 32)
+    const float d = qz_f16_le(blk);
+    BlkPtr qs = blk + 2u + (octad < 2u ? v0 : v0 - 16u);
+    const uint32_t shift = octad < 2u ? 0u : 4u;
+    for (int i = 0; i < 8; ++i) w8[i] = d * IQ4NL_MAG[(qs[i] >> shift) & 15u];
+  } else if constexpr (KIND == 42) {                     // Q2_0 (block 64)
+    const float d = qz_f16_le(blk);
+    BlkPtr qs = blk + 2u + 2u * octad;
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t q = (qs[i >> 2] >> (2u * (i & 3))) & 3u;
+      w8[i] = d * static_cast<float>(static_cast<int>(q) - 1);
+    }
+  } else if constexpr (KIND == 10) {                     // Q2_K (block 256)
+    const uint32_t sub = octad >> 1, h = v0 >> 7, j = (v0 & 127u) >> 5, l0 = v0 & 31u;
+    const uint32_t s = blk[sub];
+    const float dl = qz_f16_le(blk + 80u) * static_cast<float>(s & 15u);
+    const float ml = qz_f16_le(blk + 82u) * static_cast<float>(s >> 4);
+    BlkPtr qs = blk + 16u + 32u * h + l0;
+    for (int i = 0; i < 8; ++i) w8[i] = dl * static_cast<float>((qs[i] >> (2u * j)) & 3u) - ml;
+  } else if constexpr (KIND == 11) {                     // Q3_K (block 256)
+    const uint32_t sub = octad >> 1, h = v0 >> 7, j = (v0 & 127u) >> 5, l0 = v0 & 31u, hb = v0 >> 5;
+    const uint32_t low = sub < 8u ? (blk[96u + sub] & 15u) : (blk[96u + sub - 8u] >> 4);
+    const uint32_t high = (blk[104u + (sub & 3u)] >> (2u * (sub >> 2))) & 3u;
+    const float dl = qz_f16_le(blk + 108u) * static_cast<float>(static_cast<int>(low | (high << 4)) - 32);
+    BlkPtr qs = blk + 32u + 32u * h + l0;
+    for (int i = 0; i < 8; ++i) {
+      int q = static_cast<int>((qs[i] >> (2u * j)) & 3u);
+      if (((blk[l0 + i] >> hb) & 1u) == 0u) q -= 4;
+      w8[i] = dl * static_cast<float>(q);
+    }
+  } else if constexpr (KIND == 12 || KIND == 13) {       // Q4_K / Q5_K (block 256)
+    const uint32_t sb = octad >> 2, l0 = v0 & 31u;
+    BlkPtr sp = blk + 4u;
+    uint32_t sc, mn;
+    if (sb < 4u) {
+      sc = sp[sb] & 63u;
+      mn = sp[sb + 4u] & 63u;
+    } else {
+      sc = (sp[sb + 4u] & 15u) | ((sp[sb - 4u] >> 2) & 48u);
+      mn = (sp[sb + 4u] >> 4) | ((sp[sb] >> 2) & 48u);
+    }
+    const float dd = qz_f16_le(blk) * static_cast<float>(sc);
+    const float dm = qz_f16_le(blk + 2u) * static_cast<float>(mn);
+    BlkPtr qs = blk + (KIND == 12 ? 16u : 48u) + 32u * (sb >> 1) + l0;
+    const uint32_t shift = 4u * (sb & 1u);
+    for (int i = 0; i < 8; ++i) {
+      uint32_t q = (qs[i] >> shift) & 15u;
+      if constexpr (KIND == 13) q |= ((static_cast<uint32_t>(blk[16u + l0 + i]) >> sb) & 1u) << 4;
+      w8[i] = dd * static_cast<float>(q) - dm;
+    }
+  } else if constexpr (KIND == 14) {                     // Q6_K (block 256)
+    const uint32_t sub = octad >> 1, h = v0 >> 7, rem = v0 & 127u;
+    const float dsc = qz_f16_le(blk + 208u) * static_cast<float>(static_cast<int8_t>(blk[192u + sub]));
+    const uint32_t ql_shift = 4u * (rem >> 6), qh_shift = 2u * (rem >> 5);
+    BlkPtr qlp = blk + 64u * h + (rem & 63u);
+    BlkPtr qhp = blk + 128u + 32u * h + (rem & 31u);
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t q = ((qlp[i] >> ql_shift) & 15u) | (((qhp[i] >> qh_shift) & 3u) << 4);
+      w8[i] = dsc * static_cast<float>(static_cast<int>(q) - 32);
+    }
+  } else if constexpr (KIND == 16) {                     // IQ2_XXS (block 256)
+    const uint32_t ib32 = octad >> 2, l = octad & 3u;
+    const float d = qz_f16_le(blk);
+    const uint32_t aux = qz_u32_le(blk + 2u + 8u * ib32 + 4u);
+    const float db = d * (0.5f + static_cast<float>(aux >> 28)) * 0.25f;
+    const uint32_t sbyte = qz_ksign_byte((aux >> (7u * l)) & 127u);
+    const uint16_t g = grid[blk[2u + 8u * ib32 + l]];
+    for (int i = 0; i < 8; ++i) {
+      const float sign = ((sbyte >> i) & 1u) ? -1.0f : 1.0f;
+      w8[i] = db * IQ2_MAG[(g >> (2u * i)) & 3u] * sign;
+    }
+  } else if constexpr (KIND == 17) {                     // IQ2_XS (block 256)
+    const uint32_t ib32 = octad >> 2, l = octad & 3u;
+    const float d = qz_f16_le(blk);
+    const uint32_t q16 = qz_u16_le(blk + 2u + 2u * octad);
+    const uint32_t s = blk[66u + ib32];
+    const float db = d * (0.5f + static_cast<float>(l < 2u ? (s & 15u) : (s >> 4))) * 0.25f;
+    const uint32_t sbyte = qz_ksign_byte(q16 >> 9);
+    const uint16_t g = grid[q16 & 511u];
+    for (int i = 0; i < 8; ++i) {
+      const float sign = ((sbyte >> i) & 1u) ? -1.0f : 1.0f;
+      w8[i] = db * IQ2_MAG[(g >> (2u * i)) & 3u] * sign;
+    }
+  } else if constexpr (KIND == 22) {                     // IQ2_S (block 256)
+    const uint32_t ib32 = octad >> 2, l = octad & 3u;
+    const float d = qz_f16_le(blk);
+    const uint32_t idx10 = static_cast<uint32_t>(blk[2u + octad])
+        | (((static_cast<uint32_t>(blk[66u + ib32]) >> (2u * l)) & 3u) << 8);
+    const uint32_t sbyte = blk[34u + octad];
+    const uint32_t s = blk[74u + ib32];
+    const float db = d * (0.5f + static_cast<float>(l < 2u ? (s & 15u) : (s >> 4))) * 0.25f;
+    const uint16_t g = grid[idx10];
+    for (int i = 0; i < 8; ++i) {
+      const float sign = ((sbyte >> i) & 1u) ? -1.0f : 1.0f;
+      w8[i] = db * IQ2_MAG[(g >> (2u * i)) & 3u] * sign;
+    }
+  } else if constexpr (KIND == 19) {                     // IQ1_S (block 256)
+    const uint32_t ib32 = octad >> 2, l = octad & 3u;
+    const float d = qz_f16_le(blk);
+    const uint32_t qh = qz_u16_le(blk + 34u + 2u * ib32);
+    const float dl = d * static_cast<float>(2u * ((qh >> 12) & 7u) + 1u);
+    const float delta = (qh & 0x8000u) ? -0.125f : 0.125f;
+    const uint32_t idx11 = static_cast<uint32_t>(blk[2u + octad]) | (((qh >> (3u * l)) & 7u) << 8);
+    const uint16_t g = grid[idx11];
+    for (int i = 0; i < 8; ++i) {
+      w8[i] = dl * (static_cast<float>(static_cast<int>((g >> (2u * i)) & 3u) - 1) + delta);
+    }
+  } else if constexpr (KIND == 29) {                     // IQ1_M (block 256)
+    const uint32_t ib16 = octad >> 1;
+    const uint32_t qhb = static_cast<uint32_t>(blk[32u + ib16]) >> (4u * (octad & 1u));
+    const uint32_t sc0 = qz_u16_le(blk + 48u), sc1 = qz_u16_le(blk + 50u);
+    const uint32_t sc2 = qz_u16_le(blk + 52u), sc3 = qz_u16_le(blk + 54u);
+    const uint16_t d_bits = static_cast<uint16_t>(
+        ((sc0 >> 12) & 0x000fu) | ((sc1 >> 8) & 0x00f0u)
+        | ((sc2 >> 4) & 0x0f00u) | (sc3 & 0xf000u));
+    const float d = __half2float(__ushort_as_half(d_bits));
+    const uint32_t sc_word = qz_u16_le(blk + 48u + 2u * (ib16 >> 2));
+    const float dl = d * static_cast<float>(2u * ((sc_word >> (3u * (ib16 & 3u))) & 7u) + 1u);
+    const float delta = (qhb & 8u) ? -0.125f : 0.125f;
+    const uint16_t g = grid[static_cast<uint32_t>(blk[octad]) | ((qhb & 7u) << 8)];
+    for (int i = 0; i < 8; ++i) {
+      w8[i] = dl * (static_cast<float>(static_cast<int>((g >> (2u * i)) & 3u) - 1) + delta);
+    }
+  } else if constexpr (KIND == 18) {                     // IQ3_XXS (block 256)
+    const uint32_t ib32 = octad >> 2, l = octad & 3u;
+    const float d = qz_f16_le(blk);
+    const uint32_t aux = qz_u32_le(blk + 66u + 4u * ib32);
+    const float db = d * (0.5f + static_cast<float>(aux >> 28)) * 0.5f;
+    const uint32_t sbyte = qz_ksign_byte((aux >> (7u * l)) & 127u);
+    const uint16_t g0 = grid[blk[2u + 8u * ib32 + 2u * l]];
+    const uint16_t g1 = grid[blk[2u + 8u * ib32 + 2u * l + 1u]];
+    for (int i = 0; i < 4; ++i) {
+      const float s0 = ((sbyte >> i) & 1u) ? -1.0f : 1.0f;
+      const float s1 = ((sbyte >> (i + 4)) & 1u) ? -1.0f : 1.0f;
+      w8[i] = db * IQ3_MAG[(g0 >> (4u * i)) & 7u] * s0;
+      w8[i + 4] = db * IQ3_MAG[(g1 >> (4u * i)) & 7u] * s1;
+    }
+  } else if constexpr (KIND == 23) {                     // IQ4_XS (block 256)
+    const uint32_t ib32 = octad >> 2, l = octad & 3u;
+    const float d = qz_f16_le(blk);
+    const uint32_t high = qz_u16_le(blk + 2u);
+    const uint32_t low_b = blk[4u + (ib32 >> 1)];
+    const uint32_t low = (ib32 & 1u) ? (low_b >> 4) : (low_b & 15u);
+    const uint32_t ls = low | (((high >> (2u * ib32)) & 3u) << 4);
+    const float dl = d * static_cast<float>(static_cast<int>(ls) - 32);
+    BlkPtr qs = blk + 8u + 16u * ib32 + 8u * (l & 1u);
+    const uint32_t shift = l < 2u ? 0u : 4u;
+    for (int i = 0; i < 8; ++i) w8[i] = dl * IQ4NL_MAG[(qs[i] >> shift) & 15u];
+  }
+}
+"""
+
+_CUDA_SOURCE = r"""
+  auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+  const uint32_t lane = warp.thread_rank();
+  const uint32_t wid = warp.meta_group_rank();
+  const uint32_t first = (blockIdx.x * WARPS + wid) * ROWS;
+  if (first >= N_SIZE) {
+    return;
+  }
+  const uint32_t r = blockIdx.y;
+  const int e = idx[r];
+  const T* xr = x + static_cast<size_t>(r) * K_SIZE;
+  float acc[ROWS];
+  for (int row = 0; row < ROWS; ++row) acc[row] = 0.0f;
+  for (uint32_t k0 = 0; k0 < K_SIZE; k0 += 256u) {
+    const uint32_t v0 = k0 + lane * 8u;
+    if (v0 < K_SIZE) {
+      float xv[8];
+      for (int i = 0; i < 8; ++i) xv[i] = static_cast<float>(xr[v0 + i]);
+      const uint32_t b = v0 / PB;
+      const uint32_t octad = (v0 % PB) / 8u;
+      for (int row = 0; row < ROWS; ++row) {
+        const uint32_t n = first + row;
+        if (n >= N_SIZE) break;
+        const size_t at = (static_cast<size_t>(e) * N_SIZE + n) * K_BLOCKS + b;
+        float w8[8];
+        qz_decode_octad<KIND>(w + at * BB, grid, octad, w8);
+        float dot = 0.0f;
+        for (int i = 0; i < 8; ++i) dot += xv[i] * w8[i];
+        acc[row] += dot;
+      }
+    }
+  }
+  for (int row = 0; row < ROWS; ++row) {
+    const uint32_t n = first + row;
+    const float total = cg::reduce(warp, acc[row], QzSum{});
+    if (lane == 0u && n < N_SIZE) y[static_cast<size_t>(r) * N_SIZE + n] = static_cast<T>(total);
+  }
+"""
+
+_CUDA_TILED = r"""
+  constexpr int BM = 32, BN = 32, BK = 32, LD = 36;
+  __shared__ __align__(16) float Xs[BM * LD];
+  __shared__ __align__(16) float Ws[BK * LD];
+  const uint32_t tid = threadIdx.x;
+  const uint32_t n0 = blockIdx.x * BN;
+  const uint32_t tile = blockIdx.y;
+  const int e = tiles[tile * 3], r0 = tiles[tile * 3 + 1], count = tiles[tile * 3 + 2];
+  const uint32_t lr = tid / 4u, seg = (tid % 4u) * 8u;
+  const uint32_t tm = (tid / 8u) * 2u, tn = (tid % 8u) * 4u;
+  float acc[2][4];
+  for (int rm = 0; rm < 2; ++rm)
+    for (int rn = 0; rn < 4; ++rn) acc[rm][rn] = 0.0f;
+  const size_t row = (static_cast<size_t>(e) * N_SIZE + n0 + lr) * K_BLOCKS;
+  for (uint32_t k0 = 0; k0 < K_SIZE; k0 += BK) {
+    for (int i = 0; i < 8; ++i) {
+      Xs[lr * LD + seg + i] = (static_cast<int>(lr) < count)
+          ? static_cast<float>(x[static_cast<size_t>(r0 + lr) * K_SIZE + k0 + seg + i])
+          : 0.0f;
+    }
+    if (n0 + lr < N_SIZE) {
+      const uint32_t col = k0 + seg;
+      const uint32_t b = col / PB;
+      const uint32_t octad = (col % PB) / 8u;
+      float w8[8];
+      qz_decode_octad<KIND>(w + (row + b) * BB, grid, octad, w8);
+      for (int i = 0; i < 8; ++i) Ws[(seg + i) * LD + lr] = w8[i];
+    } else {
+      for (int i = 0; i < 8; ++i) Ws[(seg + i) * LD + lr] = 0.0f;
+    }
+    __syncthreads();
+    for (int kk = 0; kk < BK; ++kk) {
+      const float a0 = Xs[(tm + 0u) * LD + kk];
+      const float a1 = Xs[(tm + 1u) * LD + kk];
+      const float4 bv = *reinterpret_cast<const float4*>(&Ws[kk * LD + tn]);
+      acc[0][0] += a0 * bv.x; acc[0][1] += a0 * bv.y; acc[0][2] += a0 * bv.z; acc[0][3] += a0 * bv.w;
+      acc[1][0] += a1 * bv.x; acc[1][1] += a1 * bv.y; acc[1][2] += a1 * bv.z; acc[1][3] += a1 * bv.w;
+    }
+    __syncthreads();
+  }
+  for (int rm = 0; rm < 2; ++rm) {
+    if (static_cast<int>(tm + rm) < count) {
+      const size_t y_off = static_cast<size_t>(r0 + tm + rm) * N_SIZE + n0 + tn;
+      for (int rn = 0; rn < 4; ++rn) {
+        if (n0 + tn + rn < N_SIZE) {
+          y[y_off + rn] = static_cast<T>(acc[rm][rn]);
+        }
+      }
+    }
+  }
+"""
 
 
 @lru_cache(maxsize=None)
@@ -367,9 +682,31 @@ def _tiled():
     )
 
 
+@lru_cache(maxsize=None)
+def _cuda_kernel():
+    return cuda_kernels.kernel(
+        name='quanteeze_gguf_qmv_cuda',
+        input_names=['x', 'w', 'grid', 'idx'],
+        output_names=['y'],
+        header=_CUDA_HEADER,
+        source=_CUDA_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _cuda_tiled():
+    return cuda_kernels.kernel(
+        name='quanteeze_gguf_mm_cuda',
+        input_names=['x', 'w', 'grid', 'tiles'],
+        output_names=['y'],
+        header=_CUDA_HEADER,
+        source=_CUDA_TILED,
+    )
+
+
 def takes(experts, x, indices):
-    """Whether this call is a single-row decode/verify call that the Metal GGUF qmv kernel serves."""
-    if not ON[0] or not mx.metal.is_available() or mx.default_device() != mx.gpu:
+    """Whether this call is a single-row decode/verify call that a Metal or CUDA GGUF qmv kernel serves."""
+    if not ON[0] or not _gpu_available():
         return False
     kind = kind_of(experts)
     if kind is None or experts.weight.ndim != 4 or experts.weight.dtype != mx.uint8:
@@ -393,12 +730,27 @@ def run(experts, x, indices):
     rows = int(np.prod(shape))
     xs = mx.contiguous(mx.broadcast_to(x, shape + (1, k)).reshape(rows, k))
     idx = mx.broadcast_to(indices, shape).reshape(rows).astype(mx.int32)
+    template = [
+        ('T', x.dtype), ('K_SIZE', k), ('K_BLOCKS', k // pb), ('N_SIZE', n),
+        ('KIND', kind), ('PB', pb), ('BB', bb), ('ROWS', ROWS),
+    ]
+    if cuda_kernels.available() and not mx.metal.is_available():
+        if rows < 4:
+            idx = mx.pad(idx, (0, 4 - rows))
+        n_blocks = (n + WARPS * ROWS - 1) // (WARPS * ROWS)
+        out_elems = cuda_kernels.roomy(rows * n, x.dtype)
+        y = _cuda_kernel()(
+            inputs=[xs, mx.contiguous(experts.weight), _grid_for(kind), idx],
+            template=template + [('WARPS', WARPS)],
+            grid=(32 * WARPS * n_blocks, rows, 1),
+            threadgroup=(32 * WARPS, 1, 1),
+            output_shapes=[(out_elems,)],
+            output_dtypes=[x.dtype],
+        )[0]
+        return y[:rows * n].reshape(*shape, 1, n)
     y = _kernel()(
         inputs=[xs, mx.contiguous(experts.weight), _grid_for(kind), idx],
-        template=[
-            ('T', x.dtype), ('K_SIZE', k), ('K_BLOCKS', k // pb), ('N_SIZE', n),
-            ('KIND', kind), ('PB', pb), ('BB', bb), ('ROWS', ROWS),
-        ],
+        template=template,
         grid=(32, (n + ROWS - 1) // ROWS, rows),
         threadgroup=(32, 1, 1),
         output_shapes=[(rows, n)],
@@ -415,8 +767,8 @@ def gather(experts, x, indices, unpacked):
 
 
 def takes_rows(experts, x, indices):
-    """Whether this call is a multi-row `x [M, 1, K]`, `indices [M]` call that the tiled Metal GGUF kernel serves."""
-    if not ON[0] or not mx.metal.is_available() or mx.default_device() != mx.gpu:
+    """Whether this call is a multi-row `x [M, 1, K]`, `indices [M]` call that a tiled Metal or CUDA GGUF kernel serves."""
+    if not ON[0] or not _gpu_available():
         return False
     kind = kind_of(experts)
     if kind is None or experts.weight.ndim != 4 or experts.weight.dtype != mx.uint8:
@@ -443,17 +795,32 @@ def run_rows(experts, x, indices):
     if order is not None:
         xs = xs[mx.array(order.astype(np.int32))]
     n_tiles = (n + TILE - 1) // TILE
-    y = _tiled()(
-        inputs=[mx.contiguous(xs), mx.contiguous(experts.weight), _grid_for(kind), mx.array(tiles.reshape(-1))],
-        template=[
-            ('T', x.dtype), ('K_SIZE', k), ('K_BLOCKS', k // pb), ('N_SIZE', n),
-            ('KIND', kind), ('PB', pb), ('BB', bb),
-        ],
-        grid=(128 * n_tiles, len(tiles), 1),
-        threadgroup=(128, 1, 1),
-        output_shapes=[(m, n)],
-        output_dtypes=[x.dtype],
-    )[0]
+    template = [
+        ('T', x.dtype), ('K_SIZE', k), ('K_BLOCKS', k // pb), ('N_SIZE', n),
+        ('KIND', kind), ('PB', pb), ('BB', bb),
+    ]
+    if cuda_kernels.available() and not mx.metal.is_available():
+        flat_tiles = tiles.reshape(-1)
+        if flat_tiles.size < 4:
+            flat_tiles = np.pad(flat_tiles, (0, 4 - flat_tiles.size))
+        out_elems = cuda_kernels.roomy(m * n, x.dtype)
+        y = _cuda_tiled()(
+            inputs=[mx.contiguous(xs), mx.contiguous(experts.weight), _grid_for(kind), mx.array(flat_tiles)],
+            template=template,
+            grid=(128 * n_tiles, len(tiles), 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(out_elems,)],
+            output_dtypes=[x.dtype],
+        )[0][:m * n].reshape(m, n)
+    else:
+        y = _tiled()(
+            inputs=[mx.contiguous(xs), mx.contiguous(experts.weight), _grid_for(kind), mx.array(tiles.reshape(-1))],
+            template=template,
+            grid=(128 * n_tiles, len(tiles), 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(m, n)],
+            output_dtypes=[x.dtype],
+        )[0]
     if order is not None:
         y = y[mx.array(np.argsort(order).astype(np.int32))]
     return y.reshape(m, 1, n)

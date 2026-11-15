@@ -499,6 +499,14 @@ class Demand:
                 for t_name, out_view in remaining_targets:
                     self.base._read(t_name, rows_arg, cache=False, out=out_view)
 
+        if on_cuda and self._prefill_dev:
+            needed_keys = {meta[0] for meta in stage_meta.values()}
+            stale = [k for k in self._prefill_dev if k not in needed_keys]
+            if stale:
+                for k in stale:
+                    del self._prefill_dev[k]
+                mx.clear_cache()
+
         projs = {}
         for p in PROJECTIONS:
             parts = []
@@ -561,12 +569,38 @@ class Demand:
             del stacked, written
             return
 
-        reader = (
-            requant.Reader(self.base.path, self.checkpoint.bits, self.checkpoint.group_size)
-            if isinstance(self.checkpoint, requant.Flat) else self.base
-        )
         t_read = time.perf_counter()
-        fetched = ({p: reader.experts(layer, p, to_read) for p in PROJECTIONS} if to_read.size else None)
+        fetched = None
+        if to_read.size and not isinstance(self.checkpoint, requant.Flat) and self._has_tensor_table():
+            host = self._host()
+            if host is not None:
+                host_bufs = {}
+                host_targets = []
+                for p in PROJECTIONS:
+                    for part in NAMES:
+                        if not self.base.has(layer, p, part):
+                            continue
+                        t_name = self.base.name(layer, p, part)
+                        _, st_dtype, full_shape, _ = self.base.tensors[t_name]
+                        np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
+                        buf = np.empty((int(to_read.size),) + tuple(full_shape[1:]), np_dt)
+                        host_targets.append((t_name, buf))
+                        host_bufs[(p, part)] = (buf, st_dtype)
+                if host.copy_layer(layer, to_read, host_targets):
+                    fetched = {
+                        p: [
+                            None if (p, part) not in host_bufs
+                            else q2_experts._as_mlx(mx.array(host_bufs[(p, part)][0]), host_bufs[(p, part)][1])
+                            for part in NAMES
+                        ]
+                        for p in PROJECTIONS
+                    }
+        if fetched is None:
+            reader = (
+                requant.Reader(self.base.path, self.checkpoint.bits, self.checkpoint.group_size)
+                if isinstance(self.checkpoint, requant.Flat) else self.base
+            )
+            fetched = ({p: reader.experts(layer, p, to_read) for p in PROJECTIONS} if to_read.size else None)
         self.prefill_read_s += time.perf_counter() - t_read
         fetch_map = {int(e): idx for idx, e in enumerate(to_read)}
         slot_arrays = {p: [[], [], []] for p in PROJECTIONS}
@@ -665,11 +699,11 @@ class Demand:
                 return y
             self._prefill_active = None
 
-        if not is_decode:
-            self._after_prefill = True
-            self._decode_steps = 0
-            needed = np.unique(ids)
-            missing = needed[switch.route[needed] < 0]
+        needed = np.unique(ids)
+        if not is_decode or needed.size > self.slots:
+            if not is_decode:
+                self._after_prefill = True
+                self._decode_steps = 0
             if needed.size > self.slots:
                 cap = self._prefill_cap()
                 in_layer_mode = prefill.in_layer() and self.num_experts <= cap
@@ -694,46 +728,66 @@ class Demand:
                     mx.eval(y)
                     return y
 
-                batches = [needed[k:k + cap] for k in range(0, needed.size, cap)]
-                indices_np = np.array(indices) if len(batches) > 1 else None
+                present = needed[switch.route[needed] >= 0]
+                missing = needed[switch.route[needed] < 0]
+                batches = [missing[k:k + cap] for k in range(0, missing.size, cap)]
                 y = None
                 last_batch, last_projs = None, None
-                for k, batch in enumerate(batches):
+                if present.size == 0 and len(batches) == 1:
+                    batch = batches[0]
                     cap_rows = min(
                         cap,
-                        max(int(batch.size), min(self.num_experts, 1 << max(0, int(batch.size) - 1).bit_length())),
+                        min(self.num_experts, max(int(batch.size), ((int(batch.size) + 31) // 32) * 32)),
                     )
                     batch_projs = self._load_prefill_projs(layer, switch, batch, cap_rows)
                     temp = DemandSwitchGLU(
                         layer, batch_projs['gate_proj'], batch_projs['up_proj'], batch_projs['down_proj'],
                         batch, self.num_experts, switch.activation, None,
                     )
-                    if len(batches) == 1:
-                        y = expert_qmv.stock(temp, x, temp._local_indices(indices), scores if switch.weighs else None)
-                    else:
-                        inside = np.isin(indices_np, batch)
+                    y = expert_qmv.stock(temp, x, temp._local_indices(indices), scores if switch.weighs else None)
+                    mx.eval(y)
+                    last_batch, last_projs = batch, batch_projs
+                    del temp
+                else:
+                    indices_np = np.array(indices)
+                    inside_p = None
+                    if present.size > 0:
+                        inside_p = switch.route[indices_np] >= 0
+                        stand_in = mx.where(mx.array(inside_p), switch._local_indices(indices),
+                                            mx.zeros_like(indices, dtype=mx.uint32))
+                        y = expert_qmv.stock(switch, x, stand_in, scores if switch.weighs else None)
+                        mx.eval(y)
+                    for k, batch in enumerate(batches):
+                        cap_rows = min(
+                            cap,
+                            min(self.num_experts, max(int(batch.size), ((int(batch.size) + 31) // 32) * 32)),
+                        )
+                        batch_projs = self._load_prefill_projs(layer, switch, batch, cap_rows)
+                        temp = DemandSwitchGLU(
+                            layer, batch_projs['gate_proj'], batch_projs['up_proj'], batch_projs['down_proj'],
+                            batch, self.num_experts, switch.activation, None,
+                        )
+                        inside = (~inside_p) if (len(batches) == 1 and inside_p is not None) else np.isin(indices_np, batch)
                         stand_in = mx.where(mx.array(inside), temp._local_indices(indices),
                                             mx.zeros_like(indices, dtype=mx.uint32))
                         part = expert_qmv.stock(temp, x, stand_in, scores if switch.weighs else None)
                         y = part if y is None else mx.where(mx.array(inside)[..., None], part, y)
                         del part
-                    mx.eval(y)
-                    if k + 1 == len(batches):
-                        last_batch, last_projs = batch, batch_projs
-                    else:
-                        del batch_projs
-                    del temp
+                        mx.eval(y)
+                        if k + 1 == len(batches):
+                            last_batch, last_projs = batch, batch_projs
+                        else:
+                            del batch_projs
+                        del temp
                 self.prefill_layers += 1
 
                 self._update_bank_after_prefill(switch, needed, last_batch, last_projs)
                 del last_batch, last_projs
                 if layer == self.moe_indices[-1] and not prefill.in_layer():
                     self._release_prefill_buffers()
-                else:
-                    mx.clear_cache()
                 return y
 
-        active_ids = np.unique(ids)
+        active_ids = needed
 
         present_mask = switch.route[active_ids] >= 0
         self.hits += int(present_mask.sum())

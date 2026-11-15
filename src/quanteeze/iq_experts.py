@@ -62,13 +62,21 @@ def tables():
 
 
 def compact_grids():
-    """Compact uint16 IQ codebook tables for Metal kernels (made once)."""
+    """Compact uint16 IQ codebook tables for Metal and CUDA kernels (made once)."""
     if not _COMPACT_GRIDS:
+        on_cuda = not mx.metal.is_available() and mx.default_device() == mx.gpu
+
+        def dev(arr):
+            if on_cuda:
+                arr = arr + mx.zeros_like(arr)
+            mx.eval(arr)
+            return arr
+
         def u16_be(hexes):
-            return mx.array(np.frombuffer(bytes.fromhex(''.join(hexes)), '>u2').astype(np.uint16))
+            return dev(mx.array(np.frombuffer(bytes.fromhex(''.join(hexes)), '>u2').astype(np.uint16)))
 
         def u16_le(hexes):
-            return mx.array(np.frombuffer(bytes.fromhex(''.join(hexes)), '<u2').astype(np.uint16))
+            return dev(mx.array(np.frombuffer(bytes.fromhex(''.join(hexes)), '<u2').astype(np.uint16)))
 
         iq1_grid = u16_be(iq_grids.IQ1S)
         _COMPACT_GRIDS.update({

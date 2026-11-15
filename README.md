@@ -271,7 +271,7 @@ Apple Silicon MacBook Pro（128 GB Unified Memory / M5 Max / 内蔵 SSD）で、
   - 下位ビットへの量子化は、モデルがメモリに収まる場合はメモリ上で、収まらない場合は SSD から読み込みながらオンザフライで実行し、`QUANTEEZE_QUANT_CACHE` でディスクに保存して再起動時の変換を省略できます。
 - **配布済み GGUF（`UD-IQ*` 等）からのエキスパート直接配信（`--experts-gguf` / `QUANTEEZE_EXPERTS_GGUF`）**
   - モデル本体・Attention・PLE / Engram・Vision・MTP は元の MLX チェックポイントのまま保持しつつ、ルーティング・エキスパート重みだけを配布済みの GGUF（単一ファイル、分割シャード `*-00001-of-0000N.gguf`、またはフォルダ）から直接読み込みます。
-  - Unsloth 等の量子化済み混合精度 GGUF（層・射影ごとに異なる `IQ1_S` / `IQ1_M` / `IQ2_XXS` / `IQ2_XS` / `IQ2_S` / `IQ3_XXS` / `IQ4_XS` / `IQ4_NL` / `Q2_K`〜`Q6_K` / `Q4_0`〜`Q8_0` 等が混在するビルド）にも対応し、MLX 形式へ変換せず ggml 生ブロックのままメモリ保持と SSD オンデマンド読み込み（`QUANTEEZE_FROM_SSD_GB`）の両方を、Metal 融合カーネル（`gguf_qmv`）で実行できます。
+  - Unsloth 等の量子化済み混合精度 GGUF（層・射影ごとに異なる `IQ1_S` / `IQ1_M` / `IQ2_XXS` / `IQ2_XS` / `IQ2_S` / `IQ3_XXS` / `IQ4_XS` / `IQ4_NL` / `Q2_K`〜`Q6_K` / `Q4_0`〜`Q8_0` 等が混在するビルド）にも対応し、MLX 形式へ変換せず ggml 生ブロックのままメモリ保持・SSD オンデマンド読み込み（`QUANTEEZE_FROM_SSD_GB`）・CUDA 環境でのホスト RAM キャッシュ（`QUANTEEZE_HOST_EXPERTS_GB`）に対応し、Metal / CUDA 融合カーネル（`gguf_qmv`）で直接実行できます。
 - **メモリ保持とオンデマンド SSD / ホスト RAM ストリーミングの自動切り替え**
   - 利用可能な作業領域（`QUANTEEZE_MEMORY_RESERVE` を差し引いた余裕）にエキスパートが収まる場合はすべてメモリに保持します。
   - 収まらない場合は自動で **オンデマンド SSD ストリーミング**（`QUANTEEZE_FROM_SSD_GB`）へ切り替わり、メモリ内 LRU スロットバンク、省メモリな 1 レイヤーずつのプリフィル（`QUANTEEZE_PREFILL_LAYERS`、`QUANTEEZE_DEMAND_PROMPT_GB`）、および CUDA 環境でのホスト RAM キャッシュ（`QUANTEEZE_HOST_EXPERTS_GB`）を組み合わせて実行します。
@@ -279,7 +279,7 @@ Apple Silicon MacBook Pro（128 GB Unified Memory / M5 Max / 内蔵 SSD）で、
   - **PLE / Engram テーブル（`QUANTEEZE_NGRAM_SSD`）**：数十 GB 規模の Per-Layer Embedding や DeepSeek V4.1 Engram テーブルを `madvise(MADV_WILLNEED)`、マルチスレッド先読み、クロスレイヤー非同期プリフェッチ、または CUDA ピン留めホストメモリを用いて行単位で参照します。
   - **Vision tower・トークン埋め込み（`QUANTEEZE_VISION_SSD`、`QUANTEEZE_EMBED_SSD`）**：画像エンコード時だけ Vision ブロックを `mmap` で順次読み込み、非共有トークン埋め込みも行単位で `mmap` 参照することで、マルチモーダル機能を保ったまま 1〜1.5 GB のメモリをエキスパート用に空けます。
 - **ビット単位で一致検証済みの Metal / CUDA 専用カーネル**
-  - マルチトークン検証 QMV（`verify_qmv`）、単一パス・ルーティングエキスパートカーネル（`expert_qmv`、`cuda_experts`）、Metal K-quant / IQ2_XS / GGUF 直接実行カーネル（`kquant_qmv`、`gguf_qmv`）を搭載。
+  - マルチトークン検証 QMV（`verify_qmv`）、単一パス・ルーティングエキスパートカーネル（`expert_qmv`、`cuda_experts`）、GGUF 直接実行カーネル（`gguf_qmv`、Metal/CUDA 両対応）および Metal K-quant / IQ2_XS カーネル（`kquant_qmv`）を搭載。
   - Hyper-connection / Sinkhorn / FP8（`hyper`、`glm_hyper`、`cuda_v41`）、Linear Attention / Gated Delta Rule（`linear_attn`、`glm_linear_attn`）、ルーター（`sigmoid_router`、`cuda_router`）、疎アテンションインデクサ（`glm_indexer`、`cuda_attn`）、LM ヘッド（`cuda_head`）を各テンソル形状ごとに標準 MLX とビット一致検証してから適用します。
 - **MTP & DSpark 投機的デコーディング（`QUANTEEZE_MTP`）**
   - チェックポイント付属の MTP ヘッドや DeepSeek V4.1 の信頼度ゲート付き DSpark ヘッドで複数トークンを先読みし、1 トークンずつのデコードとビット一致する `QUANTEEZE_MTP_EXACT=bits`、またはより高速な `distribution` モードで検証します。
@@ -320,11 +320,11 @@ uv run python -m quanteeze.variables --markdown
 | 変数 | 既定値 | 説明 |
 |---|---|---|
 | `QUANTEEZE_BITS` | 未設定 | 全ルーティング・エキスパートの均一精度：`8` / `4` / `3` / `2` / `1`（GPU 最小二乗）、`q3_k` / `q2_k` / `iq2_xs`、または `off` / 未設定（元の精度）。 |
-| `QUANTEEZE_EXPERTS_GGUF` | 未設定 | 本体・Vision・MTP は MLX チェックポイントのまま、エキスパート重みだけを読み込む配布済み GGUF パス（単一・分割シャード・フォルダ、`--experts-gguf` と同義）。 |
+| `QUANTEEZE_EXPERTS_GGUF` | 未設定 | 本体・Vision・MTP は MLX チェックポイントのまま、エキスパート重みだけを読み込む配布済み GGUF パス（単一・分割シャード・フォルダ、`--experts-gguf` と同義）。オンデマンド読み込みや CUDA `HostCopy` にも対応。 |
 | `QUANTEEZE_QUANT_CACHE` | 未設定 | 量子化済みエキスパート重みを保存し、再起動時に再利用するディレクトリ。 |
 | `QUANTEEZE_FROM_SSD_GB` | 未設定 | エキスパートを SSD からオンデマンド読み込みし、メモリに保持する容量 GB（`auto` は空き容量に合わせる）。 |
 | `QUANTEEZE_LOAD_WHOLE` | 未設定 | `on` で空き容量に関わらず全重みをメモリへ読み込む。 |
-| `QUANTEEZE_HOST_EXPERTS_GB` | `auto` | CUDA 環境でホスト RAM に保持するエキスパート容量 GB。 |
+| `QUANTEEZE_HOST_EXPERTS_GB` | `auto` | CUDA 環境でホスト RAM に保持するエキスパート容量 GB（MLX safetensors / `--experts-gguf` 両対応）。 |
 | `QUANTEEZE_PREFILL_LAYERS` | `16384` | SSD ストリーミング時、この長さ以下のプロンプトを 1 レイヤーずつプリフィル処理する。 |
 | `QUANTEEZE_DEMAND_PROMPT_GB` | `2` | オンデマンドプリフィル時に一時的な GPU メモリへまとめて読むエキスパートの上限 GB。 |
 | `QUANTEEZE_READ_THREADS` | `4` | オンデマンド SSD 読み込みに使うスレッド数。 |

@@ -170,21 +170,24 @@ def _threads(experts):
 
 
 def takes(logits, k):
-    """Whether route() computes this one row's routing as MLX's ops do: bfloat16 logits of at most
-    8192 experts (an index in 16 bits), top 16 at most."""
+    """Whether route() computes these rows' routing as MLX's ops do: bfloat16 logits of at most
+    8192 experts (an index in 16 bits), top 16 at most, 1 to 64 rows."""
+    if not cuda_kernels.available() or logits.dtype != mx.bfloat16 or logits.ndim < 1:
+        return False
     e = logits.shape[-1]
-    return (cuda_kernels.available() and logits.dtype == mx.bfloat16 and logits.size == e and 0 < k <= min(16, e)
-            and e <= 8192)
+    rows = logits.size // e if e > 0 else 0
+    return e > 0 and logits.size == rows * e and 1 <= rows <= 64 and 0 < k <= min(16, e) and e <= 8192
 
 
 def route(logits, k):
-    """(indices, scores) of a row of router logits: argpartition's top k of their precise softmax
+    """(indices, scores) of router logits rows: argpartition's top k of their precise softmax
     and those gates renormalized, in one kernel."""
     e = logits.shape[-1]
+    rows = max(1, logits.size // e)
     block = _threads(e)
     shape = (*logits.shape[:-1], k)
-    return tuple(_kernel()(inputs=[logits, _count(e)], template=[('T', logits.dtype), ('K', int(k))],
-                           grid=(block, 1, 1), threadgroup=(block, 1, 1), output_shapes=[shape, shape],
+    return tuple(_kernel()(inputs=[mx.contiguous(logits), _count(e)], template=[('T', logits.dtype), ('K', int(k))],
+                           grid=(block * rows, 1, 1), threadgroup=(block, 1, 1), output_shapes=[shape, shape],
                            output_dtypes=[mx.uint32, logits.dtype]))
 
 
@@ -200,7 +203,9 @@ def routed(logits, k):
     """(indices, scores) through route() where this shape matched MLX's ops, else theirs."""
     if not ON[0] or not takes(logits, k):
         return original(logits, k)
-    key = (logits.shape[-1], int(k), str(logits.dtype))
+    e = logits.shape[-1]
+    rows = max(1, logits.size // e)
+    key = (e, int(k), str(logits.dtype)) if rows == 1 else (rows, e, int(k), str(logits.dtype))
     choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
     if choice is not None and seen >= CHECKS:
         if choice:

@@ -1079,9 +1079,9 @@ def _write_gguf(path, tensors, alignment=32):
 
 @pytest.mark.parametrize('kind,name', sorted(__import__('quanteeze.iq_experts', fromlist=['TYPES']).TYPES.items()))
 def test_iq_experts_and_gguf_qmv_all_21_types(kind, name):
-    """All 21 ggml types decode identically via `requant.dequantize` and match `gguf_qmv` on Metal."""
+    """All 21 ggml types decode identically via `requant.dequantize` and match `gguf_qmv` on GPU."""
     import mlx.nn as nn
-    from quanteeze import gguf_qmv, iq_experts
+    from quanteeze import cuda_kernels, gguf_qmv, iq_experts
 
     rng = np.random.default_rng(1000 + kind)
     e, n, pb = 6, 36, iq_experts.per_block(kind)
@@ -1096,7 +1096,7 @@ def test_iq_experts_and_gguf_qmv_all_21_types(kind, name):
     mx.eval(dec_direct, dec_req)
     np.testing.assert_allclose(np.array(dec_req), np.array(dec_direct), rtol=0, atol=0)
 
-    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+    if not (mx.metal.is_available() or cuda_kernels.available()) or mx.default_device() != mx.gpu:
         return
 
     proj = nn.Module()
@@ -1941,8 +1941,755 @@ def test_efforts_qwen36_preopened_response_template_and_chat_template_kwargs():
     )
 
 
+def test_gguf_qmv_cuda_sources_and_dispatch(tmp_path, monkeypatch):
+    """Compile and execute `_CUDA_HEADER` (`qz_decode_octad`) across all 21 ggml formats in C++17,
+    type-check `_CUDA_SOURCE` and `_CUDA_TILED` verbatim, and verify CUDA Python dispatch/padding."""
+    import ctypes
+    import shutil
+    import subprocess
+    import mlx.nn as nn
+    from quanteeze import cuda_kernels, gguf_qmv, iq_experts
+
+    cxx = shutil.which('c++') or shutil.which('clang++') or shutil.which('g++')
+    if cxx is not None:
+        cases = '\n'.join(
+            f'      case {k}: qz_decode_octad<{k}>(blk, grid, oct, bo + oct * 8u); break;'
+            for k in sorted(iq_experts.TYPES)
+        )
+        cpp = f"""
+#include <cstdint>
+#include <cstddef>
+#include <cstring>
+
+#define __device__
+#define __forceinline__ inline
+#define __shared__
+#define __align__(x) alignas(x)
+
+struct float4 {{ float x, y, z, w; }};
+struct dim3_stub {{ uint32_t x, y, z; }};
+static thread_local dim3_stub blockIdx{{0, 0, 0}}, threadIdx{{0, 0, 0}};
+inline void __syncthreads() {{}}
+inline float __uint_as_float(uint32_t u) {{ float f; std::memcpy(&f, &u, sizeof(f)); return f; }}
+inline uint16_t __ushort_as_half(uint16_t u) {{ return u; }}
+inline int __popc(uint32_t x) {{ return __builtin_popcount(x); }}
+inline float __half2float(uint16_t h) {{
+  uint32_t s = static_cast<uint32_t>(h & 0x8000u) << 16;
+  int e = (h >> 10) & 0x1f;
+  uint32_t m = h & 0x03ffu;
+  if (e == 0) {{
+    if (m == 0u) return __uint_as_float(s);
+    e = 1;
+    while ((m & 0x0400u) == 0u) {{ m <<= 1; e--; }}
+    m &= 0x03ffu;
+  }} else if (e == 31) {{
+    return __uint_as_float(s | 0x7f800000u | (m << 13));
+  }}
+  return __uint_as_float(s | (static_cast<uint32_t>(e + 112) << 23) | (m << 13));
+}}
+struct QzSum {{ template <typename U> U operator()(U a, U b) const {{ return a + b; }} }};
+struct StubBF16 {{
+  uint16_t v;
+  StubBF16() = default;
+  explicit StubBF16(float f) {{ uint32_t u; std::memcpy(&u, &f, 4); v = static_cast<uint16_t>(u >> 16); }}
+  explicit operator float() const {{ return __uint_as_float(static_cast<uint32_t>(v) << 16); }}
+}};
+namespace cg {{
+struct Block {{}};
+inline Block this_thread_block() {{ return {{}}; }}
+template <int N> struct Tile {{
+  uint32_t thread_rank() const {{ return 0; }}
+  uint32_t meta_group_rank() const {{ return 0; }}
+}};
+template <int N> Tile<N> tiled_partition(Block) {{ return {{}}; }}
+template <int N, typename U, typename Op> U reduce(Tile<N>, U val, Op) {{ return val; }}
+}}
+
+{gguf_qmv._CUDA_HEADER}
+
+template <typename T, int K_SIZE, int K_BLOCKS, int N_SIZE, int KIND, int PB, int BB, int ROWS, int WARPS>
+void instantiate_qmv(const T* x, const uint8_t* w, const uint16_t* grid, const int* idx, T* y) {{
+{gguf_qmv._CUDA_SOURCE}
+}}
+
+template <typename T, int K_SIZE, int K_BLOCKS, int N_SIZE, int KIND, int PB, int BB>
+void instantiate_mm(const T* x, const uint8_t* w, const uint16_t* grid, const int* tiles, T* y) {{
+{gguf_qmv._CUDA_TILED}
+}}
+
+template void instantiate_qmv<float, 256, 1, 36, 16, 256, 66, 4, 4>(
+    const float*, const uint8_t*, const uint16_t*, const int*, float*);
+template void instantiate_qmv<StubBF16, 256, 1, 36, 16, 256, 66, 4, 4>(
+    const StubBF16*, const uint8_t*, const uint16_t*, const int*, StubBF16*);
+template void instantiate_mm<float, 256, 1, 36, 16, 256, 66>(
+    const float*, const uint8_t*, const uint16_t*, const int*, float*);
+template void instantiate_mm<StubBF16, 256, 1, 36, 16, 256, 66>(
+    const StubBF16*, const uint8_t*, const uint16_t*, const int*, StubBF16*);
+
+extern "C" void decode_blocks(int kind, const uint8_t* w, const uint16_t* grid, int n_blocks, int pb, int bb,
+                              float* out) {{
+  for (int b = 0; b < n_blocks; ++b) {{
+    const uint8_t* blk = w + b * bb;
+    float* bo = out + b * pb;
+    for (uint32_t oct = 0; oct < static_cast<uint32_t>(pb / 8); ++oct) {{
+      switch (kind) {{
+{cases}
+      }}
+    }}
+  }}
+}}
+"""
+        src_path = tmp_path / 'check_gguf_cuda.cpp'
+        so_path = tmp_path / 'check_gguf_cuda.so'
+        src_path.write_text(cpp, encoding='utf-8')
+        subprocess.run([cxx, '-std=c++17', '-O2', '-shared', '-fPIC', str(src_path), '-o', str(so_path)], check=True)
+        lib = ctypes.CDLL(str(so_path))
+        lib.decode_blocks.argtypes = [
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p
+        ]
+        grids = iq_experts.compact_grids()
+        dummy_grid = np.zeros((8,), dtype=np.uint16)
+        rng = np.random.default_rng(2026)
+        for kind in sorted(iq_experts.TYPES):
+            pb, bb = iq_experts.per_block(kind), iq_experts.BLOCK[kind]
+            n_blocks = 4
+            raw = _random_ggml_blocks(rng, kind, n_blocks)
+            grid_np = np.array(grids[kind], dtype=np.uint16) if kind in grids else dummy_grid
+            got = np.empty((n_blocks, pb), dtype=np.float32)
+            lib.decode_blocks(kind, raw.ctypes.data, grid_np.ctypes.data, n_blocks, pb, bb, got.ctypes.data)
+            want = np.array(iq_experts.decode(mx.array(raw), kind))
+            np.testing.assert_allclose(got, want, rtol=0, atol=0)
+
+    # Verify Python CUDA dispatch, padding for < 4 rows, and tiled index sorting/restoring
+    captured = {}
+
+    class FakeCudaKernel:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def __call__(self, inputs, template, grid, threadgroup, output_shapes, output_dtypes):
+            captured[self.tag] = {
+                'inputs': inputs, 'template': dict(template),
+                'grid': grid, 'threadgroup': threadgroup,
+                'output_shapes': output_shapes, 'output_dtypes': output_dtypes,
+            }
+            if self.tag == 'qmv':
+                xs, w, _grid, idx = inputs
+                t = dict(template)
+                w_unp = iq_experts.decode(w.reshape(-1, w.shape[-1]), t['KIND']).reshape(
+                    w.shape[0], t['N_SIZE'], t['K_SIZE']
+                ).astype(t['T'])
+                rows_used = idx[:xs.shape[0]].astype(mx.uint32)
+                ref = mx.gather_mm(xs[:, None, :], w_unp.swapaxes(-1, -2), rhs_indices=rows_used).reshape(-1)
+                pad = output_shapes[0][0] - ref.size
+                out = mx.pad(ref, (0, pad)) if pad > 0 else ref
+                return [out]
+            xs, w, _grid, tiles = inputs
+            t = dict(template)
+            w_np = np.array(
+                iq_experts.decode(w.reshape(-1, w.shape[-1]), t['KIND']).reshape(w.shape[0], t['N_SIZE'], t['K_SIZE']),
+                dtype=np.float32,
+            )
+            xs_np = np.array(xs.astype(mx.float32), dtype=np.float32)
+            raw_tiles = np.array(tiles).reshape(-1)
+            tiles_np = raw_tiles[: (raw_tiles.size // 3) * 3].reshape(-1, 3)
+            pieces = []
+            for e_id, r0, cnt in tiles_np:
+                if cnt <= 0:
+                    continue
+                pieces.append(xs_np[int(r0):int(r0 + cnt)] @ w_np[int(e_id)].T)
+            ref = mx.array(np.concatenate(pieces, axis=0).reshape(-1), dtype=t['T'])
+            pad = output_shapes[0][0] - ref.size
+            out = mx.pad(ref, (0, pad)) if pad > 0 else ref
+            return [out]
+
+    monkeypatch.setattr(gguf_qmv.mx.metal, 'is_available', lambda: False)
+    monkeypatch.setattr(gguf_qmv, 'mx', gguf_qmv.mx)
+    monkeypatch.setattr(cuda_kernels, 'available', lambda: True)
+    monkeypatch.setattr(gguf_qmv.mx, 'default_device', lambda: mx.gpu)
+    monkeypatch.setattr(gguf_qmv, '_cuda_kernel', lambda: FakeCudaKernel('qmv'))
+    monkeypatch.setattr(gguf_qmv, '_cuda_tiled', lambda: FakeCudaKernel('mm'))
+
+    rng = np.random.default_rng(909)
+    raw = _random_ggml_blocks(rng, iq_experts.Q4_K, 4 * 20 * 1).reshape(4, 20, 1, iq_experts.BLOCK[iq_experts.Q4_K])
+    proj = nn.Module()
+    proj.weight = mx.array(raw)
+    proj.mode = 'gguf:q4_k'
+    proj.group_size = 256
+    proj.bits = 4
+    mx.eval(proj.parameters())
+
+    w_dec = iq_experts.decode(proj.weight.reshape(-1, proj.weight.shape[-1]), iq_experts.Q4_K).reshape(4, 20, 256)
+
+    # Single-row decode (`rows == 1`) pads `idx` to 4 int32s (16 bytes) and sets CUDA WARPS grid
+    x_one = mx.array(rng.standard_normal((1, 1, 256)).astype(np.float32), dtype=mx.bfloat16)
+    idx_one = mx.array([[2]], dtype=mx.uint32)
+    assert gguf_qmv.takes(proj, x_one, idx_one)
+    y_one = gguf_qmv.run(proj, x_one, idx_one)
+    want_one = mx.gather_mm(x_one, w_dec.astype(mx.bfloat16).swapaxes(-1, -2), rhs_indices=idx_one)
+    mx.eval(y_one, want_one)
+    assert y_one.shape == want_one.shape == (1, 1, 1, 20)
+    np.testing.assert_allclose(np.array(y_one.astype(mx.float32)), np.array(want_one.astype(mx.float32)), rtol=1e-2, atol=1e-2)
+    assert captured['qmv']['inputs'][3].shape == (4,)
+    assert captured['qmv']['template']['WARPS'] == gguf_qmv.WARPS
+    assert captured['qmv']['threadgroup'] == (32 * gguf_qmv.WARPS, 1, 1)
+    assert captured['qmv']['grid'] == (32 * gguf_qmv.WARPS * 2, 1, 1)
+
+    # Single-tile prefill (`len(tiles) == 1`) pads `flat_tiles` from 3 to 4 int32s (16 bytes)
+    x_t1 = mx.array(rng.standard_normal((2, 1, 256)).astype(np.float32), dtype=mx.float32)
+    idx_t1 = mx.array([2, 2], dtype=mx.uint32)
+    y_t1 = gguf_qmv.run_rows(proj, x_t1, idx_t1)
+    mx.eval(y_t1)
+    assert captured['mm']['inputs'][3].shape == (4,)
+
+    # Unsorted prefill rows restore original ordering after sorted tiled dispatch
+    x_pre = mx.array(rng.standard_normal((10, 1, 256)).astype(np.float32), dtype=mx.float32)
+    idx_pre = mx.array([3, 0, 2, 1, 3, 2, 0, 1, 2, 3], dtype=mx.uint32)
+    assert gguf_qmv.takes_rows(proj, x_pre, idx_pre)
+    y_pre = gguf_qmv.run_rows(proj, x_pre, idx_pre)
+    want_pre = mx.gather_mm(x_pre, w_dec.swapaxes(-1, -2), rhs_indices=idx_pre)
+    mx.eval(y_pre, want_pre)
+    want_fp32 = np.einsum(
+        'mk,mnk->mn',
+        np.array(x_pre[:, 0], dtype=np.float32),
+        np.array(w_dec, dtype=np.float32)[np.array(idx_pre)],
+    )[:, None, :]
+    assert captured['mm']['threadgroup'] == (128, 1, 1)
+    np.testing.assert_allclose(np.array(y_pre), want_fp32, rtol=1e-5, atol=1e-4)
+    assert float(mx.abs(y_pre - want_pre).max().item()) <= (
+        gguf_qmv.TOLERANCE * max(float(mx.abs(want_pre).max().item()), 1e-30)
+    )
 
 
+def test_gguf_experts_host_copy_and_mixed_precision_prefill(tmp_path, monkeypatch):
+    """`ExpertGGUF` integrates with `q2_experts.HostCopy` (`by_rows=False` and `True`), `serve._hold_experts`,
+    and `Demand` mixed-precision chunked prefill + lazy ring-buffer decode staging."""
+    import mlx.nn as nn
+    from quanteeze import demand, gguf_experts, iq_experts, prefill, q2_experts, serve
 
+    class DummyCache:
+        def __init__(self):
+            self.offset = 0
+            self.max_size = None
+
+    class SplitMoELayer(nn.Module):
+        def __init__(self, sw):
+            super().__init__()
+            mlp = nn.Module()
+            mlp.switch_mlp = sw
+            mlp.top_k = 4
+            self.mlp = mlp
+
+        def _pre(self, x, idx, cache=None):
+            if cache is not None:
+                cache.offset += x.shape[1]
+            return x, idx
+
+        def _post(self, x, idx):
+            return self.mlp.switch_mlp(x, idx).sum(axis=-2)
+
+        def __call__(self, x, idx, cache=None):
+            h, i = self._pre(x, idx, cache=cache)
+            return self._post(h, i)
+
+    class ToyLM(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.layers = layers
+
+        def make_cache(self):
+            return [DummyCache() for _ in self.layers]
+
+    prefill.split(SplitMoELayer, SplitMoELayer._pre, SplitMoELayer._post)
+
+    rng = np.random.default_rng(1707)
+    n_exp, d_in, d_hid = 16, 256, 256
+    layer_specs = [
+        ('stacked', {'gate_proj': iq_experts.IQ2_XXS, 'up_proj': iq_experts.IQ1_M, 'down_proj': iq_experts.Q4_K}),
+        ('per_expert', {'gate_proj': iq_experts.IQ2_XS, 'up_proj': iq_experts.Q3_K, 'down_proj': iq_experts.IQ4_NL}),
+    ]
+    gguf_name = {'gate_proj': 'ffn_gate', 'up_proj': 'ffn_up', 'down_proj': 'ffn_down'}
+
+    raw_arrays = {}
+    shard_tensors = [[], []]
+    for l_idx, (layout, projs) in enumerate(layer_specs):
+        for p, kind in projs.items():
+            out_d, in_d = (d_in, d_hid) if p == 'down_proj' else (d_hid, d_in)
+            kb = in_d // iq_experts.per_block(kind)
+            arr = _random_ggml_blocks(rng, kind, n_exp * out_d * kb).reshape(n_exp, out_d, kb, iq_experts.BLOCK[kind])
+            raw_arrays[(l_idx, p)] = (arr, kind)
+            if layout == 'stacked':
+                shard_tensors[l_idx].append(
+                    (f'blk.{l_idx}.{gguf_name[p]}_exps.weight', (in_d, out_d, n_exp), kind, arr.tobytes())
+                )
+            else:
+                for e in range(n_exp):
+                    shard_tensors[l_idx].append(
+                        (f'blk.{l_idx}.{gguf_name[p]}.{e}.weight', (in_d, out_d), kind, arr[e].tobytes())
+                    )
+
+    gdir = tmp_path / 'ud_shards'
+    gdir.mkdir()
+    shard1 = gdir / 'ud-00001-of-00002.gguf'
+    shard2 = gdir / 'ud-00002-of-00002.gguf'
+    _write_gguf(shard1, shard_tensors[0])
+    _write_gguf(shard2, shard_tensors[1])
+
+    src = gguf_experts.ExpertGGUF(shard1)
+    assert src.routed() == [
+        'blk.0.ffn_gate_exps.weight', 'blk.0.ffn_up_exps.weight', 'blk.0.ffn_down_exps.weight',
+        'blk.1.ffn_gate_exps.weight', 'blk.1.ffn_up_exps.weight', 'blk.1.ffn_down_exps.weight',
+    ]
+
+    # 1) Whole-tensor HostCopy (`by_rows=False`) invoked via shard file path
+    layer0_bytes = sum(src.nbytes(src.name(0, p, 'weight')) for p in ('gate_proj', 'up_proj', 'down_proj'))
+    try:
+        whole = q2_experts.hold(shard1, budget=layer0_bytes, workers=1, by_rows=False)
+        whole.wait()
+        assert not whole.by_rows
+        assert np.array_equal(whole.rows('blk.0.ffn_up_exps.weight', [3, 9]), raw_arrays[(0, 'up_proj')][0][[3, 9]])
+        assert whole.rows('blk.1.ffn_gate_exps.weight') is None
+    finally:
+        q2_experts.let_go(shard1)
+
+    # 2) Row-wise HostCopy (`by_rows=True`) through `serve._hold_experts` + `Demand` prefill & decode
+    def make_model():
+        layers = []
+        for _ in range(2):
+            sw = SwitchGLU(input_dims=d_in, hidden_dims=d_hid, num_experts=n_exp, bias=False)
+            layers.append(SplitMoELayer(sw))
+        return ToyLM(layers)
+
+    m_mem = make_model()
+    gguf_experts.load_model(m_mem.layers, src)
+    m_ssd = make_model()
+
+    monkeypatch.setenv('QUANTEEZE_HOST_EXPERTS_GB', '1')
+    monkeypatch.setenv('QUANTEEZE_HOST_EXPERTS_BY', 'rows')
+    held = serve._hold_experts(src)
+    assert held is not None
+    dem = None
+    prefill.JOINS.clear()
+    prefill.times(reset=True)
+    monkeypatch.setenv('QUANTEEZE_PROMPT_MOE_TOKENS', '32')
+    monkeypatch.setattr(demand.mx.metal, 'is_available', lambda: False)
+    try:
+        held.wait()
+        assert held.by_rows
+        assert held.holds_layer(0) and held.holds_layer(1)
+
+        k0 = src.name(0, 'up_proj', 'weight')
+        sub_buf = np.empty((3,) + raw_arrays[(0, 'up_proj')][0].shape[1:], dtype=np.uint8)
+        assert held.copy_layer(0, [2, 7, 13], [(k0, sub_buf)]) is True
+        assert np.array_equal(sub_buf, raw_arrays[(0, 'up_proj')][0][[2, 7, 13]])
+
+        k1 = src.name(1, 'gate_proj', 'weight')
+        full_buf = np.empty_like(raw_arrays[(1, 'gate_proj')][0])
+        assert held.copy_layer(1, None, [(k1, full_buf)]) is True
+        assert np.array_equal(full_buf, raw_arrays[(1, 'gate_proj')][0])
+
+        dem = demand.Demand(m_ssd, src, budget_bytes=1, workers=2)
+        assert dem.slots == 8
+        assert len(dem._stage_ring) == demand._STAGE_RING
+        prefill.install(m_ssd.layers, chunk=16, enabled=lambda: True)
+
+        # Prompt prefill (> 1 chunk) exercises mixed-precision `_load_prefill_projs` and stale-key eviction
+        prompt_len = 48
+        x_pre = mx.array(rng.standard_normal((1, prompt_len, d_in)).astype(np.float32), dtype=mx.bfloat16)
+        idx_pre = mx.array((np.arange(prompt_len * 4, dtype=np.uint32).reshape(1, prompt_len, 4)) % n_exp)
+        mx.eval(x_pre, idx_pre)
+
+        c_mem, c_ssd = m_mem.make_cache(), m_ssd.make_cache()
+        h_mem, h_ssd = x_pre, x_pre
+        for l_idx in range(2):
+            h_mem = m_mem.layers[l_idx](h_mem, idx_pre, cache=c_mem[l_idx])
+            h_ssd = m_ssd.layers[l_idx](h_ssd, idx_pre, cache=c_ssd[l_idx])
+        mx.eval(h_mem, h_ssd)
+        np.testing.assert_allclose(
+            np.array(h_ssd.astype(mx.float32)),
+            np.array(h_mem.astype(mx.float32)),
+            rtol=2e-2, atol=2e-2,
+        )
+        assert dem.prefill_layers == 2
+        assert len(src._ahead) == 0
+        assert len(dem._prefill_stage) == 0
+        assert len(dem._prefill_dev) == 0
+
+        # Lazy pipelined decode steps (> 2 * _STAGE_RING) exercise host-cached GGUF staging & ring wrap-around
+        lazy_pairs = []
+        for step in range(2 * demand._STAGE_RING + 2):
+            base = (step * 4) % n_exp
+            exps = [(base + offset) % n_exp for offset in range(4)]
+            x_dec = mx.array(rng.standard_normal((1, 1, d_in)).astype(np.float32), dtype=mx.bfloat16)
+            idx_dec = mx.array([[exps]], dtype=mx.uint32)
+            mx.eval(x_dec, idx_dec)
+            for l_idx in range(2):
+                lazy_pairs.append((
+                    m_mem.layers[l_idx].mlp.switch_mlp(x_dec, idx_dec),
+                    m_ssd.layers[l_idx].mlp.switch_mlp(x_dec, idx_dec),
+                ))
+        for y_mem, y_ssd in lazy_pairs:
+            mx.eval(y_mem, y_ssd)
+            np.testing.assert_allclose(
+                np.array(y_ssd.astype(mx.float32)),
+                np.array(y_mem.astype(mx.float32)),
+                rtol=2e-2, atol=2e-2,
+            )
+        assert dem.misses > 0
+        assert dem.host_served == dem.misses
+    finally:
+        prefill.release()
+        if dem is not None:
+            dem.close()
+        q2_experts.let_go(src)
+
+
+def test_demand_short_prefill_skips_resident_experts_and_parallel_host_copy(tmp_path):
+    """Short uncached prefill skips re-loading GPU-resident experts, `_update_bank_after_prefill`
+    reads missing promotions from `HostCopy` before SSD while keeping `host_served == misses`,
+    and parallel `HostCopy.copy_layer` matches single-worker output on >= 512 KiB slices."""
+    import mlx.nn as nn
+    from quanteeze import demand, q2_experts
+
+    rng = np.random.default_rng(23)
+    host_dir = tmp_path / 'big'
+    big_tensors = {}
+    for proj in ('gate_proj', 'up_proj', 'down_proj'):
+        big_tensors[f'layers.0.mlp.switch_mlp.{proj}.weight'] = mx.array(
+            rng.integers(0, 1 << 31, size=(8, 256, 128), dtype=np.uint32)
+        )
+        big_tensors[f'layers.0.mlp.switch_mlp.{proj}.scales'] = mx.ones((8, 256, 4), dtype=mx.bfloat16)
+        big_tensors[f'layers.0.mlp.switch_mlp.{proj}.biases'] = mx.zeros((8, 256, 4), dtype=mx.bfloat16)
+    mx.eval(list(big_tensors.values()))
+    host_dir.mkdir()
+    mx.save_safetensors(str(host_dir / 'model.safetensors'), big_tensors)
+
+    ckpt_big = q2_experts.Checkpoint(host_dir)
+    hc4 = q2_experts.HostCopy(ckpt_big, budget=1 << 28, workers=4, by_rows=True)
+    hc1 = q2_experts.HostCopy(ckpt_big, budget=1 << 28, workers=1, by_rows=True)
+    try:
+        hc4.wait()
+        hc1.wait()
+        targets4, targets1 = [], []
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            for part in ('weight', 'scales', 'biases'):
+                name = ckpt_big.name(0, proj, part)
+                _, st_dtype, full_shape, _ = ckpt_big.tensors[name]
+                np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
+                targets4.append((name, np.empty(full_shape, np_dt)))
+                targets1.append((name, np.empty(full_shape, np_dt)))
+        assert hc4.copy_layer(0, None, targets4) is True
+        assert hc1.copy_layer(0, None, targets1) is True
+        for (_, a4), (_, a1) in zip(targets4, targets1):
+            np.testing.assert_array_equal(a4, a1)
+
+        subset = np.array([1, 3, 5, 7], dtype=np.int64)
+        sub4, sub1 = [], []
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            for part in ('weight', 'scales', 'biases'):
+                name = ckpt_big.name(0, proj, part)
+                _, st_dtype, full_shape, _ = ckpt_big.tensors[name]
+                np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
+                sub4.append((name, np.empty((subset.size,) + tuple(full_shape[1:]), np_dt)))
+                sub1.append((name, np.empty((subset.size,) + tuple(full_shape[1:]), np_dt)))
+        assert hc4.copy_layer(0, subset, sub4) is True
+        assert hc1.copy_layer(0, subset, sub1) is True
+        for (_, a4), (_, a1) in zip(sub4, sub1):
+            np.testing.assert_array_equal(a4, a1)
+    finally:
+        hc4.close()
+        hc1.close()
+
+    model_dir = tmp_path / 'moe'
+    model_dir.mkdir()
+    mx.random.seed(29)
+    sw_base = SwitchGLU(input_dims=64, hidden_dims=64, num_experts=16, bias=False)
+    for proj in ('gate_proj', 'up_proj', 'down_proj'):
+        setattr(sw_base, proj, getattr(sw_base, proj).to_quantized(group_size=64, bits=4))
+    mx.eval(sw_base.parameters())
+    moe_tensors = {}
+    for proj in ('gate_proj', 'up_proj', 'down_proj'):
+        p = getattr(sw_base, proj)
+        moe_tensors[f'layers.0.mlp.switch_mlp.{proj}.weight'] = p.weight
+        moe_tensors[f'layers.0.mlp.switch_mlp.{proj}.scales'] = p.scales
+        moe_tensors[f'layers.0.mlp.switch_mlp.{proj}.biases'] = p.biases
+    mx.save_safetensors(str(model_dir / 'model.safetensors'), moe_tensors)
+
+    def make_model():
+        sw = SwitchGLU(input_dims=64, hidden_dims=64, num_experts=16, bias=False)
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            setattr(sw, proj, getattr(sw, proj).to_quantized(group_size=64, bits=4))
+        mlp = nn.Module()
+        mlp.switch_mlp = sw
+        layer = nn.Module()
+        layer.mlp = mlp
+        m = nn.Module()
+        m.layers = [layer]
+        return m
+
+    held = q2_experts.hold(model_dir, budget=1 << 28, workers=4, by_rows=True)
+    held.wait()
+    d_short = None
+    d_batched = None
+    try:
+        m_short, m_batched = make_model(), make_model()
+        d_short = demand.Demand(m_short, q2_experts.Checkpoint(model_dir), budget_bytes=1, workers=2, prompt_room=None)
+        d_batched = demand.Demand(m_batched, q2_experts.Checkpoint(model_dir), budget_bytes=1, workers=2, prompt_room=1)
+        assert d_short.slots == 8 and d_batched.slots == 8
+
+        recorded_loads = []
+        orig_load = d_short._load_prefill_projs
+
+        def spy_load(layer, switch, expert_ids, cap_rows):
+            recorded_loads.append(np.asarray(expert_ids, dtype=np.int64).tolist())
+            return orig_load(layer, switch, expert_ids, cap_rows)
+
+        d_short._load_prefill_projs = spy_load
+
+        x_short = mx.random.normal((1, 16, 64)).astype(mx.bfloat16)
+        idx_short = mx.array((np.arange(16 * 4, dtype=np.uint32).reshape(1, 16, 4)) % 12)
+        scores_short = mx.ones((1, 16, 4), dtype=mx.bfloat16) * 0.25
+        mx.eval(x_short, idx_short, scores_short)
+
+        y_ref_short = expert_qmv.stock(sw_base, x_short, idx_short)
+        y_short = m_short.layers[0].mlp.switch_mlp(x_short, idx_short, scores_short)
+        mx.eval(y_ref_short, y_short)
+
+        assert recorded_loads == [[8, 9, 10, 11]]
+        assert mx.array_equal(y_short, y_ref_short)
+
+        copy_calls = []
+        orig_copy = held.copy_layer
+
+        def spy_copy(layer, experts, targets):
+            copy_calls.append(None if experts is None else np.asarray(experts, dtype=np.int64).tolist())
+            return orig_copy(layer, experts, targets)
+
+        held.copy_layer = spy_copy
+
+        x_all = mx.random.normal((1, 20, 64)).astype(mx.bfloat16)
+        idx_all_np = (np.arange(20 * 4, dtype=np.uint32).reshape(1, 20, 4)) % 16
+        scores_all_np = np.full((1, 20, 4), 0.1, dtype=np.float32)
+        scores_all_np[idx_all_np == 8] = 5.0
+        idx_all = mx.array(idx_all_np)
+        scores_all = mx.array(scores_all_np).astype(mx.bfloat16)
+        mx.eval(x_all, idx_all, scores_all)
+
+        y_ref_all = expert_qmv.stock(sw_base, x_all, idx_all)
+        y_batched = m_batched.layers[0].mlp.switch_mlp(x_all, idx_all, scores_all)
+        mx.eval(y_ref_all, y_batched)
+
+        assert mx.array_equal(y_batched, y_ref_all)
+        assert [8] in copy_calls
+        assert d_batched.host_served == d_batched.misses == 0
+        assert 8 in d_batched.switches[0].experts.tolist()
+    finally:
+        if d_short is not None:
+            d_short.close()
+        if d_batched is not None:
+            d_batched.close()
+        q2_experts.let_go(model_dir)
+
+
+def test_admission_short_lengths_wanted_and_on_demand_coalesce(monkeypatch):
+    """Per-row `lengths`/`wanted` budgeting admits all short concurrent prompts (`rows == 4`),
+    `admission.install` forwards `(lengths, wanted)` from `_unprocessed_sequences`, and
+    `serve._coalesce_on_demand` enables `ON_DEMAND_COALESCE_S` only when idle, batched, and serving on demand."""
+    from quanteeze import admission, serve
+
+    adm = admission.Admission(
+        limit=16 * 1024**3,
+        fixed=600 * 1024**2,
+        batch_fixed=450 * 1024**2,
+        most=8,
+        ahead=4096,
+    )
+    adm.per_token = float(2 * 1024**2)
+    adm.kv_token = float(512 * 1024)
+    held = int(13.8 * 1024**3)
+    assert adm.rows(4, 4, 512, False, held=held, lengths=[48, 52, 44, 50], wanted=[256, 256, 256, 256]) == 4
+    assert adm.rows(4, 4, 512, False, held=held) == 1
+
+    seen_calls = []
+    orig_rows = adm.rows
+
+    def spy_rows(pending, free_rows, step, busy, held=None, remaining=(), lengths=None, wanted=None):
+        seen_calls.append({'lengths': lengths, 'wanted': wanted})
+        return orig_rows(pending, free_rows, step, busy, held=held, remaining=remaining,
+                         lengths=lengths, wanted=wanted)
+
+    adm.rows = spy_rows
+
+    class DummyGen:
+        def __init__(self):
+            self.prefill_batch_size = 4
+            self.completion_batch_size = 4
+            self.prefill_step_size = 512
+            self._unprocessed_sequences = [(1, [0] * 40, 128), (2, [0] * 50, 256)]
+            self._generation_batch = []
+            self._prompt_batch = None
+
+        def _next(self, **kwargs):
+            return 'ok'
+
+    admission.install(DummyGen, adm)
+    assert DummyGen()._next() == 'ok'
+    assert seen_calls == [{'lengths': [40, 50], 'wanted': [128, 256]}]
+
+    class DummyRespGen:
+        def _collect_pending_requests(self, *, active, capacity=None, idle_timeout=0.1, coalesce_s=0.0):
+            return coalesce_s
+
+    serve._coalesce_on_demand(DummyRespGen)
+    rg = DummyRespGen()
+
+    monkeypatch.setitem(serve._SERVING, 'demand', object())
+    assert rg._collect_pending_requests(active=False, capacity=4, coalesce_s=0.0) == serve.ON_DEMAND_COALESCE_S
+    assert rg._collect_pending_requests(active=True, capacity=4, coalesce_s=0.0) == 0.0
+    assert rg._collect_pending_requests(active=False, capacity=1, coalesce_s=0.0) == 0.0
+
+    monkeypatch.setitem(serve._SERVING, 'demand', None)
+    assert rg._collect_pending_requests(active=False, capacity=4, coalesce_s=0.0) == 0.0
+
+
+def test_multirow_decode_dispatch_and_qwen3_5_moe_left_padded_prefill(tmp_path, monkeypatch):
+    """Verify multi-row CUDA dispatch predicates (`expert_qmv`, `cuda_router`, `cuda_experts`) and
+    end-to-end left-padded `Qwen3_5MoeModel` layer-major batch prefill + decode parity."""
+    from mlx.utils import tree_flatten, tree_map_with_path
+    from mlx_vlm.generate.ar import _make_cache
+    from mlx_vlm.models.qwen3_5_moe.config import ModelConfig, TextConfig, VisionConfig
+    from mlx_vlm.models.qwen3_5_moe.language import LanguageModel
+    from quanteeze import arch, cuda_experts, cuda_kernels, cuda_router, demand, q2_experts
+
+    mx.random.seed(31)
+    sw_cuda = SwitchGLU(input_dims=128, hidden_dims=128, num_experts=16, bias=False)
+    for proj in ('gate_proj', 'up_proj', 'down_proj'):
+        p = getattr(sw_cuda, proj)
+        p.weight = p.weight.astype(mx.bfloat16)
+        setattr(sw_cuda, proj, p.to_quantized(group_size=64, bits=4))
+    mx.eval(sw_cuda.parameters())
+    expert_qmv.install_switch(sw_cuda)
+
+    with monkeypatch.context() as mp:
+        decode_shapes = []
+
+        def fake_decode(switch, x, indices, weights=None):
+            decode_shapes.append(x.shape)
+            return mx.zeros((x.shape[0], x.shape[1], indices.shape[-1], x.shape[-1]), dtype=x.dtype)
+
+        mp.setattr(mx.metal, 'is_available', lambda: False)
+        mp.setattr(expert_qmv, 'decode', fake_decode)
+        sw_cuda(mx.zeros((4, 1, 128), dtype=mx.bfloat16), mx.zeros((4, 1, 4), dtype=mx.uint32))
+        assert decode_shapes == [(4, 1, 128)]
+
+        mp.setattr(cuda_kernels, 'available', lambda: True)
+        assert cuda_router.takes(mx.zeros((4, 1, 16), dtype=mx.bfloat16), 4)
+        assert not cuda_router.takes(mx.zeros((65, 1, 16), dtype=mx.bfloat16), 4)
+        assert cuda_experts.takes(sw_cuda, mx.zeros((4, 1, 128), dtype=mx.bfloat16), mx.zeros((4, 1, 4), dtype=mx.uint32))
+        assert not cuda_experts.takes(
+            sw_cuda, mx.zeros((9, 1, 128), dtype=mx.bfloat16), mx.zeros((9, 1, 4), dtype=mx.uint32)
+        )
+
+    cfg = TextConfig(
+        model_type='qwen3_5_moe',
+        hidden_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+        num_experts=16,
+        num_experts_per_tok=4,
+        shared_expert_intermediate_size=64,
+        moe_intermediate_size=64,
+        rms_norm_eps=1e-6,
+        vocab_size=128,
+        max_position_embeddings=256,
+        tie_word_embeddings=True,
+        full_attention_interval=2,
+        norm_topk_prob=True,
+        rope_parameters={
+            'type': 'default',
+            'mrope_section': [3, 3, 2],
+            'rope_theta': 10000.0,
+            'partial_rotary_factor': 0.25,
+        },
+    )
+    model_cfg = ModelConfig(text_config=cfg, vision_config=VisionConfig(), model_type='qwen3_5_moe')
+
+    def build_model():
+        m = LanguageModel(cfg, config=model_cfg)
+        casted = tree_map_with_path(
+            lambda path, val: (val.astype(mx.bfloat16) if (val.dtype == mx.float32 and 'A_log' not in path) else val),
+            m.parameters(),
+        )
+        m.update(casted)
+        for layer in m.model.layers:
+            sw = layer.mlp.switch_mlp
+            for proj in ('gate_proj', 'up_proj', 'down_proj'):
+                setattr(sw, proj, getattr(sw, proj).to_quantized(group_size=64, bits=4))
+        return m
+
+    mx.random.seed(37)
+    m_ref = build_model()
+    mx.eval(m_ref.parameters())
+
+    m_fast = build_model()
+    m_fast.load_weights(tree_flatten(m_ref.parameters()), strict=True)
+    mx.eval(m_fast.parameters())
+
+    ckpt_tensors = {}
+    for layer_idx, layer in enumerate(m_ref.model.layers):
+        sw = layer.mlp.switch_mlp
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            p = getattr(sw, proj)
+            ckpt_tensors[f'layers.{layer_idx}.mlp.switch_mlp.{proj}.weight'] = p.weight
+            ckpt_tensors[f'layers.{layer_idx}.mlp.switch_mlp.{proj}.scales'] = p.scales
+            ckpt_tensors[f'layers.{layer_idx}.mlp.switch_mlp.{proj}.biases'] = p.biases
+    mx.save_safetensors(str(tmp_path / 'model.safetensors'), ckpt_tensors)
+
+    arch.of(m_fast).install(m_fast)
+    d_fast = demand.Demand(m_fast, q2_experts.Checkpoint(tmp_path), budget_bytes=1, workers=2)
+    try:
+        left_padding = [4, 0, 2]
+        inputs = mx.array([
+            [0, 0, 0, 0] + list(range(1, 17)),
+            list(range(20, 40)),
+            [0, 0] + list(range(50, 68)),
+        ], dtype=mx.int32)
+        cache_ref = _make_cache(m_ref, left_padding)
+        cache_fast = _make_cache(m_fast, left_padding)
+
+        out_ref = m_ref(inputs, cache=cache_ref)
+        out_fast = m_fast(inputs, cache=cache_fast)
+        logits_ref = out_ref.logits if hasattr(out_ref, 'logits') else out_ref
+        logits_fast = out_fast.logits if hasattr(out_fast, 'logits') else out_fast
+        mx.eval(logits_ref, logits_fast)
+
+        assert d_fast.prefill_layers == 4
+        assert mx.allclose(
+            logits_fast[:, -1, :].astype(mx.float32),
+            logits_ref[:, -1, :].astype(mx.float32),
+            atol=5e-2, rtol=2e-2,
+        )
+
+        next_tok = mx.array([[8], [17], [25]], dtype=mx.int32)
+        dec_ref = m_ref(next_tok, cache=cache_ref)
+        dec_fast = m_fast(next_tok, cache=cache_fast)
+        dec_logits_ref = dec_ref.logits if hasattr(dec_ref, 'logits') else dec_ref
+        dec_logits_fast = dec_fast.logits if hasattr(dec_fast, 'logits') else dec_fast
+        mx.eval(dec_logits_ref, dec_logits_fast)
+
+        assert mx.allclose(
+            dec_logits_fast.astype(mx.float32),
+            dec_logits_ref.astype(mx.float32),
+            atol=5e-2, rtol=2e-2,
+        )
+    finally:
+        d_fast.close()
 
 

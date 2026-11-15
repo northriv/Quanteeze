@@ -770,7 +770,8 @@ def install_switch(switch):
 
         def __call__(self, x, indices, *args, **kwargs):
             w = args[0] if (args and has_weights) else kwargs.get('weights')
-            if x.ndim == 3 and x.shape[0] == 1 and 1 <= x.shape[1] <= verify_qmv.MAX_TOKENS:
+            if x.ndim == 3 and ((x.shape[0] == 1 and 1 <= x.shape[1] <= verify_qmv.MAX_TOKENS)
+                                or (x.shape[1] == 1 and not mx.metal.is_available())):
                 return decode(self, x, indices, w if has_weights else None)
             bits = getattr(self.gate_proj, 'bits', None)
             mode = getattr(self.gate_proj, 'mode', 'affine')

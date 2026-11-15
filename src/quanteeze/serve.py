@@ -385,8 +385,6 @@ def _load_serving(*args, **kwargs):
             gb = _auto_gb(resident, space)
         n_experts = switches[0].gate_proj.weight.shape[0]
         expert_bytes = experts_bytes / (len(switches) * n_experts)
-        if _ADMISSION[0] is not None:
-            _ADMISSION[0].fixed = 2 * expert_bytes * n_experts
         if experts_gguf is not None:
             source = experts_gguf
         elif uniform:
@@ -414,6 +412,10 @@ def _load_serving(*args, **kwargs):
             workers=variables.integer('QUANTEEZE_READ_THREADS'),
             prompt_room=prompt_room,
         )
+        if _ADMISSION[0] is not None:
+            cap = served._prefill_cap()
+            _ADMISSION[0].fixed = min(cap, n_experts) * expert_bytes
+            _ADMISSION[0].batch_fixed = min(cap, max(0, n_experts - served.slots)) * expert_bytes
         _SERVING.update(demand=served, info={
             'model': path, 'model_type': kind, 'mode': 'on_demand',
             'bits': effective_bits, 'stock_bits': stock_bits,
@@ -433,7 +435,7 @@ def _load_serving(*args, **kwargs):
             prefill.widen(PromptProcessingBatch, layered)
             print(f'quanteeze: on demand, a prompt goes through the model a layer at a time, up to '
                   f'{layered} tokens at once', file=sys.stderr, flush=True)
-        if isinstance(source, q2_experts.Checkpoint):
+        if isinstance(source, (q2_experts.Checkpoint, gguf_experts.ExpertGGUF)):
             _hold_experts(source, 2 * expert_bytes * n_experts)
         mx.clear_cache()
         print(
@@ -707,7 +709,11 @@ def _host_by_rows(path, by=None):
 
 
 def _hold_experts(source_or_path, passing=0):
-    ckpt = source_or_path if isinstance(source_or_path, q2_experts.Checkpoint) else None
+    ckpt = (
+        source_or_path
+        if isinstance(source_or_path, (q2_experts.Checkpoint, gguf_experts.ExpertGGUF))
+        else None
+    )
     check_path = str(ckpt.path) if ckpt is not None else source_or_path
     value = (variables.get('QUANTEEZE_HOST_EXPERTS_GB') or 'auto').strip().lower()
     if value == 'off':
@@ -899,7 +905,23 @@ def _apc_reads_free_memory(module=None, readings=None):
 
 
 FULL_GPU_PREFILL = 512
+ON_DEMAND_COALESCE_S = 0.012
 _PREFILL = dict(given=False, short=False)
+
+
+def _coalesce_on_demand(generator_cls):
+    if getattr(generator_cls, '_quanteeze_coalesce', False):
+        return
+    own = generator_cls._collect_pending_requests
+
+    def _collect_pending_requests(self, *, active, capacity=None, idle_timeout=0.1, coalesce_s=0.0):
+        if (not active and coalesce_s <= 0.0 and _SERVING.get('demand') is not None
+                and (capacity is None or capacity > 1)):
+            coalesce_s = ON_DEMAND_COALESCE_S
+        return own(self, active=active, capacity=capacity, idle_timeout=idle_timeout, coalesce_s=coalesce_s)
+
+    generator_cls._collect_pending_requests = _collect_pending_requests
+    generator_cls._quanteeze_coalesce = True
 
 
 def _prefill_steps(generator_cls):
@@ -1180,6 +1202,7 @@ def main():
     apc_images.use_precision(_precision)
     _image_embeddings_now(generation.ResponseGenerator)
     _prefill_steps(generation.ResponseGenerator)
+    _coalesce_on_demand(generation.ResponseGenerator)
     _prompt_steps_waited(PromptProcessingBatch)
     mtp.install_batches(BatchGenerator)
     _ADMISSION[0] = admission.Admission.from_env()

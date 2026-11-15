@@ -305,7 +305,8 @@ class HostCopy:
         routed = [(layer, n) for layer, n in checkpoint.routed(layers=True) if layers is None or layer in layers]
         names = [n for _, n in routed]
         self.total = sum(checkpoint.nbytes(name) for name in names)
-        self._pool = ThreadPoolExecutor(max(1, workers), thread_name_prefix='host-copy')
+        self._workers = max(1, workers)
+        self._pool = ThreadPoolExecutor(self._workers, thread_name_prefix='host-copy')
         if not self.by_rows:
             for name in names:
                 size = checkpoint.nbytes(name)
@@ -439,12 +440,26 @@ class HostCopy:
                 m == first_held.shape[0]
                 and (experts is None or np.array_equal(slots, np.arange(m, dtype=np.int64)))
             )
-            for name, out in targets:
-                held = self.arrays[name]
+            work = [(self.arrays[name], out[:m]) for name, out in targets]
+
+            def _copy_one(held, out_slice):
                 if is_full:
-                    out[:m] = held
+                    out_slice[:] = held
                 else:
-                    np.take(held, slots, axis=0, out=out[:m], mode='clip')
+                    np.take(held, slots, axis=0, out=out_slice, mode='clip')
+
+            big = [item for item in work if item[1].nbytes >= (1 << 19)]
+            if self._workers > 1 and len(big) > 1:
+                small = [item for item in work if item[1].nbytes < (1 << 19)]
+                futs = [self._pool.submit(_copy_one, held, out_slice) for held, out_slice in big[:-1]]
+                _copy_one(*big[-1])
+                for held, out_slice in small:
+                    _copy_one(held, out_slice)
+                for fut in futs:
+                    fut.result()
+            else:
+                for held, out_slice in work:
+                    _copy_one(held, out_slice)
             return True
 
     def reading(self):
@@ -463,18 +478,30 @@ class HostCopy:
                 pending.result()
 
     def close(self):
+        with self.lock:
+            self.arrays, self.pending = {}, {}
         self._pool.shutdown(wait=True, cancel_futures=True)
-        self.arrays, self.pending = {}, {}
+
+
+def _is_source(obj):
+    return hasattr(obj, 'path') and hasattr(obj, 'tensors') and hasattr(obj, 'routed') and hasattr(obj, '_from_file')
 
 
 def hold(path, budget, workers, layers=None, by_rows=False):
-    """Hold `path`'s (or a `Checkpoint` instance's) routed experts in the host's memory (`HostCopy`),
-    as many as `budget` bytes take: one copy per checkpoint path."""
-    ckpt = path if isinstance(path, Checkpoint) else None
+    """Hold `path`'s (or a checkpoint / GGUF expert source's) routed experts in host memory
+    (`HostCopy`), as many as `budget` bytes take: one copy per source path."""
+    ckpt = path if _is_source(path) else None
     resolved = ckpt.path if ckpt is not None else Path(path).expanduser().resolve()
     if resolved not in _HELD:
-        _HELD[resolved] = HostCopy(ckpt if ckpt is not None else Checkpoint(resolved),
-                                   budget, workers, layers, by_rows)
+        if ckpt is None:
+            if resolved.suffix.lower() == '.gguf' or (
+                resolved.is_dir() and not any(resolved.glob('*.safetensors')) and any(resolved.glob('*.gguf'))
+            ):
+                from . import gguf_experts
+                ckpt = gguf_experts.ExpertGGUF(resolved)
+            else:
+                ckpt = Checkpoint(resolved)
+        _HELD[resolved] = HostCopy(ckpt, budget, workers, layers, by_rows)
     return _HELD[resolved]
 
 
@@ -485,7 +512,8 @@ def reading():
 
 def let_go(path=None):
     """Let go of the host's copy of checkpoint `path`'s experts (all of them for None)."""
-    for key in list(_HELD) if path is None else [Path(path).expanduser().resolve()]:
+    target = path.path if _is_source(path) else path
+    for key in list(_HELD) if target is None else [Path(target).expanduser().resolve()]:
         held = _HELD.pop(key, None)
         if held is not None:
             held.close()

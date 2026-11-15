@@ -118,7 +118,8 @@ _TABLE = [
     ('QUANTEEZE_EXPERTS_GGUF', None, 'experts', 'load',
      'read routed MoE expert weights directly from this pre-distributed GGUF path (single file, split shards, '
      'or directory), keeping the model trunk, Vision, and MTP from the MLX checkpoint (--experts-gguf). '
-     'Works whole in memory or streamed from SSD with QUANTEEZE_FROM_SSD_GB'),
+     'Works whole in memory or streamed from SSD / HostCopy with QUANTEEZE_FROM_SSD_GB and '
+     'QUANTEEZE_HOST_EXPERTS_GB'),
     ('QUANTEEZE_FROM_SSD_GB', None, 'experts', 'load',
      'stream routed experts from the SSD when routed to and waited for, with this many GB of them kept in '
      'memory (auto: what fits).  Unset: whole in memory where the experts fit, else on demand within the room'),
@@ -189,8 +190,8 @@ _TABLE = [
      'routed MoE expert decode and verify steps with each expert read once for the tokens on it, checked bit for '
      'bit against stock SwitchGLU (off: stock)'),
     ('QUANTEEZE_KQUANT_QMV', 'on', 'speed', 'start',
-     'on Metal, run uniform Q2_K/Q3_K/IQ2_XS and pre-distributed GGUF expert projections through fused gather-qmv '
-     'and tiled gather-mm kernels once verified against unpacking (off: unpack + gather_mm)'),
+     'run pre-distributed GGUF expert projections on Metal and CUDA (plus uniform Q2_K/Q3_K/IQ2_XS on Metal) '
+     'through fused gather-qmv and tiled gather-mm kernels once verified against unpacking (off: unpack + gather_mm)'),
     ('QUANTEEZE_V41_HEAD_KERNEL', 'on', 'speed', 'start',
      'on MLX\'s CUDA backend, run DeepSeek V4.1\'s BF16 LM head in a single warp-per-row kernel without float32 '
      'intermediate buffers once verified (off: chunked float32 matmul)'),

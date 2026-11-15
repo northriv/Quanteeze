@@ -6,6 +6,7 @@ Decodes each expert tensor directly in whatever standard ggml block format the G
 (`IQ*`, `Q*_K`, `Q4_0`..`Q8_0`, `F16`, `BF16`, including `UD-*` builds), both loaded whole in memory
 via `load_model()` and streamed on demand from SSD through `demand.Demand`.
 """
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import re
 import struct
@@ -116,11 +117,12 @@ def tensor_name(layer, projection):
 
 
 class ExpertGGUF:
-    """Routed MoE experts read from GGUF file(s), implementing the `demand.Demand` checkpoint API.
+    """Routed MoE experts read from GGUF file(s), implementing the `demand.Demand` checkpoint
+    and `q2_experts.HostCopy` APIs.
 
     Only `weight` tensors exist (no `scales` or `biases`); raw blocks stay encoded in ggml layout
     (`uint8 [experts, out_dims, in_dims // per_block, block_bytes]`) and execute directly through
-    `gguf_qmv` on Metal or `iq_experts.decode` fallback.
+    `gguf_qmv` on Metal and CUDA or `iq_experts.decode` fallback.
     """
 
     def __init__(self, path):
@@ -170,6 +172,17 @@ class ExpertGGUF:
 
         if not self._by_key:
             raise ValueError(f'{self.path}: no blk.<layer>.ffn_{{gate,up,down}}_exps.weight tensors found')
+
+        self._pool, self._ahead = None, {}
+        self.tensors = {}
+        proj_order = {p: i for i, p in enumerate(PROJECTIONS)}
+        for layer, proj in sorted(self._by_key, key=lambda lp: (lp[0], proj_order[lp[1]])):
+            e = self._entry(layer, proj)
+            kind = e['kind']
+            pb, bb = iq_experts.per_block(kind), iq_experts.BLOCK[kind]
+            shape = (e['experts'], e['rows'], e['cols'] // pb, bb)
+            loc = e['offset'] if e['file'] is not None else e['per_expert']
+            self.tensors[self.name(layer, proj, 'weight')] = (e['file'], 'U8', shape, loc)
 
     def _entry(self, layer, projection):
         key = (int(layer), projection)
@@ -245,22 +258,39 @@ class ExpertGGUF:
                         f'model expects {(n_exp, out_d, in_d)}'
                     )
 
-    def _read_numpy(self, layer, projection, rows, cache=False, out=None):
-        e = self._entry(layer, projection)
-        kind = e['kind']
-        pb, bb = iq_experts.per_block(kind), iq_experts.BLOCK[kind]
-        row_shape = (e['rows'], e['cols'] // pb, bb)
-        rows_arr = np.arange(e['experts'], dtype=np.int64) if rows is None else np.asarray(rows, np.int64).reshape(-1)
-        if e['file'] is not None:
-            return q2_experts.read_rows(e['file'], e['offset'], (e['experts'],) + row_shape,
-                                        np.uint8, rows_arr, cache=cache, out=out)
+    @staticmethod
+    def _key(name, rows):
+        return name, None if rows is None else tuple(np.asarray(rows, np.int64).reshape(-1).tolist())
+
+    def routed(self, layers=False):
+        """Routed GGUF expert tensor names ordered layer by layer (`(layer, name)` with `layers`)."""
+        proj_order = {p: i for i, p in enumerate(PROJECTIONS)}
+        found = [
+            (layer, self.name(layer, proj, 'weight'))
+            for layer, proj in sorted(self._by_key, key=lambda lp: (lp[0], proj_order[lp[1]]))
+        ]
+        return found if layers else [name for _, name in found]
+
+    def _from_file(self, name, rows=None, cache=False, out=None):
+        file, _, shape, offset = self.tensors[name]
+        if file is not None:
+            return q2_experts.read_rows(file, offset, shape, np.uint8, rows, cache=cache, out=out)
+        rows_arr = np.arange(shape[0], dtype=np.int64) if rows is None else np.asarray(rows, np.int64).reshape(-1)
         if out is None:
-            out = np.empty((len(rows_arr),) + row_shape, np.uint8)
-        per = e['per_expert']
+            out = np.empty((len(rows_arr),) + tuple(shape[1:]), np.uint8)
         for i, exp_id in enumerate(rows_arr):
-            part_file, part_off = per[int(exp_id)]
-            q2_experts.read_rows(part_file, part_off, row_shape, np.uint8, cache=cache, out=out[i])
+            part_file, part_off = offset[int(exp_id)]
+            q2_experts.read_rows(part_file, part_off, shape[1:], np.uint8, cache=cache, out=out[i])
         return out
+
+    def _read(self, name, rows=None, cache=False, out=None):
+        held = self.held()
+        got = None if held is None else held.rows(name, rows, out)
+        return got if got is not None else self._from_file(name, rows, cache=cache, out=out)
+
+    def _read_numpy(self, layer, projection, rows, cache=False, out=None):
+        self._entry(layer, projection)
+        return self._read(self.name(layer, projection, 'weight'), rows, cache=cache, out=out)
 
     def buffers(self, layer, projection):
         e = self._entry(layer, projection)
@@ -271,7 +301,10 @@ class ExpertGGUF:
         return [buf, None, None]
 
     def experts(self, layer, projection, experts, cache=False):
-        raw = self._read_numpy(layer, projection, experts, cache=cache)
+        self._entry(layer, projection)
+        t_name = self.name(layer, projection, 'weight')
+        pending = self._ahead.pop(self._key(t_name, experts), None)
+        raw = pending.result() if pending is not None else self._read(t_name, experts, cache=cache)
         return [mx.array(raw), None, None]
 
     def expert(self, layer, projection, expert_id, out, cache=True):
@@ -281,13 +314,30 @@ class ExpertGGUF:
         return [buf, None, None]
 
     def ahead(self, items):
-        """Pre-fetching full unrequested layer tensors is skipped for GGUF sources."""
+        """Start reading `[(tensor name, rows or None for all)]` on a background thread."""
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(1, thread_name_prefix='gguf-ahead')
+        for name, rows in items:
+            key = self._key(name, rows)
+            if key not in self._ahead:
+                self._ahead[key] = self._pool.submit(self._read, name, rows)
 
     def forget(self):
-        """Release any pending read-ahead state."""
+        """Let go of what was read ahead and not asked for."""
+        for pending in self._ahead.values():
+            pending.cancel()
+        self._ahead.clear()
+
+    def close(self):
+        """Cancel pending read-ahead tasks and shut down the read-ahead worker pool."""
+        self.forget()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
 
     def held(self):
-        return None
+        """The host's copy of this GGUF source's experts (`q2_experts.hold()`), or `None`."""
+        return q2_experts._HELD.get(self.path)
 
 
 def load_model(layers, source, on_layer=None):
@@ -299,7 +349,7 @@ def load_model(layers, source, on_layer=None):
     total = len(moe)
     for done, (layer_idx, sw) in enumerate(moe, 1):
         for p in PROJECTIONS:
-            w = src.experts(layer_idx, p, None, cache=False)[0]
+            w = demand._to_device(src.experts(layer_idx, p, None, cache=False)[0])
             kind = src._entry(layer_idx, p)['kind']
             pb = iq_experts.per_block(kind)
             proj = demand.Projection(w, None, None, pb, bits_for(kind), mode=mode_for(kind))
