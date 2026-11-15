@@ -156,6 +156,8 @@ def _driver():
                 cuda.cuMemFreeHost.argtypes = [ctypes.c_void_p]
                 cuda.cuCtxPushCurrent_v2.argtypes = [ctypes.c_void_p]
                 cuda.cuCtxPopCurrent_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+                if hasattr(cuda, 'cuMemAdvise'):
+                    cuda.cuMemAdvise.argtypes = [ctypes.c_uint64, ctypes.c_size_t, ctypes.c_int, ctypes.c_int]
                 found = (cuda, context)
         except (OSError, AttributeError):
             pass
@@ -213,6 +215,45 @@ def room_back(least):
         pass
     mx.clear_cache()
     return True
+
+
+_ADVISE_SET_PREFERRED_LOCATION = 3
+_ADVISE_UNSET_PREFERRED_LOCATION = 4
+_ADVISE_SET_ACCESSED_BY = 5
+_ADVISE_UNSET_ACCESSED_BY = 6
+_CU_DEVICE_CPU = -1
+
+
+def advise_host_staging(np_view, enable=True):
+    """Advise CUDA Unified Memory (`cuMemAdvise`) to keep a reusable `stream=mx.cpu` staging buffer
+    in host RAM (`PreferredLocation = CPU`) with direct GPU PTEs (`AccessedBy = device 0`) so CPU
+    writes and GPU `Scatter` reads do not ping-pong page faults across PCIe."""
+    if mx.metal.is_available() or np_view is None or int(np_view.nbytes) < 4096:
+        return False
+    found = _driver() if cuda_kernels.available() else None
+    if found is None:
+        return False
+    cuda, context = found
+    if not hasattr(cuda, 'cuMemAdvise'):
+        return False
+    ptr = ctypes.c_uint64(int(np_view.ctypes.data))
+    size = ctypes.c_size_t(int(np_view.nbytes))
+    device = ctypes.c_int()
+    cuda.cuCtxPushCurrent_v2(context)
+    try:
+        if cuda.cuDeviceGet(ctypes.byref(device), 0):
+            return False
+        if enable:
+            r1 = cuda.cuMemAdvise(ptr, size, _ADVISE_SET_PREFERRED_LOCATION, _CU_DEVICE_CPU)
+            r2 = cuda.cuMemAdvise(ptr, size, _ADVISE_SET_ACCESSED_BY, device.value)
+            return not (r1 or r2)
+        cuda.cuMemAdvise(ptr, size, _ADVISE_UNSET_ACCESSED_BY, device.value)
+        cuda.cuMemAdvise(ptr, size, _ADVISE_UNSET_PREFERRED_LOCATION, _CU_DEVICE_CPU)
+        return True
+    except (AttributeError, OSError):
+        return False
+    finally:
+        cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
 
 
 class _Pinned:

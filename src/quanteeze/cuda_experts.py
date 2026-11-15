@@ -346,7 +346,8 @@ def down(switch, h, idx):
 
 
 def _projection(p, k, dtype):
-    return (type(p).__name__ == 'QuantizedSwitchLinear' and getattr(p, 'mode', None) == 'affine' and p.bits == 4
+    return (type(p).__name__ in ('QuantizedSwitchLinear', 'Projection') and getattr(p, 'mode', None) == 'affine'
+            and p.bits == 4
             and p.group_size in (32, 64, 128) and p.get('biases') is not None and 'bias' not in p
             and p.weight.dtype == mx.uint32 and p.scales.dtype == dtype and p.biases.dtype == dtype
             and p.weight.shape[-1] * 8 == k and p.weight.shape[1] % 8 == 0 and k % 128 == 0)
@@ -369,27 +370,25 @@ def takes(switch, x, indices):
             and _projection(dn, gate.weight.shape[1], x.dtype) and dn.weight.shape[1] == hidden)
 
 
-def switch_glu(forward, switch, x, indices):
-    """forward._switch_glu(switch, x, indices) [1, 1, k, hidden], through gate_up() and down() where
-    this shape matched it."""
-    def theirs():
-        return forward._switch_glu(switch, x, indices)
+def decode(switch, x, indices, fallback):
+    """`fallback()` or custom CUDA `gate_up()` + `down()` for `[1, 1, k, hidden]` once bit-verified."""
     if not ON[0] or not takes(switch, x, indices):
-        return theirs()
+        return fallback()
     k = indices.size
 
     def mine():
         idx = indices.reshape(-1).astype(mx.uint32)
         h = gate_up(switch, x.reshape(1, -1), idx)
         return down(switch, h, idx).reshape(1, 1, k, -1)
+
     key = (k, x.shape[-1], switch.gate_proj.weight.shape[1], int(switch.gate_proj.group_size))
     choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS['served'] += 1
             return mine()
-        return theirs()
-    want = theirs()
+        return fallback()
+    want = fallback()
     try:
         got = mine()
         same = mx.array_equal(got, want).item()
@@ -405,6 +404,12 @@ def switch_glu(forward, switch, x, indices):
     STATS['mismatched'] += not same
     CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
     return want
+
+
+def switch_glu(forward, switch, x, indices):
+    """forward._switch_glu(switch, x, indices) [1, 1, k, hidden], through gate_up() and down() where
+    this shape matched it."""
+    return decode(switch, x, indices, lambda: forward._switch_glu(switch, x, indices))
 
 
 def summary():

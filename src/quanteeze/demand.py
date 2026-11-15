@@ -64,6 +64,27 @@ class Projection(nn.Module):
                              sorted_indices=sorted_indices)
 
 
+_STAGE_RING = 4
+
+
+def _to_device(arr):
+    """Ensure `arr` resides in pure GPU device memory (`device = 0` on CUDA) rather than
+    `cudaMallocManaged` (`mx.array(numpy)`), avoiding UVM residency churn on resident banks."""
+    if arr is None:
+        return None
+    if mx.metal.is_available() or mx.default_device() != mx.gpu:
+        mx.eval(arr)
+        return arr
+    dst = mx.zeros(arr.shape, dtype=arr.dtype)
+    mx.eval(dst)
+    if arr.ndim == 0 or arr.shape[0] == 0:
+        return dst
+    idx = mx.arange(arr.shape[0], dtype=mx.int32)
+    dst[idx] = arr
+    mx.eval(dst)
+    return dst
+
+
 class DemandSwitchGLU(nn.Module):
     """An MoE layer's `switch_mlp` holding `slots` experts in memory and reading missing ones on
     demand through `Demand`."""
@@ -78,21 +99,28 @@ class DemandSwitchGLU(nn.Module):
         self.experts = np.array(experts, dtype=np.int64, copy=True)
         self.route = np.full(num_experts, -1, np.int64)
         self.route[self.experts] = np.arange(self.experts.size)
-        self._local = mx.array(np.maximum(self.route, 0).astype(np.uint32))
+        self._local = _to_device(mx.array(np.maximum(self.route, 0).astype(np.uint32)))
         self.freeze()
 
-    def place(self, slot, expert, arrays):
-        """Write `arrays` (`{proj: [weight, scales, biases]}`) for `expert` into `slot`."""
-        old = int(self.experts[slot])
-        if old >= 0 and self.route[old] == slot:
-            self.route[old] = -1
-        self.experts[slot] = expert
-        self.route[expert] = slot
-        idx = mx.array([slot], dtype=mx.int32)
+    def place_many(self, slots, experts, arrays_by_proj):
+        """Write `arrays_by_proj` (`{proj: [weight, scales, biases]}`) for `experts` into `slots`
+        with one batched update per array so MLX donates each bank buffer in place."""
+        slots_arr = np.asarray(slots, dtype=np.int64).reshape(-1)
+        exps_arr = np.asarray(experts, dtype=np.int64).reshape(-1)
+        if not slots_arr.size:
+            return []
+        old_exps = self.experts[slots_arr].copy()
+        for slot, old in zip(slots_arr.tolist(), old_exps.tolist()):
+            if old >= 0 and self.route[old] == slot:
+                self.route[old] = -1
+        self.experts[slots_arr] = exps_arr
+        self.route[exps_arr] = slots_arr
+
+        idx = mx.array(slots_arr.astype(np.int32))
         written = []
         for p in PROJECTIONS:
             proj = getattr(self, p)
-            w, s, b = arrays[p]
+            w, s, b = arrays_by_proj[p]
             proj.weight[idx] = w
             written.append(proj.weight)
             if s is not None and getattr(proj, 'scales', None) is not None:
@@ -101,8 +129,20 @@ class DemandSwitchGLU(nn.Module):
             if b is not None and getattr(proj, 'biases', None) is not None:
                 proj.biases[idx] = b
                 written.append(proj.biases)
-        self._local = mx.array(np.maximum(self.route, 0).astype(np.uint32))
+
+        still_evicted = list(dict.fromkeys(
+            old for old in old_exps.tolist() if old >= 0 and self.route[old] < 0
+        ))
+        upd_exps = np.array(still_evicted + exps_arr.tolist(), dtype=np.int32)
+        upd_vals = np.array(([0] * len(still_evicted)) + slots_arr.tolist(), dtype=np.uint32)
+        if upd_exps.size:
+            self._local[mx.array(upd_exps)] = mx.array(upd_vals)
+            written.append(self._local)
         return written
+
+    def place(self, slot, expert, arrays):
+        """Write `arrays` (`{proj: [weight, scales, biases]}`) for `expert` into `slot`."""
+        return self.place_many([slot], [expert], arrays)
 
     def replace_all(self, experts, arrays_by_proj):
         """Replace the entire bank with `experts` and their stacked `[weight, scales, biases]`."""
@@ -112,7 +152,7 @@ class DemandSwitchGLU(nn.Module):
         written = []
         for p in PROJECTIONS:
             proj = getattr(self, p)
-            w, s, b = arrays_by_proj[p]
+            w, s, b = (_to_device(a) for a in arrays_by_proj[p])
             proj.weight = w
             written.append(proj.weight)
             if s is not None:
@@ -121,7 +161,8 @@ class DemandSwitchGLU(nn.Module):
             if b is not None:
                 proj.biases = b
                 written.append(proj.biases)
-        self._local = mx.array(np.maximum(self.route, 0).astype(np.uint32))
+        self._local = _to_device(mx.array(np.maximum(self.route, 0).astype(np.uint32)))
+        written.append(self._local)
         return written
 
     def __call__(self, x, indices, scores=None):
@@ -201,11 +242,45 @@ class Demand:
         self.next_moe = {moe_indices[i]: moe_indices[i + 1] for i in range(len(moe_indices) - 1)}
 
         self.weight = {l: np.zeros(num_experts, np.float64) for l in moe_indices}
-        self.buffers = {
-            (l, p): [self.checkpoint.buffers(l, p)
-                     for _ in range(self.workers)]
-            for l in moe_indices for p in PROJECTIONS
-        }
+        self._advised_views = []
+        self._stage_ring = [{} for _ in range(_STAGE_RING)]
+        self._stage_inflight = [None] * _STAGE_RING
+        self._stage_cursor = 0
+        self.buffers = {}
+        shared_bufs = {}
+        can_share = (not isinstance(checkpoint, requant.Flat)
+                     and hasattr(self.base, 'tensors') and hasattr(self.base, 'has') and hasattr(self.base, 'name'))
+        for l in moe_indices:
+            for p in PROJECTIONS:
+                if can_share:
+                    sig = (
+                        p,
+                        tuple(
+                            (self.base.tensors[self.base.name(l, p, part)][1],
+                             tuple(self.base.tensors[self.base.name(l, p, part)][2][1:]))
+                            if self.base.has(l, p, part) else None
+                            for part in NAMES
+                        ),
+                    )
+                    if sig not in shared_bufs:
+                        worker_bufs = [self.checkpoint.buffers(l, p) for _ in range(self.workers)]
+                        for buf in worker_bufs:
+                            for arr in (buf or ()):
+                                if arr is not None:
+                                    view = np.asarray(arr)
+                                    if cuda_ple.advise_host_staging(view, enable=True):
+                                        self._advised_views.append(view)
+                        shared_bufs[sig] = worker_bufs
+                    self.buffers[(l, p)] = shared_bufs[sig]
+                else:
+                    worker_bufs = [self.checkpoint.buffers(l, p) for _ in range(self.workers)]
+                    for buf in worker_bufs:
+                        for arr in (buf or ()):
+                            if arr is not None:
+                                view = np.asarray(arr)
+                                if cuda_ple.advise_host_staging(view, enable=True):
+                                    self._advised_views.append(view)
+                    self.buffers[(l, p)] = worker_bufs
         self.switches = {}
         self.hits = 0
         self.misses = 0
@@ -226,7 +301,9 @@ class Demand:
                     p_mode = self.base.mode(l, p) or 'affine'
                     _, in_d = _proj_dims(getattr(old_switch, p))
                     p_gs, p_bits = self.base.quantization(l, p, in_d)
+                w, s, b = _to_device(w), _to_device(s), _to_device(b)
                 projs[p] = Projection(w, s, b, p_gs, p_bits, mode=p_mode)
+                del w, s, b
                 mx.eval(projs[p].parameters())
             d_switch = DemandSwitchGLU(
                 l, projs['gate_proj'], projs['up_proj'], projs['down_proj'],
@@ -249,6 +326,53 @@ class Demand:
         held = self.base.held()
         return held if held is not None and held.by_rows else None
 
+    def _drain_layer_inflight(self, layer):
+        """Ensure any async stage write targeting `layer` has completed and been cleared so bank
+        buffers have refcount 1 for in-place donation."""
+        for k, entry in enumerate(self._stage_inflight):
+            if entry is not None and entry[0] == layer:
+                mx.eval(entry[1])
+                self._stage_inflight[k] = None
+
+    def _stage_host_experts(self, layer, in_host):
+        """Copy `in_host` expert rows from `HostCopy` directly into reusable `cuMemAdvise`-hinted
+        `stream=mx.cpu` staging buffers in the next ring slot."""
+        from . import cuda_ple
+        ring = self._stage_cursor
+        self._stage_cursor = (ring + 1) % _STAGE_RING
+        if self._stage_inflight[ring] is not None:
+            mx.eval(self._stage_inflight[ring][1])
+            self._stage_inflight[ring] = None
+        m = int(in_host.size)
+        cap = max(8, 1 << max(0, m - 1).bit_length())
+        copied = {}
+        for p in PROJECTIONS:
+            parts = []
+            for part in NAMES:
+                if not self.base.has(layer, p, part):
+                    parts.append(None)
+                    continue
+                t_name = self.base.name(layer, p, part)
+                _, st_dtype, full_shape, _ = self.base.tensors[t_name]
+                tail = tuple(full_shape[1:])
+                key = (p, part, tail, st_dtype)
+                entry = self._stage_ring[ring].get(key)
+                if entry is None or entry[0].shape[0] < m:
+                    if entry is not None and entry[2]:
+                        cuda_ple.advise_host_staging(entry[1], enable=False)
+                    np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
+                    mlx_arr = mx.zeros((cap,) + tail, q2_experts._MLX[np_dt], stream=mx.cpu)
+                    mx.eval(mlx_arr)
+                    np_view = np.asarray(mlx_arr)
+                    adv = cuda_ple.advise_host_staging(np_view, enable=True)
+                    entry = (mlx_arr, np_view, adv)
+                    self._stage_ring[ring][key] = entry
+                mlx_arr, np_view, _ = entry
+                self.base._read(t_name, in_host, cache=True, out=np_view[:m])
+                parts.append(q2_experts._as_mlx(mlx_arr[:m], st_dtype))
+            copied[p] = parts
+        return ring, copied
+
     def _read_one(self, layer, expert, worker_slot):
         with self._stream_lock:
             self._stream_threads.add(threading.get_ident())
@@ -261,9 +385,14 @@ class Demand:
     def compute(self, switch, x, indices, scores=None):
         layer = switch.layer
         is_decode = not (x.ndim == 3 and x.shape[1] > DECODE_BLOCK_SIZE and indices.size >= 64)
-        ids = np.array(indices).reshape(-1)
-        w_scores = (np.ones_like(ids, dtype=np.float64) if scores is None
-                    else np.array(scores.astype(mx.float32)).reshape(-1).astype(np.float64))
+        if scores is None:
+            ids = np.array(indices).reshape(-1)
+            w_scores = np.ones_like(ids, dtype=np.float64)
+        else:
+            scores_f32 = scores.astype(mx.float32)
+            mx.eval(indices, scores_f32)
+            ids = np.array(indices, copy=False).reshape(-1)
+            w_scores = np.array(scores_f32, copy=False).reshape(-1).astype(np.float64)
 
         self.weight[layer] *= DECAY
         np.add.at(self.weight[layer], ids, w_scores)
@@ -322,6 +451,7 @@ class Demand:
                 top = np.sort(candidates[np.argsort(-self.weight[layer][candidates], kind='stable')[:self.slots]])
                 new_exps = top[switch.route[top] < 0]
                 if new_exps.size:
+                    self._drain_layer_inflight(layer)
                     top_set = set(int(t) for t in top)
                     gone = [s for s, e in enumerate(switch.experts) if int(e) not in top_set]
                     last_map = {int(e): idx for idx, e in enumerate(last_batch)} if last_batch is not None else {}
@@ -331,28 +461,35 @@ class Demand:
                                if to_read.size else None)
                     self.read_s += time.perf_counter() - t_read
                     fetch_map = {int(e): idx for idx, e in enumerate(to_read)}
-                    written = []
-                    for slot, e in zip(gone, new_exps):
+                    slot_arrays = {p: [[], [], []] for p in PROJECTIONS}
+                    for e in new_exps:
                         e_int = int(e)
                         if e_int in last_map:
                             j = last_map[e_int]
-                            arrays = {
-                                p: [
-                                    last_projs[p].weight[j:j + 1],
-                                    last_projs[p].scales[j:j + 1]
-                                    if getattr(last_projs[p], 'scales', None) is not None else None,
-                                    last_projs[p].biases[j:j + 1]
-                                    if getattr(last_projs[p], 'biases', None) is not None else None,
-                                ]
-                                for p in PROJECTIONS
-                            }
+                            for p in PROJECTIONS:
+                                lp = last_projs[p]
+                                arrs = (
+                                    lp.weight[j:j + 1],
+                                    lp.scales[j:j + 1] if getattr(lp, 'scales', None) is not None else None,
+                                    lp.biases[j:j + 1] if getattr(lp, 'biases', None) is not None else None,
+                                )
+                                for idx_part, val in enumerate(arrs):
+                                    slot_arrays[p][idx_part].append(val)
                         else:
                             j = fetch_map[e_int]
-                            arrays = {
-                                p: [None if a is None else a[j:j + 1] for a in fetched[p]]
-                                for p in PROJECTIONS
-                            }
-                        written.extend(switch.place(slot, e_int, arrays))
+                            for p in PROJECTIONS:
+                                for idx_part, a in enumerate(fetched[p]):
+                                    slot_arrays[p][idx_part].append(None if a is None else a[j:j + 1])
+                    stacked = {
+                        p: [
+                            None if slot_arrays[p][idx_part][0] is None
+                            else (slot_arrays[p][idx_part][0] if new_exps.size == 1
+                                  else mx.concatenate(slot_arrays[p][idx_part], axis=0))
+                            for idx_part in range(len(NAMES))
+                        ]
+                        for p in PROJECTIONS
+                    }
+                    written = switch.place_many(gone[:new_exps.size], new_exps, stacked)
                     if written:
                         mx.eval(written)
                 del last_batch, last_projs
@@ -374,35 +511,52 @@ class Demand:
             in_host = host.held_in(layer, missing) if host is not None else missing[:0]
             if in_host.size:
                 missing = np.concatenate([in_host, missing[~np.isin(missing, in_host)]])
-            copied = {p: self.base.experts(layer, p, in_host) for p in PROJECTIONS} if in_host.size else None
-            in_use = set(int(e) for e in active_ids if switch.route[e] >= 0)
-            candidates = [s for s, e in enumerate(switch.experts) if int(e) not in in_use]
-            candidates.sort(key=lambda s: self.weight[layer][switch.experts[s]])
-            victims = candidates[:missing.size]
+            free_mask = np.ones(switch.experts.size, dtype=bool)
+            if present_mask.any():
+                free_mask[switch.route[active_ids[present_mask]]] = False
+            cand = np.flatnonzero(free_mask)
+            victims = cand[np.argsort(self.weight[layer][switch.experts[cand]], kind='stable')[:missing.size]]
 
+            self._drain_layer_inflight(layer)
             written = []
-            for k in range(in_host.size):
-                slot = victims[k]
-                e = int(missing[k])
-                arrays = {p: [None if a is None else a[k:k + 1] for a in copied[p]] for p in PROJECTIONS}
-                written.extend(switch.place(slot, e, arrays))
+            ring = None
+            if in_host.size:
+                ring, copied = self._stage_host_experts(layer, in_host)
+                written = switch.place_many(victims[:in_host.size], in_host, copied)
             disk_victims = victims[in_host.size:]
             disk_missing = missing[in_host.size:]
-            for start in range(0, len(disk_victims), self.workers):
-                batch_slots = disk_victims[start:start + self.workers]
-                batch_exps = disk_missing[start:start + len(batch_slots)]
-                futures = [
-                    self._pool.submit(self._read_one, layer, e, w_idx)
-                    for w_idx, e in enumerate(batch_exps)
-                ]
-                for slot, fut in zip(batch_slots, futures):
-                    e, arrays = fut.result()
-                    written.extend(switch.place(slot, int(e), arrays))
+            if disk_missing.size == 0:
+                if written:
+                    self._stage_inflight[ring] = (layer, written)
+                    mx.async_eval(*written)
+                    del written
+            else:
                 if written:
                     mx.eval(written)
                     written.clear()
-            if written:
-                mx.eval(written)
+                for start in range(0, len(disk_victims), self.workers):
+                    batch_slots = disk_victims[start:start + self.workers]
+                    batch_exps = disk_missing[start:start + len(batch_slots)]
+                    futures = [
+                        self._pool.submit(self._read_one, layer, e, w_idx)
+                        for w_idx, e in enumerate(batch_exps)
+                    ]
+                    results = [fut.result() for fut in futures]
+                    batch_exps_done = [int(r[0]) for r in results]
+                    if len(results) == 1:
+                        batch_arrays = results[0][1]
+                    else:
+                        batch_arrays = {
+                            p: [
+                                None if results[0][1][p][i] is None
+                                else mx.concatenate([r[1][p][i] for r in results], axis=0)
+                                for i in range(len(NAMES))
+                            ]
+                            for p in PROJECTIONS
+                        }
+                    batch_written = switch.place_many(batch_slots, batch_exps_done, batch_arrays)
+                    if batch_written:
+                        mx.eval(batch_written)
             if in_host.size:
                 self.host_served += int(in_host.size)
             self.read_s += time.perf_counter() - t0
@@ -437,6 +591,22 @@ class Demand:
         }
 
     def close(self):
+        from . import cuda_ple
+        for k, entry in enumerate(self._stage_inflight):
+            if entry is not None:
+                try:
+                    mx.eval(entry[1])
+                except Exception:
+                    pass
+                self._stage_inflight[k] = None
+        for ring_map in self._stage_ring:
+            for _, np_view, adv in ring_map.values():
+                if adv:
+                    cuda_ple.advise_host_staging(np_view, enable=False)
+            ring_map.clear()
+        for np_view in self._advised_views:
+            cuda_ple.advise_host_staging(np_view, enable=False)
+        self._advised_views.clear()
         if hasattr(self.base, 'close'):
             self.base.close()
         else:

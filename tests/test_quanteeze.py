@@ -1553,6 +1553,145 @@ def test_idle_false_during_host_copy_and_clean_shutdown_helpers(tmp_path, monkey
     assert exc_ungraceful.value.code == 128 + signal.SIGTERM
 
 
+def test_demand_batched_place_many_and_ring_staging(tmp_path):
+    """`Demand` updates all missed slots in one `place_many` batch, updates `_local` in place, wraps
+    `_STAGE_RING` cleanly over many decode steps, and matches stock `SwitchGLU` bit-for-bit."""
+    import mlx.nn as nn
+    from quanteeze import demand, q2_experts
+
+    mx.random.seed(505)
+    tensors = {}
+    for layer in range(2):
+        sw = SwitchGLU(input_dims=256, hidden_dims=256, num_experts=16, bias=False)
+        nn.quantize(sw, group_size=64, bits=4)
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            p = getattr(sw, proj)
+            for part in ('weight', 'scales', 'biases'):
+                arr = getattr(p, part)
+                tensors[f'layers.{layer}.mlp.switch_mlp.{proj}.{part}'] = arr
+    mx.eval(*tensors.values())
+    (tmp_path / 'config.json').write_text('{}', encoding='utf-8')
+    mx.save_safetensors(str(tmp_path / 'model.safetensors'), tensors)
+
+    def make_q_model():
+        m = nn.Module()
+        m.layers = []
+        for layer in range(2):
+            sw = SwitchGLU(input_dims=256, hidden_dims=256, num_experts=16, bias=False)
+            nn.quantize(sw, group_size=64, bits=4)
+            for proj in ('gate_proj', 'up_proj', 'down_proj'):
+                p = getattr(sw, proj)
+                for part in ('weight', 'scales', 'biases'):
+                    setattr(p, part, tensors[f'layers.{layer}.mlp.switch_mlp.{proj}.{part}'])
+            mlp = nn.Module()
+            mlp.switch_mlp = sw
+            layer_mod = nn.Module()
+            layer_mod.mlp = mlp
+            m.layers.append(layer_mod)
+        return m
+
+    m_ref = make_q_model()
+    for layer_mod in m_ref.layers:
+        expert_qmv.install_switch(layer_mod.mlp.switch_mlp)
+    m_ssd = make_q_model()
+    ckpt = q2_experts.Checkpoint(tmp_path)
+    held = q2_experts.hold(ckpt, budget=10**9, workers=2, by_rows=True)
+    dem = None
+    try:
+        held.wait()
+        dem = demand.Demand(m_ssd, ckpt, budget_bytes=1, workers=2)
+        assert dem.slots == 8
+        step_indices = [
+            [8, 9, 10, 11],
+            [12, 13, 14, 15],
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+            [8, 10, 12, 14],
+            [1, 3, 9, 11],
+            [5, 7, 13, 15],
+        ]
+        # Verify lazy pipelining across > 2 * _STAGE_RING layer calls before evaluating outputs.
+        lazy_pairs = []
+        for exps in step_indices:
+            x = mx.random.normal((1, 1, 256)).astype(mx.bfloat16)
+            idx = mx.array([[exps]], dtype=mx.uint32)
+            mx.eval(x, idx)
+            for layer_idx in range(2):
+                y_ref = m_ref.layers[layer_idx].mlp.switch_mlp(x, idx)
+                y_ssd = m_ssd.layers[layer_idx].mlp.switch_mlp(x, idx)
+                lazy_pairs.append((y_ref, y_ssd))
+        for y_ref, y_ssd in lazy_pairs:
+            mx.eval(y_ref, y_ssd)
+            assert np.array_equal(
+                np.array(y_ssd.astype(mx.float32)),
+                np.array(y_ref.astype(mx.float32)),
+            )
+        assert dem.misses > 0
+        assert dem.host_served == dem.misses
+        for sw in dem.switches.values():
+            local_np = np.array(sw._local)
+            for e in range(16):
+                slot = int(sw.route[e])
+                assert int(local_np[e]) == (slot if slot >= 0 else 0)
+    finally:
+        if dem is not None:
+            dem.close()
+        q2_experts.let_go(ckpt.path)
+
+
+def test_advise_host_staging_and_cuda_experts_projection(monkeypatch):
+    """`cuda_ple.advise_host_staging` issues `cuMemAdvise` CPU/device hints on >=4KB views, and
+    `cuda_experts._projection` accepts `demand.Projection` 4-bit affine modules."""
+    from quanteeze import cuda_experts, cuda_kernels, cuda_ple, demand
+
+    assert cuda_ple.advise_host_staging(np.zeros((64,), dtype=np.uint8), enable=True) is False
+
+    calls = []
+
+    class FakeCuda:
+        def cuCtxPushCurrent_v2(self, ctx):
+            return 0
+
+        def cuCtxPopCurrent_v2(self, out_ctx):
+            return 0
+
+        def cuDeviceGet(self, out_dev, ordinal):
+            out_dev._obj.value = 3
+            return 0
+
+        def cuMemAdvise(self, ptr, size, advice, device):
+            sz = size.value if hasattr(size, 'value') else int(size)
+            adv = advice.value if hasattr(advice, 'value') else int(advice)
+            dev = device.value if hasattr(device, 'value') else int(device)
+            calls.append((int(sz), int(adv), int(dev)))
+            return 0
+
+    monkeypatch.setattr(cuda_ple.mx.metal, 'is_available', lambda: False)
+    monkeypatch.setattr(cuda_kernels, 'available', lambda: True)
+    monkeypatch.setattr(cuda_ple, '_DRIVER', [(FakeCuda(), object())])
+
+    buf = np.zeros((4096,), dtype=np.uint8)
+    assert cuda_ple.advise_host_staging(buf, enable=True) is True
+    assert cuda_ple.advise_host_staging(buf, enable=False) is True
+    assert calls == [
+        (4096, 3, -1),
+        (4096, 5, 3),
+        (4096, 6, 3),
+        (4096, 4, -1),
+    ]
+
+    proj = demand.Projection(
+        mx.zeros((8, 64, 16), dtype=mx.uint32),
+        mx.ones((8, 64, 2), dtype=mx.bfloat16),
+        mx.zeros((8, 64, 2), dtype=mx.bfloat16),
+        group_size=64,
+        bits=4,
+        mode='affine',
+    )
+    assert cuda_experts._projection(proj, 128, mx.bfloat16) is True
+
+
+
 
 
 

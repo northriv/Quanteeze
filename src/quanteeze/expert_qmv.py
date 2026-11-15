@@ -722,6 +722,10 @@ def stock(switch, x, indices, weights=None):
 
 def decode(switch, x, indices, weights=None):
     """Run a decode (`T = 1`) or verify (`1 < T <= MAX_TOKENS`) step on `switch`."""
+    if ON[0] and weights is None and not mx.metal.is_available():
+        from . import cuda_experts
+        if cuda_experts.ON[0] and cuda_experts.takes(switch, x, indices):
+            return cuda_experts.decode(switch, x, indices, lambda: stock(switch, x, indices))
     if not ON[0] or not eligible(switch, x, indices):
         return stock(switch, x, indices, weights)
     k = key(switch, x, indices, weights is not None)
