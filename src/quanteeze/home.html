@@ -1,0 +1,1047 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>quanteeze</title>
+<!-- quanteeze.home serves this page through quanteeze.control; it holds no secret: the token comes in the URL's fragment. -->
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --line: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11,11,11,0.10);
+  --accent: #2a78d6;
+  --accent-soft: rgba(42,120,214,0.10);
+  --warn-bg: #fdf1dc;
+  --warn: #8a5a00;
+  --bad: #d03b3b;
+  --good: #006300;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --line: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255,255,255,0.10);
+    --accent: #3987e5;
+    --accent-soft: rgba(57,135,229,0.16);
+    --warn-bg: #3a2c10;
+    --warn: #fab219;
+    --bad: #e66767;
+    --good: #0ca30c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --line: #2c2c2a;
+  --axis: #383835;
+  --ring: rgba(255,255,255,0.10);
+  --accent: #3987e5;
+  --accent-soft: rgba(57,135,229,0.16);
+  --warn-bg: #3a2c10;
+  --warn: #fab219;
+  --bad: #e66767;
+  --good: #0ca30c;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 24px 16px 80px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+h2 { font-size: 16px; font-weight: 600; margin: 0 0 10px; }
+h3 { font-size: 14px; font-weight: 600; margin: 14px 0 6px; }
+a { color: var(--accent); }
+.sub, .note { color: var(--ink-2); }
+.note { font-size: 13px; }
+.card { background: var(--surface); border-radius: 12px; box-shadow: 0 0 0 1px var(--ring); padding: 18px; margin-top: 16px; }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.bar[hidden], .seg[hidden], button[hidden], details[hidden] { display: none; }
+.grow { flex: 1; }
+input[type=text], input[type=password], select {
+  font: inherit; color: var(--ink); background: var(--page); border: 1px solid var(--axis); border-radius: 6px; padding: 6px 9px;
+}
+button { font: inherit; border-radius: 8px; padding: 7px 14px; border: 1px solid var(--axis); background: var(--surface); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button:disabled { opacity: 0.5; cursor: default; }
+.models { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.pick { text-align: left; padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--page); width: 100%; }
+.pick:hover { border-color: var(--axis); }
+.pick.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--accent-soft); }
+.pick .title { font-weight: 600; overflow-wrap: anywhere; }
+.pick .org { color: var(--muted); font-size: 12px; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; font-size: 12px; }
+.tag { border-radius: 999px; padding: 1px 8px; box-shadow: 0 0 0 1px var(--ring); color: var(--ink-2); }
+.tag.good { color: var(--good); }
+.tag.warn { background: var(--warn-bg); color: var(--warn); box-shadow: none; }
+.ways { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 10px; }
+.way { text-align: left; padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--page); }
+.way.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--accent-soft); }
+.way b { display: block; margin-bottom: 2px; }
+.way span { color: var(--ink-2); font-size: 13px; display: block; }
+.way span.warn { color: var(--warn); }
+.list { display: flex; flex-direction: column; gap: 8px; }
+.seg { display: inline-flex; border: 1px solid var(--axis); border-radius: 9px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; border-right: 1px solid var(--axis); background: var(--surface); }
+.seg button:last-child { border-right: 0; }
+.seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
+.presets { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+.meter { height: 10px; border-radius: 999px; background: var(--line); overflow: hidden; margin-top: 10px; }
+.meter div { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width 0.4s; }
+.ok { color: var(--good); }
+.err { color: var(--bad); }
+.ask { border: 1px solid var(--accent); border-radius: 10px; padding: 12px; margin-top: 12px; background: var(--accent-soft); }
+textarea { width: 100%; font: inherit; color: var(--ink); background: var(--page); border: 1px solid var(--axis); border-radius: 8px; padding: 8px 10px; resize: vertical; }
+.reply { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 10px; }
+#try-think { margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--page); }
+#try-think > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+#try-thinking { margin-top: 6px; max-height: 260px; overflow-y: auto; }
+.copyrow { display: grid; grid-template-columns: 12em minmax(0, 1fr) auto; gap: 6px 12px; align-items: center; }
+.copyrow code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--page); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .copyrow { grid-template-columns: minmax(0, 1fr) auto; } .copyrow .k { grid-column: 1 / -1; } }
+.livegrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; margin-top: 12px; }
+.live { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.live .k { font-size: 12px; color: var(--muted); }
+.live .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+.live .note { font-size: 12px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+#phases { font-variant-numeric: tabular-nums; }
+.mono { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<main>
+  <div class="bar">
+    <div class="grow">
+      <h1>quanteeze</h1>
+      <div class="sub">Choose a model and its uniform expert precision on <span class="here">this Mac</span>.</div>
+    </div>
+    <a href="#" id="lang-switch" lang="ja">日本語</a>
+    <a href="/quanteeze/settings">Every setting →</a>
+  </div>
+
+  <section class="card" id="locked" hidden>
+    <h2>Token</h2>
+    <p class="note">This page asks for the token the server made at start. Open the URL it printed (with <code>#token=…</code>), or paste the token from <code>~/.quanteeze/control-token</code>.</p>
+    <div class="bar"><input type="password" id="token" aria-label="Control token" autocomplete="off" style="flex:1 1 240px"><button class="primary" id="use-token">Use</button></div>
+    <p class="err" id="token-why"></p>
+  </section>
+
+  <div id="app" hidden>
+    <section class="card" id="now">
+      <div class="bar">
+        <div class="grow">
+          <div class="note">Serving now</div>
+          <div id="now-model" style="font-weight:600"></div>
+          <div id="now-how" class="note"></div>
+        </div>
+        <span id="now-state" class="tag"></span>
+      </div>
+      <div class="meter" id="now-meter" hidden><div id="now-bar"></div></div>
+      <div id="now-msg" class="note"></div>
+      <div id="live" class="livegrid"></div>
+      <div id="phases" class="list" style="margin-top:8px"></div>
+    </section>
+
+    <section class="card">
+      <h2>Model &amp; uniform precision</h2>
+      <p class="note">Pick a checkpoint found on <span class="here">this Mac</span> (in LM Studio or Hugging Face's cache), or fetch one from Hugging Face.</p>
+      <div id="models" class="models"></div>
+
+      <div class="bar" style="margin-top:12px">
+        <input type="text" id="dl-repo" placeholder="Fetch from Hugging Face: org/model-name" aria-label="Hugging Face repository" style="flex:1 1 280px">
+        <button id="dl-check">Check size</button>
+      </div>
+      <div id="dl-ask" class="ask" hidden></div>
+      <div id="dl-progress" hidden>
+        <div class="meter"><div id="dl-bar"></div></div>
+        <div class="note" id="dl-msg"></div>
+      </div>
+
+      <div id="precision-pane" hidden style="margin-top:16px">
+        <h3>Routed expert precision</h3>
+        <p class="note" id="room-note"></p>
+        <div id="ways" class="ways"></div>
+        <div class="bar" style="margin-top:14px">
+          <button class="primary" id="start-btn">Serve this model</button>
+          <span id="start-msg" class="note"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Try a prompt</h2>
+      <textarea id="try-text" rows="3" placeholder="Ask the model something…" aria-label="Prompt"></textarea>
+      <div class="bar" style="margin-top:8px">
+        <span class="bar" id="try-knobs">
+          <select id="try-thinks" aria-label="Thinking">
+            <option value="">Thinking as the model does</option>
+            <option value="off">No thinking</option>
+          </select>
+          <select id="try-length" aria-label="Longest answer">
+            <option value="1024">Up to 1,024 tokens</option>
+            <option value="4096" selected>Up to 4,096 tokens</option>
+            <option value="16384">Up to 16,384 tokens</option>
+          </select>
+        </span>
+        <button class="primary" id="try-send">Send</button>
+        <button id="try-stop" hidden>Stop</button>
+        <span id="try-status" class="note grow"></span>
+      </div>
+      <details id="try-think" hidden><summary>Its thinking</summary><div id="try-thinking" class="reply note"></div></details>
+      <div id="try-reply" class="reply"></div>
+    </section>
+
+    <section class="card">
+      <h2>Memory, PLE, MTP &amp; heat</h2>
+      <p class="note">Saved at once; settings marked as load-time take effect the next time a model loads.</p>
+      <div id="presets" class="presets" style="margin-top:12px"></div>
+      <div id="preset-msg" class="note" style="margin-top:8px"></div>
+    </section>
+
+    <section class="card">
+      <h2>Connect an app</h2>
+      <p class="note" id="connect-note"></p>
+      <div id="connect-rows" class="list" style="margin-top:10px"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'onclick') n.onclick = v;
+    else if (v !== false && v != null) n.setAttribute(k, v === true ? '' : v);
+  }
+  for (const k of kids) if (k != null) n.append(k);
+  return n;
+};
+const fmt = (x, d = 1) => (x == null ? '–' : Number(x).toFixed(d));
+const pct = x => `${(100 * x).toFixed(x < 0.01 && x > 0 ? 1 : 0)}%`;
+const shortPath = p => p ? p.replace(/\/$/, '').split('/').slice(-2).join('/') : '';
+
+let TOKEN = null, CATALOG = null, MODEL = null, LIVE = null, PRESETS = null;
+let pickedModel = null, pickedBits = '', wasBusy = false;
+let dlInfo = null, dlTimer = null, pollTimer = null, TRY = null;
+
+function store(t) { try { sessionStorage.setItem('quanteeze-token', t); } catch (e) {} }
+function stored() { try { return sessionStorage.getItem('quanteeze-token'); } catch (e) { return null; } }
+function takeToken() {
+  const m = location.hash.match(/token=([^&]+)/);
+  if (m) {
+    TOKEN = decodeURIComponent(m[1]); store(TOKEN);
+    history.replaceState(null, '', location.pathname + location.search);
+  } else TOKEN = stored();
+}
+
+async function call(method, path, body) {
+  const headers = {'X-Quanteeze-Token': TOKEN || ''};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const r = await fetch(path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store'});
+  let data = null; try { data = await r.json(); } catch (e) {}
+  if (!r.ok) {
+    const e = new Error((data && (data.error || (data.error && data.error.message) || data.detail)) || `${r.status} ${r.statusText}`);
+    e.status = r.status; throw e;
+  }
+  return data;
+}
+
+const LOAD_PHASES = {opening: 'opening the checkpoint', weights: 'reading the weights', experts: 'quantizing the experts', starting: 'starting'};
+const HEAT_LEVELS = ['nominal', 'fair', 'serious', 'critical', 'sleeping'];
+const REQ_PHASE = {reading: 'reading the prompt', thinking: 'thinking', answering: 'answering', tool: 'calling a tool'};
+const REQ_ENDING = {
+  answered: 'answered',
+  tool: 'called a tool',
+  length: 'cut at its token limit',
+  thinking: 'ended in its thinking, with no answer and no call: the client may ask again',
+  cancelled: 'cancelled',
+  stopped: 'stopped without saying it ended (an error?)',
+};
+
+function bytes(n) { return n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${(n / 1e6).toFixed(0)} MB`; }
+function tile(k, v, note) {
+  return el('div', {class: 'live'}, el('div', {class: 'k'}, k), el('div', {class: 'v'}, v), note ? el('div', {class: 'note'}, note) : null);
+}
+
+// Rolling decode rate over the last 5 seconds (smooths MTP burst chunks, matching LM Studio / llama.cpp).
+const RATE_WINDOW_MS = 5000;
+function recentRate(seen, now) {
+  if (!seen || seen.length < 2) return 0;
+  const from = seen.find(([t]) => t >= now - RATE_WINDOW_MS) || seen[0];
+  const to = seen[seen.length - 1];
+  const start = from === to ? seen[Math.max(0, seen.indexOf(from) - 1)] : from;
+  return to[0] > start[0] && to[1] > start[1] ? (to[1] - start[1]) / ((to[0] - start[0]) / 1000) : 0;
+}
+
+// Per-request client-side rolling tok/s fallback for requests observed through /home/live polling.
+const PHASE_RATES = new Map();
+function observedDecodeRate(r, nowMs, active) {
+  if (r.decode_tps != null) return r.decode_tps;
+  const gen = (r.thought || 0) + (r.written || 0);
+  let rec = PHASE_RATES.get(r.id);
+  if (active && gen > 0) {
+    if (!rec) { rec = {samples: [], lastRate: null}; PHASE_RATES.set(r.id, rec); }
+    const last = rec.samples[rec.samples.length - 1];
+    if (!last || last[1] !== gen) rec.samples.push([nowMs, gen]);
+    while (rec.samples.length > 2 && rec.samples[0][0] < nowMs - 12000) rec.samples.shift();
+    const rate = recentRate(rec.samples, nowMs);
+    if (rate > 0) rec.lastRate = rate;
+  }
+  return rec && rec.lastRate ? rec.lastRate : null;
+}
+
+function reqTokens(r) {
+  return `${(r.prompt || 0).toLocaleString()} prompt tokens${r.cached != null ? ` (${r.cached.toLocaleString()} from the cache)` : ''}`
+    + ` · ${(r.thought || 0).toLocaleString()} thought, ${(r.written || 0).toLocaleString()} written`;
+}
+function reqEffort(r) {
+  return !r.thinking ? 'no thinking' : r.effort ? `${r.effort} effort` : "the model's default effort";
+}
+
+function renderPhases(R) {
+  const box = $('phases');
+  if (!R) { box.replaceChildren(); return; }
+  const nowMs = performance.now();
+  const keepIds = new Set();
+  for (const r of R.now || []) keepIds.add(r.id);
+  for (const r of R.ended || []) keepIds.add(r.id);
+  for (const id of PHASE_RATES.keys()) if (!keepIds.has(id)) PHASE_RATES.delete(id);
+
+  const rows = (R.now || []).map(r => {
+    if (r.phase === 'reading') {
+      const pRate = r.prefill_tps ? ` · ${Math.round(r.prefill_tps).toLocaleString()} tokens/s` : '';
+      return el('div', {}, el('span', {class: 'tag good'}, 'now'), ' ',
+        `reading the prompt: ${(r.read || 0).toLocaleString()} of ${(r.prompt || 0).toLocaleString()} tokens (${pct(r.prompt ? r.read / r.prompt : 0)})${pRate} · ${fmt(r.seconds, 1)} s`);
+    }
+    const dRate = observedDecodeRate(r, nowMs, true);
+    const rateStr = dRate ? ` · ${fmt(dRate, 1)} tokens/s` : '';
+    const lead = r.phase === 'thinking' ? `thinking with ${reqEffort(r)}` : `${REQ_PHASE[r.phase] || r.phase} (${reqEffort(r)})`;
+    return el('div', {}, el('span', {class: 'tag good'}, 'now'), ' ',
+      `${lead} · ${reqTokens(r)}${rateStr} · ${fmt(r.seconds, 1)} s`);
+  });
+
+  for (const r of (R.ended || []).slice(0, 5)) {
+    const dRate = observedDecodeRate(r, nowMs, false);
+    const rateStr = dRate ? ` · ${fmt(dRate, 1)} tokens/s` : '';
+    rows.push(el('div', {class: ['thinking', 'stopped'].includes(r.how) ? 'err' : 'note'},
+      `${new Date(r.ended * 1000).toLocaleTimeString()} · ${REQ_ENDING[r.how] || r.how} · ${reqEffort(r)} · ${reqTokens(r)}${rateStr} · ${fmt(r.seconds, 1)} s`));
+  }
+
+  box.replaceChildren(
+    el('h3', {}, 'Requests now and lately'),
+    ...(rows.length ? rows : [el('p', {class: 'note', style: 'margin:0'}, 'None since the server started.')]),
+  );
+}
+
+function renderNow() {
+  if (!MODEL) return;
+  const fullModel = (MODEL.target && MODEL.state !== 'idle') ? MODEL.target : MODEL.model;
+  $('now-model').textContent = fullModel ? shortPath(fullModel) : 'No model loaded';
+  $('now-model').title = fullModel || '';
+  const stateLabel = {
+    idle: MODEL.model ? 'ready' : 'idle',
+    waiting: 'waiting for requests to finish',
+    loading: 'loading',
+    failed: 'failed',
+  }[MODEL.state] || MODEL.state;
+  $('now-state').textContent = stateLabel;
+  $('now-state').className = 'tag' + (MODEL.state === 'failed' ? ' warn' : MODEL.state === 'idle' ? ' good' : ' warn');
+
+  const s = (LIVE && LIVE.serving) || {};
+  const parts = [];
+  const fmtBits = b => typeof b === 'string' && isNaN(b) ? b.toUpperCase() : `${b}-bit`;
+  if (s.model_type) parts.push(s.model_type);
+  if (s.bits) parts.push(`${fmtBits(s.bits)} experts` + (s.stock_bits && s.bits !== s.stock_bits ? ` (lowered from ${s.stock_bits}-bit${typeof s.bits === 'number' || !isNaN(s.bits) ? ' by least squares' : ''})` : ''));
+  else if (MODEL.bits) parts.push(`${fmtBits(MODEL.bits)} uniform requested`);
+  if (s.mode === 'on_demand') parts.push(`streaming on demand from SSD (${s.experts_gb ?? '?'} of ${s.total_experts_gb ?? '?'} GB kept in memory)`);
+  else if (s.mode === 'in_memory') parts.push('all weights in memory');
+  $('now-how').textContent = parts.join(' · ');
+
+  const p = MODEL.progress, busy = MODEL.state === 'waiting' || MODEL.state === 'loading';
+  $('start-btn').disabled = busy;
+  $('now-meter').hidden = !(busy || (p && p.loading));
+  if (busy || (p && p.loading)) {
+    const detail = MODEL.state === 'waiting'
+      ? `Waiting for ${MODEL.inflight} request${MODEL.inflight === 1 ? '' : 's'} to finish…`
+      : `${p.percent}% · ${LOAD_PHASES[p.phase] || p.phase || ''}` + (p.unit === 'bytes' ? ` (${bytes(p.done)} of ${bytes(p.total)})` : p.unit ? ` (${p.done} of ${p.total} ${p.unit})` : '')
+        + (p.seconds != null ? ` · ${fmt(p.seconds, 0)} s` : '');
+    $('now-bar').style.width = `${MODEL.state === 'waiting' ? 0 : p.percent}%`;
+    $('now-msg').className = 'note';
+    $('now-msg').textContent = detail;
+    $('start-msg').className = 'note';
+    $('start-msg').textContent = `Loading model… ${detail}`;
+  } else {
+    $('now-msg').className = 'note' + (MODEL.state === 'failed' ? ' err' : '');
+    $('now-msg').textContent = MODEL.error || '';
+  }
+
+  const grid = $('live'); grid.replaceChildren();
+  if (LIVE) {
+    const mem = LIVE.memory || {};
+    if (mem.active_gb != null) {
+      const memNote = [`peak ${fmt(mem.peak_gb)}`, mem.cache_gb != null ? `cache ${fmt(mem.cache_gb)}` : null,
+        mem.working_set_gb != null ? `of ${fmt(mem.working_set_gb)} GB` : null].filter(Boolean).join(' · ');
+      grid.append(tile('Memory (MLX)', `${fmt(mem.active_gb)} GB`, memNote));
+    }
+    const K = mem.keeper;
+    if (K) {
+      grid.append(tile('Memory (the server)', `${fmt(K.held_gb)} GB`,
+        K.stopped ? 'stopped: it outgrew its memory'
+          : `at most ${fmt(K.peak_gb)} · keeps to ${fmt(K.limit_gb)}` + (K.stop_gb == null ? '' : ` · stops at ${fmt(K.stop_gb)} GB`)));
+    }
+    const h = LIVE.heat || {};
+    grid.append(tile('Heat', h.level == null ? '–' : (HEAT_LEVELS[h.level] || String(h.level)),
+      h.throttle_at == null ? 'no throttle' : `slows from ${HEAT_LEVELS[h.throttle_at] || h.throttle_at} · rested ${fmt(h.rested_s, 0)} s`));
+
+    if (LIVE.demand) {
+      const d = LIVE.demand;
+      const total = (d.hits || 0) + (d.misses || 0);
+      const hitVal = d.hit_rate != null ? `${pct(d.hit_rate)} in memory`
+        : total ? `${pct((d.hits || 0) / total)} in memory` : 'ready';
+      const dNote = [`${d.slots || '?'}${d.num_experts ? `/${d.num_experts}` : ''} slots/layer`,
+        `${(d.misses || 0).toLocaleString()} misses`,
+        d.read_s != null ? `${fmt(d.read_s, 1)} s read` : null].filter(Boolean).join(' · ');
+      grid.append(tile('On-demand SSD', hitVal, dNote));
+    }
+    if (LIVE.mtp) {
+      const m = LIVE.mtp;
+      if (typeof m === 'object') {
+        grid.append(tile('MTP', m.acceptance == null ? 'no rounds yet' : `${pct(m.acceptance)} accepted`,
+          `${m.tokens_a_round != null ? fmt(m.tokens_a_round, 2) : '–'} tokens a round · ${(m.rounds || 0).toLocaleString()} rounds`));
+      } else {
+        grid.append(tile('MTP', String(m), null));
+      }
+    }
+    if (LIVE.requests) {
+      const R = LIVE.requests;
+      const activeN = (R.now || []).length;
+      if (R.counts) {
+        const doneOk = (R.counts.answered || 0) + (R.counts.tool || 0);
+        grid.append(tile('Requests', `${(R.counts.requests || 0) + activeN}`,
+          `${doneOk} answered · ${activeN} running now`));
+      } else {
+        const endedN = (R.ended || []).length;
+        grid.append(tile('Requests', activeN ? `${activeN} running` : `${endedN} recent`,
+          activeN ? `${endedN} ended lately` : (endedN ? 'idle now' : 'none yet')));
+      }
+    }
+    renderPhases(LIVE.requests);
+  }
+}
+
+function isServed(m) {
+  return Boolean(CATALOG && CATALOG.served && (m.path === CATALOG.served || (m.ple && m.ple.view === CATALOG.served)));
+}
+
+function renderCatalog() {
+  if (!CATALOG) return;
+  for (const node of document.querySelectorAll('.here')) node.textContent = CATALOG.machine || 'this machine';
+  const box = $('models'); box.replaceChildren();
+  if (!pickedModel && CATALOG.models.length) {
+    const served = CATALOG.models.find(isServed) || CATALOG.models[0];
+    pickedModel = served.path;
+    pickedBits = CATALOG.bits ? String(CATALOG.bits) : '';
+  }
+  for (const m of CATALOG.models) {
+    const btn = el('button', {class: 'pick' + (m.path === pickedModel ? ' on' : '')});
+    const parts = (m.name || '').split('/');
+    if (parts.length > 1) btn.append(el('div', {class: 'org'}, parts[0]));
+    btn.append(el('div', {class: 'title'}, parts[parts.length - 1] || m.name));
+    const tags = el('div', {class: 'tags'});
+    tags.append(el('span', {class: 'tag'}, `${m.gb} GB`));
+    if (m.moe && m.experts) tags.append(el('span', {class: 'tag'}, `${m.layers || '?'}L × ${m.experts}E`));
+    if (m.stock_bits) tags.append(el('span', {class: 'tag'}, `${m.stock_bits}-bit stock`));
+    if (m.mtp && m.mtp.head) tags.append(el('span', {class: 'tag good'}, 'MTP head'));
+    if (m.ple && m.ple.gb) tags.append(el('span', {class: 'tag'}, `PLE ${m.ple.gb} GB${m.ngram_ssd ? ' (SSD)' : ''}`));
+    if (m.engram && m.engram.gb) tags.append(el('span', {class: 'tag'}, `Engram ${m.engram.gb} GB (SSD)`));
+    if (isServed(m)) tags.append(el('span', {class: 'tag good'}, 'serving'));
+    btn.append(tags);
+    btn.addEventListener('click', () => {
+      pickedModel = m.path;
+      if (!wasBusy) { $('start-msg').textContent = ''; $('start-msg').className = 'note'; }
+      renderCatalog(); renderPrecision();
+    });
+    box.append(btn);
+  }
+  renderPrecision();
+}
+
+function renderPrecision() {
+  const pane = $('precision-pane');
+  const m = CATALOG && CATALOG.models.find(x => x.path === pickedModel);
+  if (!m) { pane.hidden = true; return; }
+  pane.hidden = false;
+  const ways = $('ways'); ways.replaceChildren();
+  const room = m.room_gb;
+  if (!m.moe) {
+    $('room-note').textContent = `${m.name} is a dense model (${m.gb} GB): all weights load at their checkpoint precision.`;
+    pickedBits = '';
+    return;
+  }
+  $('room-note').textContent = room != null
+    ? `Available room for routed experts beside the rest of the model and reserve: ${room} GB.`
+    : `Routed experts originally take ${m.experts_gb ?? '?'} GB.`;
+
+  const choices = [
+    {bits: '', title: `Original (${m.stock_bits || '?'}-bit)`, gb: m.experts_gb, desc: 'Checkpoint precision without re-quantizing'},
+  ];
+  if (m.uniform_gb) {
+    const ladder = [
+      {bits: '4', minStock: 5, title: '4 bits (least-squares)', desc: 'All routed experts lowered uniformly to 4-bit'},
+      {bits: 'q3_k', minStock: 4, title: 'Q3_K (ggml K-quant)', desc: 'Intermediate size (3.44 bpw); slower at load, from SSD, and on CUDA', kquant: true},
+      {bits: '3', minStock: 4, title: '3 bits (least-squares)', desc: 'All routed experts lowered uniformly to 3-bit'},
+      {bits: 'q2_k', minStock: 3, title: 'Q2_K (ggml K-quant)', desc: 'Intermediate size (2.63 bpw); slower at load, from SSD, and on CUDA', kquant: true},
+      {bits: 'iq2_xs', minStock: 3, title: 'IQ2_XS (ggml importance grid)', desc: 'Intermediate size (2.31 bpw); slower at load, from SSD, and on CUDA', kquant: true},
+      {bits: '2', minStock: 3, title: '2 bits (least-squares)', desc: 'All routed experts lowered uniformly to 2-bit'},
+      {bits: '1', minStock: 2, title: '1 bit (least-squares)', desc: 'All routed experts lowered uniformly to 1-bit'},
+    ];
+    for (const item of ladder) {
+      if (m.stock_bits && m.stock_bits < item.minStock) continue;
+      if (m.uniform_gb[item.bits] == null) continue;
+      choices.push({...item, gb: m.uniform_gb[item.bits]});
+    }
+  }
+  if (!choices.some(c => c.bits === pickedBits)) pickedBits = '';
+  const onMac = !CATALOG || CATALOG.machine === 'this Mac';
+  for (const c of choices) {
+    const btn = el('button', {class: 'way' + (pickedBits === c.bits ? ' on' : '')});
+    btn.append(el('b', {}, c.title));
+    const fits = c.gb == null || room == null || c.gb <= room;
+    if (c.gb != null) {
+      btn.append(el('span', {}, `${c.gb} GB of experts · ${fits ? 'fits in memory' : 'streams from SSD'}`));
+    }
+    btn.append(el('span', c.kquant && (!fits || !onMac) ? {class: 'warn'} : {}, c.desc));
+    btn.addEventListener('click', () => {
+      pickedBits = c.bits;
+      if (!wasBusy) { $('start-msg').textContent = ''; $('start-msg').className = 'note'; }
+      renderPrecision();
+    });
+    ways.append(btn);
+  }
+}
+
+$('start-btn').addEventListener('click', async () => {
+  if (!pickedModel) return;
+  $('start-btn').disabled = true;
+  $('start-msg').className = 'note';
+  $('start-msg').textContent = 'Starting load…';
+  try {
+    MODEL = await call('POST', '/v1/quanteeze/home/start', {path: pickedModel, bits: pickedBits});
+    wasBusy = true;
+    $('start-msg').textContent = 'Loading model…';
+    renderNow();
+    schedulePoll(800);
+  } catch (e) {
+    $('start-msg').className = 'note err';
+    $('start-msg').textContent = `Could not start: ${e.message}`;
+    $('start-btn').disabled = false;
+  }
+});
+
+// ---------------------------------------------------------------- presets
+const GROUP_TITLES = {
+  memory: 'Memory reserve',
+  ngram: 'PLE n-gram table',
+  mtp: 'MTP speculative decoding',
+  heat: 'Thermal throttle',
+};
+
+function renderPresets() {
+  if (!PRESETS) return;
+  const box = $('presets'); box.replaceChildren();
+  for (const [group, title] of Object.entries(GROUP_TITLES)) {
+    const g = PRESETS[group];
+    if (!g) continue;
+    const wrap = el('div');
+    wrap.append(el('h3', {style: 'margin-top:0'}, title));
+    const seg = el('div', {class: 'seg'});
+    let activeAbout = '';
+    for (const c of g.choices) {
+      const on = g.now === c.key;
+      if (on) activeAbout = c.about;
+      const b = el('button', {class: on ? 'on' : ''}, c.label);
+      b.addEventListener('click', async () => {
+        try {
+          PRESETS = await call('POST', '/v1/quanteeze/home/presets', {group, key: c.key});
+          CATALOG = await call('GET', '/v1/quanteeze/home/catalog');
+          renderPresets(); renderCatalog();
+          $('preset-msg').textContent = `Saved ${title.toLowerCase()} preset (${c.label}).`;
+        } catch (e) { $('preset-msg').textContent = e.message; }
+      });
+      seg.append(b);
+    }
+    wrap.append(seg, el('div', {class: 'note', style: 'margin-top:6px'}, g.note || activeAbout || 'Custom value set in settings'));
+    box.append(wrap);
+  }
+}
+
+// ---------------------------------------------------------------- download
+$('dl-check').addEventListener('click', async () => {
+  const repo = $('dl-repo').value.trim();
+  if (!repo) return;
+  $('dl-check').disabled = true;
+  try {
+    dlInfo = await call('POST', '/v1/quanteeze/home/download/info', {repo});
+    const ask = $('dl-ask'); ask.replaceChildren(); ask.hidden = false;
+    ask.append(el('div', {}, `${dlInfo.repo}: ${dlInfo.files} files, ${dlInfo.gb} GB` + (dlInfo.local ? ` (already at ${dlInfo.local})` : '')));
+    const bar = el('div', {class: 'bar', style: 'margin-top:8px'});
+    const go = el('button', {class: 'primary'}, `Download ${dlInfo.gb} GB`);
+    go.addEventListener('click', async () => {
+      ask.hidden = true;
+      await call('POST', '/v1/quanteeze/home/download', {repo: dlInfo.repo, gb: dlInfo.gb});
+      pollDownload();
+    });
+    bar.append(go); ask.append(bar);
+  } catch (e) {
+    const ask = $('dl-ask'); ask.replaceChildren(el('div', {class: 'err'}, e.message)); ask.hidden = false;
+  }
+  $('dl-check').disabled = false;
+});
+
+function pollDownload() {
+  if (dlTimer) return;
+  $('dl-progress').hidden = false;
+  dlTimer = setInterval(async () => {
+    try {
+      const d = await call('GET', '/v1/quanteeze/home/download');
+      const pctDone = d.total ? Math.min(100, Math.round(100 * (d.bytes || 0) / d.total)) : 0;
+      $('dl-bar').style.width = `${pctDone}%`;
+      $('dl-msg').textContent = d.state === 'downloading'
+        ? `Downloading ${d.repo}: ${bytes(d.bytes || 0)}${d.total ? ` of ${bytes(d.total)} (${pctDone}%)` : ''}`
+        : d.state === 'done' ? `Downloaded ${d.repo}.` : (d.error || '');
+      if (d.state !== 'downloading') {
+        clearInterval(dlTimer); dlTimer = null;
+        CATALOG = await call('GET', '/v1/quanteeze/home/catalog');
+        renderCatalog();
+      }
+    } catch (e) {}
+  }, 1500);
+}
+
+// ---------------------------------------------------------------- try a prompt (SSE streaming + live tok/s)
+async function streamPrompt(body) {
+  const r = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    signal: TRY.controller.signal,
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({...body, stream: true, stream_options: {include_usage: true}}),
+  });
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error((d.error && (d.error.message || d.error)) || d.detail || `${r.status} ${r.statusText}`);
+  }
+  const reader = r.body.getReader(), dec = new TextDecoder(), calls = [];
+  let buf = '';
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (data === '[DONE]') continue;
+      let chunk; try { chunk = JSON.parse(data); } catch (e) { continue; }
+      const choice = chunk.choices && chunk.choices[0];
+      const d = choice && choice.delta;
+      if (choice && choice.finish_reason) TRY.finish = choice.finish_reason;
+      if (d && d.reasoning_content) {
+        $('try-think').hidden = false;
+        $('try-thinking').textContent += d.reasoning_content;
+      }
+      if (d && d.content) {
+        $('try-reply').textContent += d.content;
+      }
+      for (const t of (d && d.tool_calls) || []) {
+        const idx = t.index || 0;
+        const c = calls[idx] || (calls[idx] = {id: '', function: {name: '', arguments: ''}});
+        if (t.id) c.id = t.id;
+        if (t.function && t.function.name) c.function.name += t.function.name;
+        if (t.function && t.function.arguments) c.function.arguments += t.function.arguments;
+      }
+      const now = performance.now();
+      if (d && (d.content || d.reasoning_content || d.tool_calls)) {
+        TRY.tokens += 1;
+        TRY.first = TRY.first || now;
+        TRY.seen.push([now, TRY.tokens]);
+      }
+      if (chunk.usage) {
+        if (chunk.usage.completion_tokens != null) TRY.tokens = chunk.usage.completion_tokens;
+        if (chunk.usage.prompt_tokens != null) TRY.prompt = chunk.usage.prompt_tokens;
+      }
+      if (TRY.first && now - TRY.shown >= 250) {
+        TRY.shown = now;
+        $('try-status').textContent = `${TRY.tokens} tokens · ${fmt(recentRate(TRY.seen, now))} tokens/s · first token after ${fmt((TRY.first - TRY.started) / 1000)} s`;
+      }
+    }
+  }
+  const builtCalls = calls.filter(Boolean);
+  if (builtCalls.length && !$('try-reply').textContent) {
+    $('try-reply').textContent = builtCalls.map(c => `${c.function.name}(${c.function.arguments})`).join('\n');
+  }
+}
+
+async function sendPrompt() {
+  const content = $('try-text').value.trim();
+  if (TRY || !content) return;
+  const knobs = {
+    max_tokens: +$('try-length').value,
+    ...($('try-thinks').value === 'off' ? {enable_thinking: false} : {}),
+  };
+  TRY = {controller: new AbortController(), started: performance.now(), tokens: 0, finish: null, prompt: null, seen: [], shown: 0, first: null};
+  $('try-reply').textContent = '';
+  $('try-thinking').textContent = '';
+  $('try-think').hidden = true;
+  $('try-think').open = false;
+  $('try-send').disabled = true;
+  $('try-stop').hidden = false;
+  $('try-status').className = 'note grow';
+  $('try-status').textContent = 'Waiting for the first token…';
+  schedulePoll(400);
+  try {
+    await streamPrompt({model: 'local', messages: [{role: 'user', content}], ...knobs});
+    const end = performance.now();
+    const last = TRY.seen.length ? TRY.seen[TRY.seen.length - 1][0] : end;
+    const first = TRY.first;
+    const wait = first ? (first - TRY.started) / 1000 : null;
+    const made = first && last > first ? (last - first) / 1000 : null;
+    const genCount = Math.max(TRY.tokens, TRY.seen.length);
+    $('try-status').textContent = [
+      `${genCount} tokens`,
+      made && genCount > 1 ? `${fmt((genCount - 1) / made)} tokens/s generating` : null,
+      wait != null ? `first token after ${fmt(wait)} s` + (TRY.prompt != null ? ` (${TRY.prompt.toLocaleString()} prompt tokens read)` : '') : null,
+      `${fmt((end - TRY.started) / 1000)} s in all`,
+    ].filter(Boolean).join(' · ');
+    if (!$('try-reply').textContent && !$('try-thinking').textContent) {
+      $('try-reply').textContent = '(empty reply)';
+    }
+  } catch (e) {
+    $('try-status').className = 'note grow' + (e.name === 'AbortError' ? '' : ' err');
+    $('try-status').textContent = e.name === 'AbortError' ? 'Stopped.' : `Not answered: ${e.message}`;
+  } finally {
+    TRY = null;
+    $('try-send').disabled = false;
+    $('try-stop').hidden = true;
+    pollOnce();
+  }
+}
+
+$('try-send').addEventListener('click', sendPrompt);
+$('try-stop').addEventListener('click', () => { if (TRY) TRY.controller.abort(); });
+$('try-text').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendPrompt(); }
+});
+
+// ---------------------------------------------------------------- connect
+function renderConnect(c) {
+  $('connect-note').textContent = c.local_only
+    ? 'Listening on localhost only (start with --host 0.0.0.0 to reach from other devices on your LAN).'
+    : 'Reachable from other devices on your network.';
+  const box = $('connect-rows'); box.replaceChildren();
+  const rows = [
+    ['OpenAI base URL', c.openai],
+    ['Anthropic base URL', c.anthropic],
+    ['Claude Code', c.claude_code],
+    ['curl', c.curl],
+  ];
+  for (const [label, val] of rows) {
+    const r = el('div', {class: 'copyrow'});
+    r.append(el('span', {class: 'k note'}, label), el('code', {}, val));
+    const btn = el('button', {}, 'Copy');
+    btn.addEventListener('click', () => { navigator.clipboard.writeText(val); btn.textContent = 'Copied'; setTimeout(() => btn.textContent = 'Copy', 1200); });
+    r.append(btn);
+    box.append(r);
+  }
+}
+
+// ---------------------------------------------------------------- init & adaptive live polling
+async function pollOnce() {
+  if ($('app').hidden) return;
+  try {
+    const [mod, live] = await Promise.all([call('GET', '/v1/quanteeze/model'), call('GET', '/v1/quanteeze/home/live')]);
+    MODEL = mod; LIVE = live;
+    const busyNow = mod.state === 'waiting' || mod.state === 'loading';
+    if (wasBusy && !busyNow) {
+      if (mod.state === 'idle') {
+        const secs = mod.progress && mod.progress.seconds != null ? ` (${mod.progress.seconds}s)` : '';
+        $('start-msg').className = 'note ok';
+        $('start-msg').textContent = `Ready — serving model${secs}.`;
+      } else {
+        $('start-msg').className = 'note err';
+        $('start-msg').textContent = mod.error || 'Model load failed.';
+      }
+      const [cat, conn] = await Promise.all([call('GET', '/v1/quanteeze/home/catalog'), call('GET', '/v1/quanteeze/home/connect')]);
+      CATALOG = cat;
+      renderCatalog(); renderConnect(conn);
+    }
+    wasBusy = busyNow;
+    renderNow();
+  } catch (e) {}
+}
+
+function schedulePoll(ms) {
+  if (pollTimer) clearTimeout(pollTimer);
+  const activeReq = Boolean(TRY || (MODEL && (MODEL.state === 'waiting' || MODEL.state === 'loading'))
+    || (LIVE && LIVE.requests && LIVE.requests.now && LIVE.requests.now.length));
+  const wait = ms != null ? ms : (activeReq ? 1000 : 2000);
+  pollTimer = setTimeout(async () => {
+    await pollOnce();
+    schedulePoll();
+  }, wait);
+}
+
+async function init() {
+  try {
+    const [cat, mod, live, pre, conn] = await Promise.all([
+      call('GET', '/v1/quanteeze/home/catalog'),
+      call('GET', '/v1/quanteeze/model'),
+      call('GET', '/v1/quanteeze/home/live'),
+      call('GET', '/v1/quanteeze/home/presets'),
+      call('GET', '/v1/quanteeze/home/connect'),
+    ]);
+    CATALOG = cat; MODEL = mod; LIVE = live; PRESETS = pre;
+    wasBusy = Boolean(mod && (mod.state === 'waiting' || mod.state === 'loading'));
+    $('locked').hidden = true;
+    $('app').hidden = false;
+    renderNow(); renderCatalog(); renderPresets(); renderConnect(conn);
+    schedulePoll();
+  } catch (e) {
+    $('locked').hidden = false;
+    $('app').hidden = true;
+    $('token-why').textContent = e.status === 401
+      ? (TOKEN ? 'The token was not accepted.' : 'Enter the control token to open the dashboard.')
+      : e.message;
+  }
+}
+
+$('use-token').addEventListener('click', () => { TOKEN = $('token').value.trim(); store(TOKEN); $('token').value = ''; init(); });
+addEventListener('hashchange', () => { takeToken(); init(); });
+takeToken();
+init();
+</script>
+<script>
+// Japanese / English toggle (saved in localStorage; defaults to Japanese when browser language starts with 'ja').
+// Translates UI text and attributes via MutationObserver while leaving model replies, inputs, code and model IDs untouched.
+(() => {
+  'use strict';
+  const KEY = 'quanteeze-lang';
+  let lang = null;
+  try { lang = localStorage.getItem(KEY); } catch (e) {}
+  if (lang !== 'ja' && lang !== 'en') {
+    lang = ((navigator.languages && navigator.languages[0]) || navigator.language || 'en').toLowerCase().startsWith('ja') ? 'ja' : 'en';
+  }
+  const link = document.getElementById('lang-switch');
+  if (link) {
+    link.textContent = lang === 'ja' ? 'English' : '日本語';
+    link.lang = lang === 'ja' ? 'en' : 'ja';
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      try { localStorage.setItem(KEY, lang === 'ja' ? 'en' : 'ja'); } catch (_) {}
+      location.reload();
+    });
+  }
+  if (lang !== 'ja') return;
+  document.documentElement.lang = 'ja';
+
+  const JA = {
+    'Every setting →': '詳細設定 →',
+    'Choose a model and its uniform expert precision on': 'モデルと均一エキスパート量子化精度を',
+    'this Mac': 'この Mac', 'this machine': 'このマシン',
+    '.': 'で選びます。',
+    'Token': 'トークン',
+    'Control token': '管理トークン',
+    'Use': '使う',
+    'Enter the control token to open the dashboard.': 'ダッシュボードを開くには管理トークンを入力してください。',
+    'The token was not accepted.': 'トークンが受け付けられませんでした。',
+    'Serving now': 'いま配信中',
+    'No model loaded': 'モデル未読み込み',
+    'ready': '待機中（配信可）', 'idle': '待機中', 'loading': '読み込み中', 'failed': '失敗',
+    'waiting for requests to finish': '実行中リクエストの完了待ち',
+    'serving': '配信中',
+    'Memory (MLX)': 'メモリ（MLX）',
+    'Memory (the server)': 'メモリ（サーバー全体）',
+    'Heat': '発熱',
+    'no throttle': '減速なし',
+    'nominal': '平常', 'fair': 'やや高い', 'serious': '高い', 'critical': '危険', 'sleeping': 'スリープ',
+    'On-demand SSD': 'オンデマンド SSD',
+    'MTP': 'MTP 投機デコード',
+    'no rounds yet': 'まだラウンドなし',
+    'Requests': 'リクエスト数',
+    'idle now': '現在待機中', 'none yet': 'まだなし',
+    'Requests now and lately': '実行中・直近のリクエスト',
+    'None since the server started.': 'サーバー起動以降、まだリクエストはありません。',
+    'now': '実行中',
+    'Model & uniform precision': 'モデルと均一量子化精度',
+    'Fetch from Hugging Face: org/model-name': 'Hugging Face から取得: org/model-name',
+    'Check size': 'サイズ確認',
+    'Routed expert precision': 'ルーティング・エキスパートの精度',
+    'Checkpoint precision without re-quantizing': '再量子化せずチェックポイントの元の精度を使用',
+    'Serve this model': 'このモデルを配信',
+    'Starting load…': '読み込みを開始しています…',
+    'Loading model…': 'モデルを読み込み中…',
+    'Model load failed.': 'モデルの読み込みに失敗しました。',
+    'Try a prompt': '質問してみる',
+    'Ask the model something…': 'モデルに質問してみる…',
+    'Prompt': 'プロンプト',
+    'Thinking': '思考',
+    'Thinking as the model does': '思考はモデルの既定どおり',
+    'No thinking': '思考なし',
+    'Longest answer': '答えの最大長',
+    'Up to 1,024 tokens': '最大 1,024 トークン',
+    'Up to 4,096 tokens': '最大 4,096 トークン',
+    'Up to 16,384 tokens': '最大 16,384 トークン',
+    'Send': '送る', 'Stop': '止める',
+    'Waiting for the first token…': '最初のトークンを待っています…',
+    'Stopped.': '停止しました。',
+    'Its thinking': '思考の内容',
+    '(empty reply)': '（空の応答）',
+    'Memory, PLE, MTP & heat': 'メモリ・PLE・MTP・発熱',
+    'Saved at once; settings marked as load-time take effect the next time a model loads.': 'すぐに保存されます（読み込み時設定は次回モデル読み込みから有効）。',
+    'Memory reserve': 'メモリ確保枠',
+    'PLE n-gram table': 'PLE n-gram 表',
+    'MTP speculative decoding': 'MTP 投機デコード',
+    'Thermal throttle': '発熱による減速',
+    'Roomy': 'ゆったり', 'Standard': '標準', 'Most experts': 'エキスパート最大',
+    'Quiet': '静か', 'Full speed': '全速', 'Auto': '自動', 'SSD': 'SSD', 'Off': 'オフ', 'On': 'オン', 'On (exact)': 'オン（完全一致）',
+    'Custom value set in settings': '詳細設定ページで個別に指定中',
+    'Connect an app': 'アプリをつなぐ',
+    'Listening on localhost only (start with --host 0.0.0.0 to reach from other devices on your LAN).': 'localhost のみで待ち受け中（LAN 内の他端末から接続するには --host 0.0.0.0 を付けて起動）。',
+    'Reachable from other devices on your network.': '同じネットワーク上の他の端末からも接続できます。',
+    'OpenAI base URL': 'OpenAI 互換 URL',
+    'Anthropic base URL': 'Anthropic 互換 URL',
+    'Copy': 'コピー', 'Copied': 'コピー済み',
+  };
+
+  const PATTERNS = [
+    [/^(.+) tokens · (.+) tokens\/s · first token after (.+) s$/, '$1 トークン · $2 tok/s · 最初のトークンまで $3 秒'],
+    [/^(.+) tokens · (.+) tokens\/s generating · first token after (.+) s(?: \((.+) prompt tokens read\))? · (.+) s in all$/,
+      (m, tok, tps, ttft, pr, tot) => `${tok} トークン · 生成 ${tps} tok/s · 最初のトークンまで ${ttft} 秒${pr ? `（プロンプト ${pr} トークン読込）` : ''} · 合計 ${tot} 秒`],
+    [/^(.+) tokens · first token after (.+) s(?: \((.+) prompt tokens read\))? · (.+) s in all$/,
+      (m, tok, ttft, pr, tot) => `${tok} トークン · 最初のトークンまで ${ttft} 秒${pr ? `（プロンプト ${pr} トークン読込）` : ''} · 合計 ${tot} 秒`],
+    [/^reading the prompt: (.+) of (.+) tokens \((.+)\)(?: · (.+) tokens\/s)? · (.+) s$/,
+      (m, r, p, pc, tps, s) => `プロンプト読込中：${p} トークン中 ${r}（${pc}）${tps ? ` · ${tps} tok/s` : ''} · ${s} 秒`],
+    [/^peak (.+?)(?: · cache (.+?))?(?: · of (.+) GB)?$/,
+      (m, pk, ca, ws) => `最大 ${pk}${ca ? ` · キャッシュ ${ca}` : ''}${ws ? ` · 作業枠 ${ws} GB` : ''}`],
+    [/^at most (.+) · keeps to (.+?)(?: · stops at (.+) GB)?$/,
+      (m, pk, lim, st) => `最大 ${pk} · 目安 ${lim}${st ? ` · ${st} GB で停止` : ''}`],
+    [/^slows from (.+) · rested (.+) s$/, (m, lv, s) => `${JA[lv] || lv} から減速 · 休止計 ${s} 秒`],
+    [/^(.+) accepted$/, '$1 受理'],
+    [/^(.+) tokens a round · (.+) rounds$/, '1ラウンド $1 トークン · 計 $2 ラウンド'],
+    [/^(\d+) answered · (\d+) running now$/, '完了 $1 · 実行中 $2'],
+    [/^(\d+) running$/, '実行中 $1'], [/^(\d+) recent$/, '直近 $1'], [/^(\d+) ended lately$/, '直近完了 $1'],
+    [/^(.+) in memory$/, 'メモリ内ヒット $1'],
+    [/^Ready — serving model(?: \((.+)s\))?\.$/, (m, s) => `準備完了 — 配信中${s ? `（${s}秒）` : ''}。`],
+    [/^Original \((.+)-bit\)$/, '元の精度（$1 ビット）'],
+    [/^(\d+) bits? \(least-squares\)$/, '$1 ビット（最小二乗）'],
+    [/^(Q3_K|Q2_K) \(ggml K-quant\)$/, '$1（ggml K-quant）'],
+    [/^IQ2_XS \(ggml importance grid\)$/, 'IQ2_XS（ggml 格子量子化）'],
+    [/^All routed experts lowered uniformly to (\d+)-bit$/, '全ルーティング・エキスパートを均一に $1 ビットへ量子化'],
+    [/^All routed experts quantized uniformly to (.+)$/, '全ルーティング・エキスパートを均一に $1 へ量子化'],
+    [/^Intermediate size \((.+)\); slower at load, from SSD, and on CUDA$/, '中間サイズ（$1）・初回読込／SSD配信／CUDAでは低速'],
+    [/^(.+) GB of experts · fits in memory$/, 'エキスパート $1 GB · メモリに収まる'],
+    [/^(.+) GB of experts · streams from SSD$/, 'エキスパート $1 GB · SSD からオンデマンド読込'],
+    [/^Available room for routed experts beside the rest of the model and reserve: (.+) GB\.$/,
+      'モデル本体と確保枠を除き、エキスパートに使えるメモリ余裕：$1 GB。'],
+    [/^Not answered: (.+)$/, '応答エラー：$1'],
+    [/^Could not start: (.+)$/, '起動できませんでした：$1'],
+  ];
+
+  const FRAGMENTS = [
+    ['all weights in memory', '全重みをメモリ保持'],
+    [/(\d+)-bit experts \(lowered from (\d+)-bit by least squares\)/, '$1ビット・エキスパート（$2ビットから最小二乗で量子化）'],
+    [/(Q3_K|Q2_K|IQ2_XS) experts \(lowered from (\d+)-bit\)/, '$1 エキスパート（$2ビットから均一量子化）'],
+    [/(\d+)-bit experts/, '$1ビット・エキスパート'],
+    [/(Q3_K|Q2_K|IQ2_XS) experts/, '$1 エキスパート'],
+    [/streaming on demand from SSD \((.+?) of (.+?) GB kept in memory\)/, 'SSD オンデマンド配信（$2 GB 中 $1 GB をメモリ保持）'],
+    ['opening the checkpoint', 'チェックポイントを開いています'],
+    ['reading the weights', '重みを読み込んでいます'],
+    ['quantizing the experts', 'エキスパートを量子化しています'],
+    ['thinking with ', '思考中：'],
+    ['answering (', '回答中（'],
+    ['calling a tool (', 'ツール呼出中（'],
+    [' · answered · ', ' · 回答完了 · '],
+    [' · called a tool · ', ' · ツール呼出 · '],
+    [' · cut at its token limit · ', ' · 最大トークン到達 · '],
+    [' · cancelled · ', ' · キャンセル · '],
+    ["the model's default effort", '既定の思考量'],
+    ['no thinking', '思考なし'],
+    [/ prompt tokens \((.+?) from the cache\)/, ' プロンプトトークン（キャッシュ $1）'],
+    [/ prompt tokens/, ' プロンプトトークン'],
+    [/ ([0-9,]+) thought, ([0-9,]+) written/, ' 思考 $1・出力 $2'],
+    [/ · ([0-9.]+) tokens\/s/, ' · $1 tok/s'],
+    [/ · ([0-9.]+) s$/, ' · $1 秒'],
+  ];
+
+  const SKIP = '#lang-switch, #try-reply, #try-thinking, .reply, textarea, code, pre, .mono, script, style, .pick .title, .pick .org, #now-model';
+  const ATTRS = ['placeholder', 'title', 'aria-label'];
+
+  function swap(s) {
+    const t = s.trim();
+    if (!t) return null;
+    let out = Object.prototype.hasOwnProperty.call(JA, t) ? JA[t] : null;
+    if (out == null) {
+      for (const [re, to] of PATTERNS) if (re.test(t)) { out = t.replace(re, to); break; }
+    }
+    if (out == null) out = t;
+    for (const [from, to] of FRAGMENTS) out = typeof from === 'string' ? out.split(from).join(to) : out.replace(from, to);
+    if (out === t) return null;
+    const i = s.indexOf(t);
+    return s.slice(0, i) + out + s.slice(i + t.length);
+  }
+  function skipped(node) {
+    const e = node.nodeType === 1 ? node : node.parentElement;
+    return !e || !!e.closest(SKIP);
+  }
+  function text(n) {
+    if (skipped(n)) return;
+    const o = swap(n.nodeValue);
+    if (o != null && o !== n.nodeValue) n.nodeValue = o;
+  }
+  function attrs(e) {
+    if (e.closest('script, style')) return;
+    for (const a of ATTRS) {
+      const v = e.getAttribute(a);
+      if (!v) continue;
+      const o = swap(v);
+      if (o != null && o !== v) e.setAttribute(a, o);
+    }
+  }
+  function walk(root) {
+    if (root.nodeType === 3) { text(root); return; }
+    if (root.nodeType !== 1) return;
+    attrs(root);
+    for (const e of root.querySelectorAll('[placeholder], [title], [aria-label]')) attrs(e);
+    const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) text(n);
+  }
+  walk(document.body);
+  new MutationObserver(list => {
+    for (const m of list) {
+      if (m.type === 'childList') m.addedNodes.forEach(walk);
+      else if (m.type === 'characterData') text(m.target);
+      else if (m.type === 'attributes') attrs(m.target);
+    }
+  }).observe(document.body, {childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ATTRS});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+[project]
+name = "quanteeze"
+version = "0.1.0"
+description = "Fast uniform least-squares quantization and speculative MoE serving on Apple Silicon and CUDA"
+readme = "README.md"
+license = "GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0"
+license-files = ["LICENSE", "LICENSE-GPL-2.0", "LICENSE-POLYFORM-SHIELD"]
+authors = [{ name = "Kentaro Kitagawa" }]
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=42",
+    "mlx==0.32.4",
+    "mlx-lm==0.32.2",
+    "mlx-vlm==0.7.9",
+    "numpy>=2",
+]
+
+[project.optional-dependencies]
+cuda = ["mlx[cuda12]==0.32.4"]
+cuda12 = ["mlx[cuda12]==0.32.4"]
+cuda13 = ["mlx[cuda13]==0.32.4"]
+cpu = ["mlx[cpu]==0.32.4"]
+
+[project.scripts]
+quanteeze = "quanteeze.serve:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

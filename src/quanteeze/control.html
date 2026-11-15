@@ -1,0 +1,365 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>quanteeze settings</title>
+<!-- quanteeze.control serves this page; it holds no secret: the token comes in the URL's fragment. -->
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --line: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11,11,11,0.10);
+  --accent: #2a78d6;
+  --warn-bg: #fdf1dc;
+  --warn: #8a5a00;
+  --bad: #d03b3b;
+  --good: #006300;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --line: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255,255,255,0.10);
+    --accent: #3987e5;
+    --warn-bg: #3a2c10;
+    --warn: #fab219;
+    --bad: #e66767;
+    --good: #0ca30c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --line: #2c2c2a;
+  --axis: #383835;
+  --ring: rgba(255,255,255,0.10);
+  --accent: #3987e5;
+  --warn-bg: #3a2c10;
+  --warn: #fab219;
+  --bad: #e66767;
+  --good: #0ca30c;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 96px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+h2 { font-size: 15px; font-weight: 600; margin: 0; text-transform: capitalize; }
+a { color: var(--accent); }
+.sub { color: var(--ink-2); }
+.card { background: var(--surface); border-radius: 10px; box-shadow: 0 0 0 1px var(--ring); padding: 16px; margin-top: 16px; }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+input[type=search], input[type=text], input[type=password], select {
+  font: inherit; color: var(--ink); background: var(--page); border: 1px solid var(--axis); border-radius: 6px; padding: 5px 8px;
+}
+input[type=search] { flex: 1 1 220px; }
+button { font: inherit; border-radius: 6px; padding: 6px 12px; border: 1px solid var(--axis); background: var(--surface); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: 0.5; cursor: default; }
+label { color: var(--ink-2); }
+.setting { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 4px 16px; padding: 12px 0; border-top: 1px solid var(--line); }
+.setting:first-of-type { border-top: 0; }
+.name { font: 12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.doc { color: var(--ink-2); font-size: 13px; }
+.value input, .value select { width: 100%; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.value select.dirty, .value input.dirty { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; font-size: 12px; }
+.tag { border-radius: 999px; padding: 1px 8px; box-shadow: 0 0 0 1px var(--ring); color: var(--ink-2); }
+.tag.wait { background: var(--warn-bg); color: var(--warn); box-shadow: none; font-weight: 600; }
+.why { color: var(--bad); font-size: 12.5px; }
+.note { font-size: 12.5px; color: var(--ink-2); }
+#savebar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface); box-shadow: 0 -1px 0 var(--ring); padding: 10px 16px; display: none; }
+#savebar .bar { max-width: 1100px; margin: 0 auto; }
+#message { min-height: 1.4em; }
+.ok { color: var(--good); }
+.err { color: var(--bad); }
+.meter { height: 10px; border-radius: 999px; background: var(--line); overflow: hidden; margin-top: 10px; }
+#model-bar { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width 0.4s; }
+@media (max-width: 640px) { .setting { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body>
+<main>
+  <div class="bar">
+    <div style="flex:1">
+      <h1>quanteeze settings</h1>
+      <div class="sub">The QUANTEEZE_* variables this server reads: a change is set at once and saved, and takes effect when the server next reads it.</div>
+    </div>
+    <a href="/quanteeze/">← Overview</a>
+  </div>
+
+  <section class="card" id="locked" hidden>
+    <h2>Token</h2>
+    <p class="note">The control routes ask for the token the server made at start. Open the URL it printed (with <code>#token=…</code>), or paste the token from <code>~/.quanteeze/control-token</code>.</p>
+    <div class="bar"><input type="password" id="token" aria-label="Control token" autocomplete="off" style="flex:1 1 240px"><button class="primary" id="use-token">Use</button></div>
+  </section>
+
+  <section class="card" id="status" hidden>
+    <div class="bar">
+      <span id="summary"></span>
+      <span style="flex:1"></span>
+      <button id="cache-reset" title="mlx-vlm's POST /v1/cache/reset: the prompts' cache emptied, the model kept">Reset the prompt cache</button>
+      <button id="unload" title="mlx-vlm's POST /unload: the next request loads the model again">Unload the model</button>
+    </div>
+    <div id="message" class="note"></div>
+  </section>
+
+  <section class="card" id="model-card" hidden>
+    <h2>Model</h2>
+    <p class="note">Load another model or change uniform expert bit-width without a restart. Requests that generate meanwhile are asked to come back (503) once the running ones finish.</p>
+    <div id="model-now"></div>
+    <div id="model-progress" hidden>
+      <div class="meter"><div id="model-bar"></div></div>
+      <div class="note" id="model-phase"></div>
+    </div>
+    <div class="bar" style="margin-top:10px">
+      <input type="text" id="model-path" list="models-found" placeholder="a checkpoint's directory (or pick one)" aria-label="Model checkpoint" style="flex:1 1 320px">
+      <datalist id="models-found"></datalist>
+      <select id="model-bits" aria-label="Uniform expert bits">
+        <option value="">Original precision</option>
+        <option value="8">8 bits (uniform least-squares)</option>
+        <option value="4">4 bits (uniform least-squares)</option>
+        <option value="q3_k">Q3_K (ggml K-quant)</option>
+        <option value="3">3 bits (uniform least-squares)</option>
+        <option value="q2_k">Q2_K (ggml K-quant)</option>
+        <option value="iq2_xs">IQ2_XS (ggml importance grid)</option>
+        <option value="2">2 bits (uniform least-squares)</option>
+        <option value="1">1 bit (uniform least-squares)</option>
+      </select>
+      <button class="primary" id="model-load">Load</button>
+    </div>
+    <div id="model-message" class="note"></div>
+  </section>
+
+  <section class="card" id="filters" hidden>
+    <div class="bar">
+      <input type="search" id="search" placeholder="Filter by name or description" aria-label="Filter">
+      <label>Group <select id="group"><option value="">all</option></select></label>
+      <label><input type="checkbox" id="only"> set or waiting only</label>
+    </div>
+  </section>
+
+  <div id="groups"></div>
+</main>
+<div id="savebar"><div class="bar">
+  <span id="dirty-count"></span><span style="flex:1"></span>
+  <button id="discard">Discard</button><button class="primary" id="save">Save</button>
+</div></div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const el = (tag, attrs = {}, text) => { const n = document.createElement(tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); if (text != null) n.textContent = text; return n; };
+const WHEN = {request: 'read at each request', load: 'read at a load', start: 'read at start'};
+const WAITS = {load: 'waits for the next load', start: 'waits for a restart'};
+let TOKEN = null, STATE = null;
+const dirty = new Map();
+
+function store(t) { try { sessionStorage.setItem('quanteeze-token', t); } catch (e) { /* private window */ } }
+function stored() { try { return sessionStorage.getItem('quanteeze-token'); } catch (e) { return null; } }
+function takeToken() {
+  const m = location.hash.match(/token=([^&]+)/);
+  if (m) {
+    TOKEN = decodeURIComponent(m[1]); store(TOKEN);
+    history.replaceState(null, '', location.pathname + location.search);
+  } else TOKEN = stored();
+}
+
+async function call(method, path, body) {
+  const headers = {'X-Quanteeze-Token': TOKEN || ''};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const r = await fetch(path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store'});
+  let data = null; try { data = await r.json(); } catch (e) { /* no JSON */ }
+  if (!r.ok) { const e = new Error((data && (data.error || data.detail)) || `${r.status} ${r.statusText}`); e.status = r.status; throw e; }
+  return data;
+}
+
+function say(text, kind) { const m = $('message'); m.textContent = text; m.className = 'note ' + (kind || ''); }
+
+function shown(s) {
+  const q = $('search').value.trim().toLowerCase(), g = $('group').value;
+  if (g && s.group !== g) return false;
+  if ($('only').checked && !(s.value || s.pending || dirty.has(s.name))) return false;
+  return !q || s.name.toLowerCase().includes(q) || s.doc.toLowerCase().includes(q);
+}
+
+function render(rejected = {}) {
+  const box = $('groups'); box.replaceChildren();
+  const waiting = STATE.settings.filter(s => s.pending);
+  $('summary').textContent = `${STATE.loaded ? 'A model is loaded' : 'No model loaded yet'} · ${STATE.settings.filter(s => s.value).length} set · `
+    + `${waiting.length} waiting · ` + (STATE.saved_to ? `saved to ${STATE.saved_to}` : 'not saved (QUANTEEZE_SETTINGS=off)');
+  for (const group of STATE.groups) {
+    const items = STATE.settings.filter(s => s.group === group && shown(s));
+    if (!items.length) continue;
+    const card = el('section', {class: 'card'});
+    card.append(el('h2', {}, group));
+    for (const s of items) card.append(row(s, rejected[s.name]));
+    box.append(card);
+  }
+  const n = dirty.size;
+  $('savebar').style.display = n ? 'block' : 'none';
+  $('dirty-count').textContent = `${n} change${n === 1 ? '' : 's'} not saved`;
+}
+
+function row(s, why) {
+  const div = el('div', {class: 'setting'});
+  const left = el('div');
+  left.append(el('div', {class: 'name'}, s.name), el('div', {class: 'doc'}, s.doc));
+  const tags = el('div', {class: 'tags'});
+  tags.append(el('span', {class: 'tag'}, WHEN[s.when]));
+  if (s.source === 'environment') tags.append(el('span', {class: 'tag', title: 'Set in the environment the server started in: at the next start it wins over a saved value'}, 'from the environment'));
+  if (s.source === 'saved') tags.append(el('span', {class: 'tag'}, 'saved'));
+  if (s.source === 'here') tags.append(el('span', {class: 'tag'}, 'changed here'));
+  if (s.pending) tags.append(el('span', {class: 'tag wait', title: `In effect: ${s.in_effect ?? 'the default'}`}, WAITS[s.when]));
+  if (s.environment && s.saved != null && s.saved !== s.value) tags.append(el('span', {class: 'tag wait'}, 'the environment overrides the saved value at start'));
+  left.append(tags);
+  const right = el('div', {class: 'value'});
+  let input;
+  if (s.choices && s.choices.length) {
+    input = el('select', {'aria-label': s.name});
+    input.append(el('option', {value: ''}, s.default == null ? '(unset)' : `default: ${s.default}`));
+    for (const c of s.choices) input.append(el('option', {value: c}, c));
+  } else {
+    input = el('input', {type: 'text', spellcheck: 'false', 'aria-label': s.name,
+                         placeholder: s.default == null ? '(unset)' : `default: ${s.default}`});
+  }
+  input.value = dirty.has(s.name) ? dirty.get(s.name) : (s.value ?? '');
+  if (dirty.has(s.name)) input.classList.add('dirty');
+  input.addEventListener(input.tagName === 'SELECT' ? 'change' : 'input', () => {
+    if (input.value === (s.value ?? '')) dirty.delete(s.name); else dirty.set(s.name, input.value);
+    input.classList.toggle('dirty', dirty.has(s.name));
+    const n = dirty.size; $('savebar').style.display = n ? 'block' : 'none';
+    $('dirty-count').textContent = `${n} change${n === 1 ? '' : 's'} not saved`;
+  });
+  right.append(input);
+  if (s.pending) right.append(el('div', {class: 'note'}, `In effect until then: ${s.in_effect ?? 'the default' + (s.default != null ? ` (${s.default})` : '')}`));
+  if (why) right.append(el('div', {class: 'why'}, why));
+  div.append(left, right);
+  return div;
+}
+
+async function load() {
+  try {
+    STATE = await call('GET', '/v1/quanteeze/settings');
+  } catch (e) {
+    $('locked').hidden = false;
+    for (const id of ['status', 'filters', 'model-card']) $(id).hidden = true;
+    $('groups').replaceChildren(el('p', {class: 'err'}, e.status === 401 ? (TOKEN ? 'The token was not accepted.' : 'Give the token to see the settings.') : `The settings could not be read: ${e.message}`));
+    return;
+  }
+  $('locked').hidden = true;
+  for (const id of ['status', 'filters', 'model-card']) $(id).hidden = false;
+  loadModel(); loadFound();
+  if ($('group').options.length === 1)
+    for (const g of STATE.groups) if (STATE.settings.some(s => s.group === g)) $('group').append(el('option', {value: g}, g));
+  render();
+}
+
+$('save').addEventListener('click', async () => {
+  const values = Object.fromEntries([...dirty].map(([k, v]) => [k, v.trim() === '' ? null : v.trim()]));
+  $('save').disabled = true;
+  try {
+    const out = await call('PATCH', '/v1/quanteeze/settings', {values});
+    STATE = out;
+    for (const name of out.applied) dirty.delete(name);
+    render(out.rejected);
+    const rej = Object.keys(out.rejected).length;
+    const waits = out.settings.filter(s => out.applied.includes(s.name) && s.pending);
+    say(`${out.applied.length} saved` + (waits.length ? `; ${waits.filter(s => s.when === 'load').length} wait for the next load, ${waits.filter(s => s.when === 'start').length} for a restart` : '')
+        + (rej ? `; ${rej} refused (see below)` : ''), rej ? 'err' : 'ok');
+  } catch (e) { say(`Not saved: ${e.message}`, 'err'); }
+  $('save').disabled = false;
+});
+$('discard').addEventListener('click', () => { dirty.clear(); render(); });
+$('unload').addEventListener('click', async () => {
+  if (!confirm('Unload the model? Requests in flight may fail; the next request loads it again, with the settings read at a load.')) return;
+  try {
+    const out = await call('POST', '/unload');
+    say(out && out.status === 'success' ? 'Unloaded: the next request loads the model again.' : (out && out.message) || 'Nothing was loaded.', 'ok');
+    await load();
+  } catch (e) { say(`Not unloaded: ${e.message}`, 'err'); }
+});
+$('cache-reset').addEventListener('click', async () => {
+  if (!confirm('Empty the prompt cache? The next request of each conversation reads its prompt again.')) return;
+  try { await call('POST', '/v1/cache/reset'); say('The prompt cache is empty.', 'ok'); }
+  catch (e) { say(`Not reset: ${e.message}`, 'err'); }
+});
+$('use-token').addEventListener('click', () => { TOKEN = $('token').value.trim(); store(TOKEN); $('token').value = ''; load(); });
+for (const id of ['search', 'group', 'only']) $(id).addEventListener(id === 'search' ? 'input' : 'change', () => render());
+
+// ---------------------------------------------------------------- the model
+let MODEL = null, modelPoll = null;
+const PHASES = {opening: 'opening the checkpoint', weights: 'reading the weights', experts: 'quantizing the experts', starting: 'starting'};
+function bytes(n) { return n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${(n / 1e6).toFixed(0)} MB`; }
+function showModel() {
+  const m = MODEL, now = $('model-now'); now.replaceChildren();
+  const line = el('div', {class: 'tags'});
+  line.append(el('span', {class: 'name'}, m.model || m.target || '(no model loaded)'));
+  line.append(el('span', {class: 'tag' + (m.state === 'idle' ? '' : ' wait')}, m.state));
+  if (m.bits) line.append(el('span', {class: 'tag'}, `${m.bits}-bit uniform`));
+  if (m.from_ssd_gb) line.append(el('span', {class: 'tag'}, `SSD on-demand (${m.from_ssd_gb} GB)`));
+  if (m.served) line.append(el('span', {class: 'tag', title: 'Every request is served by it, whatever model it names'}, 'chosen here'));
+  now.append(line);
+  if (m.error) now.append(el('div', {class: 'why'}, m.error));
+  if (!$('model-path').value && (m.model || m.target)) $('model-path').value = m.model || m.target;
+  $('model-bits').value = m.bits ? String(m.bits) : '';
+  const p = m.progress, busy = m.state === 'waiting' || m.state === 'loading';
+  $('model-progress').hidden = !(busy || (p && p.loading));
+  if (busy || (p && p.loading)) {
+    $('model-bar').style.width = `${m.state === 'waiting' ? 0 : p.percent}%`;
+    $('model-phase').textContent = m.state === 'waiting'
+      ? `Waiting for ${m.inflight} request${m.inflight === 1 ? '' : 's'} to finish…`
+      : `${p.percent}% · ${PHASES[p.phase] || p.phase || ''}` + (p.unit === 'bytes' ? ` (${bytes(p.done)} of ${bytes(p.total)})` : p.unit ? ` (${p.done} of ${p.total} ${p.unit})` : '') + (p.seconds != null ? ` · ${p.seconds} s` : '');
+  }
+  $('model-load').disabled = busy;
+  if (busy && !modelPoll) modelPoll = setInterval(async () => {
+    try { MODEL = await call('GET', '/v1/quanteeze/model'); } catch (e) { return; }
+    if (MODEL.state !== 'waiting' && MODEL.state !== 'loading') {
+      clearInterval(modelPoll); modelPoll = null;
+      $('model-message').textContent = MODEL.state === 'idle' ? `Serving ${MODEL.model} (${MODEL.progress.seconds} s).` : 'The model did not load.';
+      load();
+    }
+    showModel();
+  }, 1000);
+}
+async function loadModel() { try { MODEL = await call('GET', '/v1/quanteeze/model'); showModel(); } catch (e) { $('model-message').textContent = e.message; } }
+$('model-load').addEventListener('click', async () => {
+  const path = $('model-path').value.trim();
+  const bits = $('model-bits').value;
+  if (!path) { $('model-message').textContent = 'Give a checkpoint\'s directory.'; return; }
+  if (!confirm(`Load ${path}${bits ? ` at ${bits} bits` : ' at original precision'}?`)) return;
+  try { MODEL = await call('POST', '/v1/quanteeze/model', {path, bits}); $('model-message').textContent = 'Loading…'; showModel(); }
+  catch (e) { $('model-message').textContent = `Not loaded: ${e.message}`; }
+});
+
+async function loadFound() {
+  try {
+    const cat = await call('GET', '/v1/quanteeze/home/catalog');
+    $('models-found').replaceChildren(...cat.models.map(m => el('option', {value: m.path}, `${m.name} · ${m.gb} GB`)));
+  } catch (e) { /* typing still works */ }
+}
+
+addEventListener('hashchange', () => { takeToken(); load(); });
+takeToken();
+load();
+</script>
+</body>
+</html>
