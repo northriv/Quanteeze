@@ -11,3 +11,6 @@ dist/
 models/
 *.safetensors
 *.gguf
+
+# Local-only agent instructions.
+CLAUDE.md
