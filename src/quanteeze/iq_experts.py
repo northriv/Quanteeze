@@ -7,7 +7,7 @@ import numpy as np
 from . import iq_grids
 
 QK = 256
-F16, Q4_0, Q4_1, IQ1_M, BF16, Q2_0 = 1, 2, 3, 29, 30, 42
+F16, Q4_0, Q4_1, IQ1_M, BF16, MXFP4, Q2_0 = 1, 2, 3, 29, 30, 39, 42
 IQ2_XXS, IQ2_XS, IQ1_S, IQ2_S = 16, 17, 19, 22
 Q5_0, IQ3_XXS, IQ4_NL, IQ4_XS = 6, 18, 20, 23
 Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K = 7, 8, 10, 11, 12, 13, 14
@@ -15,7 +15,7 @@ TYPES = {
     F16: 'F16', Q4_0: 'Q4_0', Q4_1: 'Q4_1',
     IQ2_XXS: 'IQ2_XXS', IQ2_XS: 'IQ2_XS', IQ1_S: 'IQ1_S', IQ1_M: 'IQ1_M', IQ2_S: 'IQ2_S',
     Q5_0: 'Q5_0', IQ3_XXS: 'IQ3_XXS', IQ4_NL: 'IQ4_NL', IQ4_XS: 'IQ4_XS',
-    Q5_1: 'Q5_1', Q8_0: 'Q8_0', BF16: 'BF16', Q2_0: 'Q2_0',
+    Q5_1: 'Q5_1', Q8_0: 'Q8_0', BF16: 'BF16', MXFP4: 'MXFP4', Q2_0: 'Q2_0',
     Q2_K: 'Q2_K', Q3_K: 'Q3_K', Q4_K: 'Q4_K', Q5_K: 'Q5_K', Q6_K: 'Q6_K',
 }
 BY_NAME = {name: kind for kind, name in TYPES.items()}
@@ -23,11 +23,12 @@ BLOCK = {
     F16: 64, Q4_0: 18, Q4_1: 20,
     IQ2_XXS: 66, IQ2_XS: 74, IQ1_S: 50, IQ1_M: 56, IQ2_S: 82,
     Q5_0: 22, IQ3_XXS: 98, IQ4_NL: 18, IQ4_XS: 136,
-    Q5_1: 24, Q8_0: 34, BF16: 64, Q2_0: 18,
+    Q5_1: 24, Q8_0: 34, BF16: 64, MXFP4: 17, Q2_0: 18,
     Q2_K: 84, Q3_K: 110, Q4_K: 144, Q5_K: 176, Q6_K: 210,
 }
-VALUES = {F16: 32, Q4_0: 32, Q4_1: 32, Q5_0: 32, Q5_1: 32, IQ4_NL: 32, Q8_0: 32, BF16: 32, Q2_0: 64}
+VALUES = {F16: 32, Q4_0: 32, Q4_1: 32, Q5_0: 32, Q5_1: 32, IQ4_NL: 32, Q8_0: 32, BF16: 32, MXFP4: 32, Q2_0: 64}
 IQ1S_DELTA = 0.125
+MXFP4_MAG = (0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0)
 
 
 def _grid(hexes, values):
@@ -57,6 +58,7 @@ def tables():
             'signs': mx.array(_signs(256)),
             IQ3_XXS: mx.array(_grid3(iq_grids.IQ3XXS, iq_grids.IQ3XXS_MAP)),
             IQ4_NL: mx.array(np.asarray(iq_grids.IQ4NL, np.float32)),
+            MXFP4: mx.array(np.asarray(MXFP4_MAG, np.float32)),
         })
     return _TABLES
 
@@ -258,6 +260,10 @@ def _decode_chunk(b, kind):
         y = d * q + _f16(b, 2)
     elif kind == Q8_0:
         y = d * b[:, 2:34].view(mx.int8).astype(mx.float32)
+    elif kind == MXFP4:
+        e = b[:, 0:1].astype(mx.uint32)
+        e_bits = mx.where(e < 2, mx.array(0x00200000, dtype=mx.uint32) << e, (e - 1) << 23)
+        y = e_bits.view(mx.float32) * mx.take(t[MXFP4], _nibbles(b[:, 1:17]).astype(mx.uint32), axis=0)
     elif kind in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K):
         y = _k_quant(b, kind, n)
     else:

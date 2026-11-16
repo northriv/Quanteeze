@@ -28,7 +28,9 @@ def lower_bits(stock_bits):
 
 
 def group_size(bits):
-    """The group size of uniform quantization at `bits` (256 for ggml K/IQ formats)."""
+    """The group size of uniform quantization at `bits` (256 for ggml K/IQ formats, 32 for MXFP4)."""
+    if bits == 'mxfp4':
+        return 32
     if bits in GGML_MODES:
         return 256
     return 64 if int(bits) >= 4 else requant.GROUP_SIZE
@@ -57,8 +59,10 @@ def weights(switch):
 
 
 def quantized_bytes(weights, bits):
-    """Bytes of `weights` scalar weights quantized uniformly at `bits` (integer affine bits or
-    ggml format `'q3_k'`, `'q2_k'`, `'iq2_xs'`)."""
+    """Bytes of `weights` scalar weights quantized uniformly at `bits` (integer affine bits, `'mxfp4'`,
+    or ggml format `'q3_k'`, `'q2_k'`, `'iq2_xs'`)."""
+    if bits == 'mxfp4':
+        return weights * (4 + 8 / 32) / 8
     if bits in GGML_MODES:
         from . import ggml_quants
         return weights * ggml_quants.BITS[bits] / 8

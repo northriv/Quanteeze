@@ -663,7 +663,7 @@ def own(switch, x, indices, weights=None):
     return run(switch.down_proj, hidden, idx, per).reshape(1, t, k, d)
 
 
-def _proj_call(proj, x, indices, sorted_indices=False):
+def _proj_call(proj, x, indices, sorted_indices=False, rows_plan=None):
     bits = getattr(proj, 'bits', None)
     mode = getattr(proj, 'mode', 'affine')
     if bits is not None and not requant.native(bits, mode):
@@ -678,14 +678,19 @@ def _proj_call(proj, x, indices, sorted_indices=False):
             w = requant.dequantize(*arrays, proj.group_size, bits, mode=mode, dtype=x.dtype).astype(x.dtype)
             return mx.gather_mm(x, w.swapaxes(-1, -2), rhs_indices=idx, sorted_indices=sorted_indices)
 
+        prefer_rows = rows_plan is not None or (indices.ndim == 1 and indices.size >= 16)
         if isinstance(mode, str) and mode.startswith('gguf:'):
             from . import gguf_qmv
+            if prefer_rows and gguf_qmv.takes_rows(proj, x, indices):
+                return gguf_qmv.gather_rows(proj, x, indices, unpacked, plan=rows_plan)
             if gguf_qmv.takes(proj, x, indices):
                 return gguf_qmv.gather(proj, x, indices, unpacked)
             if gguf_qmv.takes_rows(proj, x, indices):
                 return gguf_qmv.gather_rows(proj, x, indices, unpacked)
         from . import kquant_qmv
         if mode in kquant_qmv.MODES:
+            if prefer_rows and kquant_qmv.takes_rows(proj, x, indices):
+                return kquant_qmv.gather_rows(proj, x, indices, unpacked)
             if kquant_qmv.takes(proj, x, indices):
                 return kquant_qmv.gather(proj, x, indices, unpacked)
             if kquant_qmv.takes_rows(proj, x, indices):
@@ -702,30 +707,56 @@ def stock(switch, x, indices, weights=None):
     do_sort = indices.size >= 64
     idx = indices
     order = None
+    inv_order = None
+    rows_plan = None
     if do_sort:
-        order = mx.argsort(indices.flatten())
-        x_exp = x_exp.flatten(0, -3)[order // shape[-1]]
-        idx = indices.flatten()[order]
-        if weights is not None:
-            weights = weights.flatten()[order]
-    up = _proj_call(switch.up_proj, x_exp, idx, sorted_indices=do_sort)
-    gate = _proj_call(switch.gate_proj, x_exp, idx, sorted_indices=do_sort)
+        projs = (switch.up_proj, switch.gate_proj, switch.down_proj)
+        if all(isinstance(getattr(p, 'mode', None), str) and p.mode.startswith('gguf:') for p in projs):
+            from . import gguf_qmv
+            if gguf_qmv.ON[0] and gguf_qmv._gpu_available():
+                order_mx, inv_order, idx, rows_plan = gguf_qmv.prepare_rows(indices.flatten())
+                x_flat = x_exp.flatten(0, -3)
+                if order_mx is None:
+                    x_exp = mx.broadcast_to(
+                        mx.expand_dims(x_flat, 1),
+                        (x_flat.shape[0], shape[-1], *x_flat.shape[1:]),
+                    ).reshape(-1, *x_flat.shape[1:])
+                else:
+                    x_exp = x_flat[order_mx // shape[-1]]
+                if weights is not None:
+                    w_flat = weights.flatten()
+                    weights = w_flat if order_mx is None else w_flat[order_mx]
+        if rows_plan is None:
+            order = mx.argsort(indices.flatten())
+            x_exp = x_exp.flatten(0, -3)[order // shape[-1]]
+            idx = indices.flatten()[order]
+            if weights is not None:
+                weights = weights.flatten()[order]
+    up = _proj_call(switch.up_proj, x_exp, idx, sorted_indices=do_sort, rows_plan=rows_plan)
+    gate = _proj_call(switch.gate_proj, x_exp, idx, sorted_indices=do_sort, rows_plan=rows_plan)
     if weights is not None:
         hidden = switch.activation(up, gate, weights[..., None, None])
     else:
         hidden = switch.activation(up, gate)
-    y = _proj_call(switch.down_proj, hidden, idx, sorted_indices=do_sort)
+    y = _proj_call(switch.down_proj, hidden, idx, sorted_indices=do_sort, rows_plan=rows_plan)
     if do_sort:
-        y = mx.unflatten(y[mx.argsort(order)], 0, shape)
+        if rows_plan is not None:
+            if inv_order is not None:
+                y = y[inv_order]
+            y = mx.unflatten(y, 0, shape)
+        else:
+            y = mx.unflatten(y[mx.argsort(order)], 0, shape)
     return y.squeeze(-2)
 
 
 def decode(switch, x, indices, weights=None):
     """Run a decode (`T = 1`) or verify (`1 < T <= MAX_TOKENS`) step on `switch`."""
     if ON[0] and weights is None and not mx.metal.is_available():
-        from . import cuda_experts
+        from . import cuda_experts, gguf_qmv
         if cuda_experts.ON[0] and cuda_experts.takes(switch, x, indices):
             return cuda_experts.decode(switch, x, indices, lambda: stock(switch, x, indices))
+        if gguf_qmv.ON[0] and gguf_qmv.takes_switch(switch, x, indices):
+            return gguf_qmv.decode_switch(switch, x, indices, lambda: stock(switch, x, indices))
     if not ON[0] or not eligible(switch, x, indices):
         return stock(switch, x, indices, weights)
     k = key(switch, x, indices, weights is not None)

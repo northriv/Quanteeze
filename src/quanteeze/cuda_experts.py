@@ -21,22 +21,40 @@ CHOICE = {}                     # (k, hidden, inner, group size): whether it mat
 CHECKED = {}
 SAID = []
 
-HEADER = r"""
+MXFP4_DECODE_HEADER = r"""
+__device__ __forceinline__ unsigned qz_bits(__nv_bfloat162 v) { return *reinterpret_cast<unsigned*>(&v); }
+__device__ __forceinline__ __nv_bfloat162 qz_e8m0_bf162(uint8_t e) {
+  const uint16_t u = (e == 0u) ? 0x0040u : (static_cast<uint16_t>(e) << 7);
+  const uint32_t u2 = static_cast<uint32_t>(u) | (static_cast<uint32_t>(u) << 16);
+  return *reinterpret_cast<const __nv_bfloat162*>(&u2);
+}
+__device__ __forceinline__ unsigned qz_deq_mxfp4(uint32_t v, int t, __nv_bfloat162 s2) {
+  constexpr uint16_t E2M1[16] = {
+      0x0000u, 0x3f00u, 0x3f80u, 0x3fc0u, 0x4000u, 0x4040u, 0x4080u, 0x40c0u,
+      0x8000u, 0xbf00u, 0xbf80u, 0xbfc0u, 0xc000u, 0xc040u, 0xc080u, 0xc0c0u
+  };
+  const uint32_t byte = (v >> (8 * t)) & 0xffu;
+  const uint32_t q_bits = static_cast<uint32_t>(E2M1[byte & 0xfu])
+      | (static_cast<uint32_t>(E2M1[byte >> 4]) << 16);
+  return qz_bits(__hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q_bits), s2));
+}
+"""
+
+HEADER = MXFP4_DECODE_HEADER + r"""
 __device__ __forceinline__ void qz_mma(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                        unsigned b0, unsigned b1) {
   asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-__device__ __forceinline__ unsigned qz_bits(__nv_bfloat162 v) { return *reinterpret_cast<unsigned*>(&v); }
 
 // A warp's 8 rows n0..n0+7 of expert e on the input xr [K] (PAIR: of two projections, two chains):
 // lane (g, t) holds B's column n0 + g; c[p] its C fragment, row 0's columns 2t and 2t+1 in lanes 0..3.
-template <int N, int K, int GS, bool PAIR>
+template <int N, int K, int GS, bool PAIR, bool MXFP4 = false, typename ScaleT = __nv_bfloat16>
 __device__ __forceinline__ void qz_expert_rows(float (&c)[PAIR ? 2 : 1][4], const __nv_bfloat16* xr,
-                                               const uint32_t* w, const __nv_bfloat16* scales,
-                                               const __nv_bfloat16* biases, const uint32_t* w2,
-                                               const __nv_bfloat16* scales2, const __nv_bfloat16* biases2,
+                                               const uint32_t* w, const ScaleT* scales,
+                                               const ScaleT* biases, const uint32_t* w2,
+                                               const ScaleT* scales2, const ScaleT* biases2,
                                                int e, int n0) {
   const int lane = threadIdx.x & 31;
   const int g = lane >> 2;
@@ -44,15 +62,19 @@ __device__ __forceinline__ void qz_expert_rows(float (&c)[PAIR ? 2 : 1][4], cons
   const int n = n0 + g;
   constexpr int NW = PAIR ? 2 : 1;
   const uint32_t* wr[NW];
-  const __nv_bfloat16* sr[NW];
-  const __nv_bfloat16* br[NW];
+  const ScaleT* sr[NW];
+  const ScaleT* br[NW];
   wr[0] = w + (static_cast<size_t>(e) * N + n) * (K / 8);
   sr[0] = scales + (static_cast<size_t>(e) * N + n) * (K / GS);
-  br[0] = biases + (static_cast<size_t>(e) * N + n) * (K / GS);
+  if constexpr (!MXFP4) {
+    br[0] = biases + (static_cast<size_t>(e) * N + n) * (K / GS);
+  }
   if constexpr (PAIR) {
     wr[NW - 1] = w2 + (static_cast<size_t>(e) * N + n) * (K / 8);
     sr[NW - 1] = scales2 + (static_cast<size_t>(e) * N + n) * (K / GS);
-    br[NW - 1] = biases2 + (static_cast<size_t>(e) * N + n) * (K / GS);
+    if constexpr (!MXFP4) {
+      br[NW - 1] = biases2 + (static_cast<size_t>(e) * N + n) * (K / GS);
+    }
   }
   const uint32_t magic_bits = 0x43004300u;
   const __nv_bfloat162 magic = *reinterpret_cast<const __nv_bfloat162*>(&magic_bits);
@@ -92,15 +114,23 @@ __device__ __forceinline__ void qz_expert_rows(float (&c)[PAIR ? 2 : 1][4], cons
         const uint4 q4 = cur[p][cc / 2];
         const uint32_t w0 = (cc & 1) ? q4.z : q4.x;
         const uint32_t w1 = (cc & 1) ? q4.w : q4.y;
-        const __nv_bfloat162 s2 = __bfloat162bfloat162(sr[p][(kc * 16) / GS]);
-        const __nv_bfloat162 b2 = __bfloat162bfloat162(br[p][(kc * 16) / GS]);
         unsigned bq[2];
+        if constexpr (MXFP4) {
+          const __nv_bfloat162 s2 = qz_e8m0_bf162(*reinterpret_cast<const uint8_t*>(&sr[p][(kc * 16) / GS]));
+          bq[0] = qz_deq_mxfp4(w0, t, s2);
+          bq[1] = qz_deq_mxfp4(w1, t, s2);
+        } else {
+          const __nv_bfloat162 s2 = __bfloat162bfloat162(
+              *reinterpret_cast<const __nv_bfloat16*>(&sr[p][(kc * 16) / GS]));
+          const __nv_bfloat162 b2 = __bfloat162bfloat162(
+              *reinterpret_cast<const __nv_bfloat16*>(&br[p][(kc * 16) / GS]));
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          uint32_t v = h ? w1 : w0;
-          uint32_t bits = ((v >> (8 * t)) & 0xFu) | (((v >> (8 * t + 4)) & 0xFu) << 16) | magic_bits;
-          __nv_bfloat162 q = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&bits), magic);
-          bq[h] = qz_bits(__hadd2(__hmul2(q, s2), b2));
+          for (int h = 0; h < 2; ++h) {
+            uint32_t v = h ? w1 : w0;
+            uint32_t bits = ((v >> (8 * t)) & 0xFu) | (((v >> (8 * t + 4)) & 0xFu) << 16) | magic_bits;
+            __nv_bfloat162 q = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&bits), magic);
+            bq[h] = qz_bits(__hadd2(__hmul2(q, s2), b2));
+          }
         }
         qz_mma(c[p], a0, 0u, a2, 0u, bq[0], bq[1]);
       }
@@ -169,6 +199,18 @@ __device__ __forceinline__ void qz_rows16_chunk(float (&c)[4], const uint32_t* w
   qz_mma(c, qz_deq(w0.x, t, s0, b0), qz_deq(w8.x, t, s8, b8), qz_deq(w0.y, t, s0, b0), qz_deq(w8.y, t, s8, b8),
          x0, x1);
 }
+
+template <int ROWW, int SBR, int GS>
+__device__ __forceinline__ void qz_rows16_chunk_mxfp4(float (&c)[4], const uint32_t* wrow, int cw,
+                                                      const uint8_t* srow, int kc,
+                                                      unsigned x0, unsigned x1, int t) {
+  const uint2 w0 = *reinterpret_cast<const uint2*>(wrow + cw);
+  const uint2 w8 = *reinterpret_cast<const uint2*>(wrow + 8 * ROWW + cw);
+  const __nv_bfloat162 s0 = qz_e8m0_bf162(srow[(kc * 16) / GS]);
+  const __nv_bfloat162 s8 = qz_e8m0_bf162(srow[8 * SBR + (kc * 16) / GS]);
+  qz_mma(c, qz_deq_mxfp4(w0.x, t, s0), qz_deq_mxfp4(w8.x, t, s8),
+         qz_deq_mxfp4(w0.y, t, s0), qz_deq_mxfp4(w8.y, t, s8), x0, x1);
+}
 """
 
 # A warp 8 rows (n0..n0+7) of slot j's expert: C's row 0 is lanes 0..3, columns 2t and 2t+1.
@@ -184,8 +226,8 @@ SOURCE = r"""
     const int lane = warp.thread_rank();
     const int t = lane & 3;
     float c[PAIR ? 2 : 1][4];
-    qz_expert_rows<N, K, GS, PAIR>(c, x + static_cast<size_t>(X_DIV ? j / X_DIV : 0) * K, w, scales, biases, w2,
-                                   scales2, biases2, static_cast<int>(idx[j]), n0);
+    qz_expert_rows<N, K, GS, PAIR, MXFP4>(c, x + static_cast<size_t>(X_DIV ? j / X_DIV : 0) * K, w, scales, biases, w2,
+                                          scales2, biases2, static_cast<int>(idx[j]), n0);
     if (lane < 4) {
       for (int i = 0; i < 2; ++i) {
         __nv_bfloat16 gate = __float2bfloat16_rn(c[0][i]);
@@ -210,9 +252,9 @@ STAGED_SOURCE = r"""
     constexpr int ROWW = SEGW + 4;                  // a row's words in shared memory (rows' banks apart)
     constexpr int NS = K / 512;
     constexpr int GPS = 512 / GS;                   // a stage's groups
-    constexpr int SBR = GPS + 8;                    // a row's scales a stage in shared memory (16 bytes more)
+    constexpr int SBR = MXFP4 ? 32 : (GPS + 8);     // a row's scales a stage in shared memory (16B aligned)
     constexpr int SBP = GPS / 8;                    // ... in 16-byte pieces
-    constexpr int BUF = 16 * ROWW * 4 + 2 * 16 * SBR * 2;   // a stage's weights, scales and biases
+    constexpr int BUF = 16 * ROWW * 4 + (MXFP4 ? (16 * SBR) : (2 * 16 * SBR * 2));
     extern __shared__ __align__(16) unsigned char smem[];
     __nv_bfloat16* xs = reinterpret_cast<__nv_bfloat16*>(smem);
     const int tid = threadIdx.x;
@@ -228,8 +270,8 @@ STAGED_SOURCE = r"""
     const int wr0 = (wid % 2) * 16;
     const size_t grow = static_cast<size_t>(idx[j]) * N + r0 + wr0;
     const uint32_t* wsrc = (m ? w2 : w) + grow * (K / 8);
-    const __nv_bfloat16* ssrc = (m ? scales2 : scales) + grow * (K / GS);
-    const __nv_bfloat16* bsrc = (m ? biases2 : biases) + grow * (K / GS);
+    const auto* ssrc = (m ? scales2 : scales) + grow * (K / GS);
+    const auto* bsrc = (m ? biases2 : biases) + grow * (K / GS);
     const __nv_bfloat16* xj = x + static_cast<size_t>(j / TOP_K) * K;
     for (int p = tid; p < K / 8; p += 128) {
       qz_cp16(xs + p * 8, xj + p * 8);
@@ -238,12 +280,19 @@ STAGED_SOURCE = r"""
       if (s < NS) {
         unsigned char* buf = mine + (s % 2) * BUF;
         uint32_t* dst = reinterpret_cast<uint32_t*>(buf);
-        __nv_bfloat16* sb = reinterpret_cast<__nv_bfloat16*>(buf + 16 * ROWW * 4);
-        for (int p = lane; p < 2 * 16 * SBP; p += 32) {
-          const int a = p / (16 * SBP);
-          const int q = p % (16 * SBP);
-          qz_cp16(sb + (a * 16 + q / SBP) * SBR + (q % SBP) * 8,
-                  (a ? bsrc : ssrc) + (q / SBP) * (K / GS) + s * GPS + (q % SBP) * 8);
+        if constexpr (MXFP4) {
+          uint8_t* sb = reinterpret_cast<uint8_t*>(buf + 16 * ROWW * 4);
+          if (lane < 16) {
+            qz_cp16(sb + lane * SBR, ssrc + lane * (K / GS) + s * GPS);
+          }
+        } else {
+          __nv_bfloat16* sb = reinterpret_cast<__nv_bfloat16*>(buf + 16 * ROWW * 4);
+          for (int p = lane; p < 2 * 16 * SBP; p += 32) {
+            const int a = p / (16 * SBP);
+            const int q = p % (16 * SBP);
+            qz_cp16(sb + (a * 16 + q / SBP) * SBR + (q % SBP) * 8,
+                    (a ? bsrc : ssrc) + (q / SBP) * (K / GS) + s * GPS + (q % SBP) * 8);
+          }
         }
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -266,18 +315,32 @@ STAGED_SOURCE = r"""
       stage(s + 1);
       const unsigned char* buf = mine + (s % 2) * BUF;
       const uint32_t* wrow = reinterpret_cast<const uint32_t*>(buf) + g * ROWW;
-      const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(buf + 16 * ROWW * 4);
-      const __nv_bfloat16* srow = sb + g * SBR;
-      const __nv_bfloat16* brow = sb + (16 + g) * SBR;
+      if constexpr (MXFP4) {
+        const uint8_t* srow = reinterpret_cast<const uint8_t*>(buf + 16 * ROWW * 4) + g * SBR;
 #pragma unroll 8
-      for (int cc = 0; cc < 32; ++cc) {
-        const int kc = s * 32 + cc;
-        unsigned x0 = 0u, x1 = 0u;
-        if (g == 0) {
-          x0 = xw[kc * 8 + t];
-          x1 = xw[kc * 8 + t + 4];
+        for (int cc = 0; cc < 32; ++cc) {
+          const int kc = s * 32 + cc;
+          unsigned x0 = 0u, x1 = 0u;
+          if (g == 0) {
+            x0 = xw[kc * 8 + t];
+            x1 = xw[kc * 8 + t + 4];
+          }
+          qz_rows16_chunk_mxfp4<ROWW, SBR, GS>(c, wrow, 2 * cc, srow, cc, x0, x1, t);
         }
-        qz_rows16_chunk<ROWW, SBR, GS>(c, wrow, 2 * cc, srow, brow, cc, x0, x1, t);
+      } else {
+        const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(buf + 16 * ROWW * 4);
+        const __nv_bfloat16* srow = sb + g * SBR;
+        const __nv_bfloat16* brow = sb + (16 + g) * SBR;
+#pragma unroll 8
+        for (int cc = 0; cc < 32; ++cc) {
+          const int kc = s * 32 + cc;
+          unsigned x0 = 0u, x1 = 0u;
+          if (g == 0) {
+            x0 = xw[kc * 8 + t];
+            x1 = xw[kc * 8 + t + 4];
+          }
+          qz_rows16_chunk<ROWW, SBR, GS>(c, wrow, 2 * cc, srow, brow, cc, x0, x1, t);
+        }
       }
     }
     if (t == 0) {
@@ -292,22 +355,24 @@ STAGED_SOURCE = r"""
 """
 
 
-def _staged_smem(k, group_size):
-    return k * 2 + 4 * 2 * (16 * 68 * 4 + 2 * 16 * (512 // group_size + 8) * 2)
+def _staged_smem(k, group_size, mxfp4=False):
+    scale_bytes = 16 * 32 if mxfp4 else 2 * 16 * (512 // group_size + 8) * 2
+    return k * 2 + 4 * 2 * (16 * 68 * 4 + scale_bytes)
 
 
-def staged(n, k, group_size):
+def staged(n, k, group_size, mxfp4=False):
     """Whether gate_up() takes the staged kernel: inputs in stages of 512, a stage's scales in 16-byte
     pieces (groups of 32 or 64), rows in blocks of 32, its shared memory within an A100's."""
     return (k % 512 == 0 and group_size in (32, 64) and n % 32 == 0
-            and _staged_smem(k, group_size) <= 99 * 1024)
+            and _staged_smem(k, group_size, mxfp4) <= 99 * 1024)
 
 
 @lru_cache(maxsize=None)
-def _staged_kernel(k, group_size):
-    return cuda_kernels.kernel(f'quanteeze_experts_staged_{k}_{group_size}',
+def _staged_kernel(k, group_size, mxfp4=False):
+    suffix = f'_{k}_{group_size}_mxfp4' if mxfp4 else f'_{k}_{group_size}'
+    return cuda_kernels.kernel(f'quanteeze_experts_staged{suffix}',
                                ['x', 'w', 'scales', 'biases', 'idx', 'w2', 'scales2', 'biases2'], ['y'],
-                               STAGED_SOURCE, HEADER, shared_memory=_staged_smem(k, group_size))
+                               STAGED_SOURCE, HEADER, shared_memory=_staged_smem(k, group_size, mxfp4))
 
 
 @lru_cache(maxsize=None)
@@ -318,12 +383,14 @@ def _kernel():
 
 def _run(x, proj, idx, x_div, pair=None):
     slots, n, k = idx.size, proj.weight.shape[1], x.shape[-1]
+    mxfp4 = getattr(proj, 'mode', None) == 'mxfp4'
     second = pair or proj
+    b1 = proj.scales if mxfp4 else proj.biases
+    b2 = second.scales if mxfp4 else second.biases
     return _kernel()(
-        inputs=[mx.contiguous(x), proj.weight, proj.scales, proj.biases, idx, second.weight, second.scales,
-                second.biases],
+        inputs=[mx.contiguous(x), proj.weight, proj.scales, b1, idx, second.weight, second.scales, b2],
         template=[('N', n), ('K', k), ('GS', int(proj.group_size)), ('SLOTS', slots), ('X_DIV', int(x_div)),
-                  ('PAIR', pair is not None)],
+                  ('PAIR', pair is not None), ('MXFP4', mxfp4)],
         grid=(32 * slots * (n // 8), 1, 1), threadgroup=(256, 1, 1), output_shapes=[(slots, n)],
         output_dtypes=[x.dtype])[0]
 
@@ -332,14 +399,16 @@ def gate_up(switch, x, idx):
     """swiglu(gate_proj(x), up_proj(x)) of each slot's expert for token rows `x`: `[slots, inner]`."""
     gate, up = switch.gate_proj, switch.up_proj
     slots, n, k, gs = idx.size, gate.weight.shape[1], x.shape[-1], int(gate.group_size)
+    mxfp4 = getattr(gate, 'mode', None) == 'mxfp4'
     rows = max(1, x.size // k)
     top_k = max(1, slots // rows)
-    if not staged(n, k, gs):
+    if not staged(n, k, gs, mxfp4):
         return _run(x, gate, idx, 0 if rows == 1 else top_k, pair=up)
-    return _staged_kernel(k, gs)(
-        inputs=[mx.contiguous(x.reshape(-1)), gate.weight, gate.scales, gate.biases, idx, up.weight, up.scales,
-                up.biases],
-        template=[('N', n), ('K', k), ('GS', gs), ('SLOTS', slots), ('TOP_K', top_k)],
+    b1 = gate.scales if mxfp4 else gate.biases
+    b2 = up.scales if mxfp4 else up.biases
+    return _staged_kernel(k, gs, mxfp4)(
+        inputs=[mx.contiguous(x.reshape(-1)), gate.weight, gate.scales, b1, idx, up.weight, up.scales, b2],
+        template=[('N', n), ('K', k), ('GS', gs), ('SLOTS', slots), ('TOP_K', top_k), ('MXFP4', mxfp4)],
         grid=(128 * slots * (n // 32), 1, 1), threadgroup=(128, 1, 1), output_shapes=[(slots, n)],
         output_dtypes=[x.dtype])[0]
 
@@ -350,17 +419,24 @@ def down(switch, h, idx):
 
 
 def _projection(p, k, dtype):
-    return (type(p).__name__ in ('QuantizedSwitchLinear', 'Projection') and getattr(p, 'mode', None) == 'affine'
-            and p.bits == 4
-            and p.group_size in (32, 64, 128) and p.get('biases') is not None and 'bias' not in p
+    if type(p).__name__ not in ('QuantizedSwitchLinear', 'Projection') or p.bits != 4 or 'bias' in p:
+        return False
+    mode = getattr(p, 'mode', None)
+    if mode == 'mxfp4':
+        return (p.group_size == 32 and p.get('biases') is None
+                and p.weight.dtype == mx.uint32 and p.scales.dtype == mx.uint8
+                and p.weight.shape[-1] * 8 == k and p.scales.shape[-1] * 32 == k
+                and p.weight.shape[1] % 8 == 0 and k % 128 == 0)
+    return (mode == 'affine'
+            and p.group_size in (32, 64, 128) and p.get('biases') is not None
             and p.weight.dtype == mx.uint32 and p.scales.dtype == dtype and p.biases.dtype == dtype
             and p.weight.shape[-1] * 8 == k and p.weight.shape[1] % 8 == 0 and k % 128 == 0)
 
 
 def takes(switch, x, indices):
     """Whether switch_glu() computes this step's experts as MLX's qmm_sm80 does: on CUDA, bfloat16
-    single-token steps (B=1..8, T=1), 8 to 64 total slots (fewer go to gather_qmv), 4-bit affine
-    projections with biases, a SwiGLU between them."""
+    single-token steps (B=1..8, T=1), 8 to 64 total slots (fewer go to gather_qmv), 4-bit affine or
+    mxfp4 projections, a SwiGLU between them."""
     if not cuda_kernels.available() or x.dtype != mx.bfloat16 or x.ndim != 3 or x.shape[1] != 1 or not 1 <= x.shape[0] <= 8:
         return False
     if indices.ndim != 3 or indices.shape[:2] != x.shape[:2] or indices.shape[-1] <= 0:
@@ -373,6 +449,7 @@ def takes(switch, x, indices):
     gate, up, dn = switch.gate_proj, switch.up_proj, switch.down_proj
     return (_projection(gate, hidden, x.dtype) and _projection(up, hidden, x.dtype)
             and gate.weight.shape == up.weight.shape and gate.group_size == up.group_size
+            and getattr(gate, 'mode', None) == getattr(up, 'mode', None)
             and _projection(dn, gate.weight.shape[1], x.dtype) and dn.weight.shape[1] == hidden)
 
 
@@ -387,9 +464,11 @@ def decode(switch, x, indices, fallback):
         h = gate_up(switch, x.reshape(b, -1), idx)
         return down(switch, h, idx).reshape(b, 1, top_k, -1)
 
-    key = ((top_k, x.shape[-1], switch.gate_proj.weight.shape[1], int(switch.gate_proj.group_size))
-           if b == 1 else
-           (b, top_k, x.shape[-1], switch.gate_proj.weight.shape[1], int(switch.gate_proj.group_size)))
+    gate, dn = switch.gate_proj, switch.down_proj
+    base = ((top_k, x.shape[-1], gate.weight.shape[1], int(gate.group_size))
+            if b == 1 else
+            (b, top_k, x.shape[-1], gate.weight.shape[1], int(gate.group_size)))
+    key = base if gate.mode == 'affine' and dn.mode == 'affine' else base + (gate.mode, dn.mode)
     choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
     if choice is not None and seen >= CHECKS:
         if choice:

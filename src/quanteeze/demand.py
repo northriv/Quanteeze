@@ -46,14 +46,19 @@ class Projection(nn.Module):
                 return mx.gather_mm(x, w.swapaxes(-1, -2), rhs_indices=idx,
                                     sorted_indices=sorted_indices and idx is indices)
 
+            prefer_rows = indices.ndim == 1 and indices.size >= 16
             if isinstance(self.mode, str) and self.mode.startswith('gguf:'):
                 from . import gguf_qmv
+                if prefer_rows and gguf_qmv.takes_rows(self, x, indices):
+                    return gguf_qmv.gather_rows(self, x, indices, unpacked)
                 if gguf_qmv.takes(self, x, indices):
                     return gguf_qmv.gather(self, x, indices, unpacked)
                 if gguf_qmv.takes_rows(self, x, indices):
                     return gguf_qmv.gather_rows(self, x, indices, unpacked)
             from . import kquant_qmv
             if self.mode in kquant_qmv.MODES:
+                if prefer_rows and kquant_qmv.takes_rows(self, x, indices):
+                    return kquant_qmv.gather_rows(self, x, indices, unpacked)
                 if kquant_qmv.takes(self, x, indices):
                     return kquant_qmv.gather(self, x, indices, unpacked)
                 if kquant_qmv.takes_rows(self, x, indices):
@@ -65,6 +70,7 @@ class Projection(nn.Module):
 
 
 _STAGE_RING = 8
+_PREFILL_PAGE = 65536
 
 
 def _to_device(arr):
@@ -197,7 +203,12 @@ def _proj_meta(w, s, bits_spec):
     from . import ggml_quants
     if w.ndim == 4:
         return ggml_quants.FORMAT_BITS[bits_spec], 256, bits_spec
-    eff_bits = ggml_quants.FORMAT_BITS[bits_spec] if bits_spec in requant.GGML_MODES else int(bits_spec)
+    if bits_spec == 'mxfp4' and s.dtype == mx.uint8:
+        in_dims = w.shape[2] * 8
+        return 4, in_dims // s.shape[-1], 'mxfp4'
+    eff_bits = (4 if bits_spec == 'mxfp4'
+                else ggml_quants.FORMAT_BITS[bits_spec] if bits_spec in requant.GGML_MODES
+                else int(bits_spec))
     in_dims = w.shape[2] * 32 // eff_bits
     return eff_bits, in_dims // s.shape[-1], 'affine'
 
@@ -234,7 +245,7 @@ class Demand:
                 out_d, in_d = _proj_dims(getattr(first_switch, p))
                 eff_b, _, eff_mode = requant.effective_format(bits_spec, in_d, gs)
                 per_expert += fitting.quantized_bytes(
-                    out_d * in_d, eff_mode if eff_mode in fitting.GGML_MODES else eff_b
+                    out_d * in_d, eff_mode if eff_mode in requant.UNIFORM_MODES else eff_b
                 )
         else:
             mode = self.base.mode(first_layer, 'gate_proj') or 'affine'
@@ -376,21 +387,26 @@ class Demand:
                 t_name = self.base.name(layer, p, part)
                 _, st_dtype, full_shape, _ = self.base.tensors[t_name]
                 tail = tuple(full_shape[1:])
-                key = (p, part, tail, st_dtype)
-                entry = self._stage_ring[ring].get(key)
-                if entry is None or entry[0].shape[0] < m:
+                np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
+                row_bytes = int(np.prod(tail, dtype=np.int64)) * np_dt.itemsize
+                used_bytes = m * row_bytes
+                need_bytes = cap * row_bytes
+                slot_key = (p, part)
+                entry = self._stage_ring[ring].get(slot_key)
+                if entry is None or entry[0].shape[0] < need_bytes:
                     if entry is not None and entry[2]:
                         cuda_ple.advise_host_staging(entry[1], enable=False)
-                    np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
-                    mlx_arr = mx.zeros((cap,) + tail, q2_experts._MLX[np_dt], stream=mx.cpu)
+                    mlx_arr = mx.zeros((need_bytes,), mx.uint8, stream=mx.cpu)
                     mx.eval(mlx_arr)
                     np_view = np.asarray(mlx_arr)
                     adv = cuda_ple.advise_host_staging(np_view, enable=True)
                     entry = (mlx_arr, np_view, adv)
-                    self._stage_ring[ring][key] = entry
-                mlx_arr, np_view, _ = entry
-                targets.append((t_name, np_view[:m]))
-                parts.append(q2_experts._as_mlx(mlx_arr[:m], st_dtype))
+                    self._stage_ring[ring][slot_key] = entry
+                mlx_arr, np_u8, _ = entry
+                out_view = np_u8[:used_bytes].view(np_dt).reshape((m,) + tail)
+                targets.append((t_name, out_view))
+                raw_part = mlx_arr[:used_bytes].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
+                parts.append(q2_experts._as_mlx(raw_part, st_dtype))
             copied[p] = parts
         host = self._host()
         if targets:
@@ -406,8 +422,23 @@ class Demand:
             and hasattr(self.base, '_read')
         )
 
-    def _prefill_cap(self):
-        prompt_cap = self.num_experts if not self.prompt_room else max(1, int(self.prompt_room // self.per_expert))
+    def _layer_expert_bytes(self, layer):
+        if layer is None or not self._has_tensor_table():
+            return self.per_expert
+        total = 0
+        for p in PROJECTIONS:
+            for part in NAMES:
+                if not self.base.has(layer, p, part):
+                    continue
+                t_name = self.base.name(layer, p, part)
+                _, st_dtype, full_shape, _ = self.base.tensors[t_name]
+                row_elems = int(np.prod(full_shape[1:], dtype=np.int64))
+                total += row_elems * np.dtype(q2_experts._SAFETENSORS[st_dtype]).itemsize
+        return max(1, total)
+
+    def _prefill_cap(self, layer=None):
+        per_exp = self._layer_expert_bytes(layer)
+        prompt_cap = self.num_experts if not self.prompt_room else max(1, int(self.prompt_room // per_exp))
         if not mx.metal.is_available() and mx.default_device() == mx.gpu:
             from . import cuda_ple
             if not self._prefill_dev:
@@ -418,7 +449,7 @@ class Demand:
                 avail = int(room[0]) + int(room[1]) + held_dev
                 reserve = max(int(self._free_least or 0), 256 << 20)
                 usable = avail - reserve if avail > reserve else avail // 2
-                vram_cap = max(8, self.slots // 2, int(usable // self.per_expert))
+                vram_cap = max(8, self.slots // 2, int(usable // per_exp))
                 return min(prompt_cap, vram_cap)
         return prompt_cap
 
@@ -461,25 +492,31 @@ class Demand:
                 _, st_dtype, full_shape, _ = self.base.tensors[t_name]
                 tail = tuple(full_shape[1:])
                 np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
-                key = (p, part, tail, st_dtype)
-                entry = self._prefill_stage.get(key)
+                row_bytes = int(np.prod(tail, dtype=np.int64)) * np_dt.itemsize
+                used_bytes = m * row_bytes
+                need_bytes = cap_rows * row_bytes
+                pages_used = max(1, (used_bytes + _PREFILL_PAGE - 1) // _PREFILL_PAGE)
+                pages_cap = max(pages_used, (need_bytes + _PREFILL_PAGE - 1) // _PREFILL_PAGE)
+                slot_key = (p, part)
+                entry = self._prefill_stage.get(slot_key)
                 if on_cuda:
-                    if entry is None or entry[0] is None or entry[0].shape[0] < cap_rows:
+                    if entry is None or entry[0] is None or entry[0].shape[0] < pages_cap:
                         if entry is not None and entry[2]:
                             cuda_ple.advise_host_staging(entry[1], enable=False)
-                        mlx_arr = mx.zeros((cap_rows,) + tail, q2_experts._MLX[np_dt], stream=mx.cpu)
-                        mx.eval(mlx_arr)
-                        np_view = np.asarray(mlx_arr)
-                        adv = cuda_ple.advise_host_staging(np_view, enable=True)
-                        entry = (mlx_arr, np_view, adv)
-                        self._prefill_stage[key] = entry
+                        stage_u8 = mx.zeros((pages_cap, _PREFILL_PAGE), mx.uint8, stream=mx.cpu)
+                        mx.eval(stage_u8)
+                        stage_np_u8 = np.asarray(stage_u8)
+                        adv = cuda_ple.advise_host_staging(stage_np_u8, enable=True)
+                        entry = (stage_u8, stage_np_u8, adv)
+                        self._prefill_stage[slot_key] = entry
+                    np_view = entry[1].reshape(-1)[:used_bytes].view(np_dt).reshape((m,) + tail)
                 else:
-                    if entry is None or entry[1].shape[0] < cap_rows:
-                        np_view = np.empty((cap_rows,) + tail, np_dt)
-                        entry = (None, np_view, False)
-                        self._prefill_stage[key] = entry
-                np_view = entry[1]
-                stage_meta[(p, part)] = (key, st_dtype, tail, np_dt, entry)
+                    if entry is None or entry[1].size < pages_cap * _PREFILL_PAGE:
+                        stage_np_u8 = np.empty(pages_cap * _PREFILL_PAGE, np.uint8)
+                        entry = (None, stage_np_u8, False)
+                        self._prefill_stage[slot_key] = entry
+                    np_view = entry[1].reshape(-1)[:used_bytes].view(np_dt).reshape((m,) + tail)
+                stage_meta[slot_key] = (st_dtype, tail, np_dt, used_bytes, pages_used, pages_cap, entry, np_view)
                 pending = None
                 pending_all = None
                 if ahead_map is not None:
@@ -487,11 +524,11 @@ class Demand:
                     if pending is None and not is_all:
                         pending_all = ahead_map.pop(self.base._key(t_name, None), None)
                 if pending is not None:
-                    np_view[:m] = pending.result()[:m]
+                    np_view[:] = pending.result()[:m]
                 elif pending_all is not None:
-                    np.take(pending_all.result(), exp_ids, axis=0, out=np_view[:m], mode='clip')
+                    np.take(pending_all.result(), exp_ids, axis=0, out=np_view, mode='clip')
                 else:
-                    remaining_targets.append((t_name, np_view[:m]))
+                    remaining_targets.append((t_name, np_view))
 
         if remaining_targets:
             host = self._host()
@@ -500,7 +537,7 @@ class Demand:
                     self.base._read(t_name, rows_arg, cache=False, out=out_view)
 
         if on_cuda and self._prefill_dev:
-            needed_keys = {meta[0] for meta in stage_meta.values()}
+            needed_keys = set(stage_meta.keys())
             stale = [k for k in self._prefill_dev if k not in needed_keys]
             if stale:
                 for k in stale:
@@ -511,24 +548,28 @@ class Demand:
         for p in PROJECTIONS:
             parts = []
             for part in NAMES:
-                meta = stage_meta.get((p, part))
+                slot_key = (p, part)
+                meta = stage_meta.get(slot_key)
                 if meta is None:
                     parts.append(None)
                     continue
-                key, st_dtype, tail, np_dt, entry = meta
-                stage_mlx, stage_np, _ = entry
+                st_dtype, tail, np_dt, used_bytes, pages_used, pages_cap, entry, np_view = meta
+                stage_u8 = entry[0]
                 if on_cuda:
-                    dev_arr = self._prefill_dev.pop(key, None)
-                    if dev_arr is None or dev_arr.shape[0] < cap_rows:
-                        dev_arr = mx.zeros((cap_rows,) + tail, q2_experts._MLX[np_dt])
-                        mx.eval(dev_arr)
-                    idx = mx.arange(m, dtype=mx.int32)
-                    dev_arr[idx] = stage_mlx[:m]
-                    self._prefill_dev[key] = dev_arr
-                    raw_dev = dev_arr if m == dev_arr.shape[0] else dev_arr[:m]
+                    dev_u8 = self._prefill_dev.pop(slot_key, None)
+                    if dev_u8 is None or dev_u8.shape[0] < pages_cap:
+                        if dev_u8 is not None:
+                            dev_u8 = None
+                            mx.clear_cache()
+                        dev_u8 = mx.zeros((pages_cap, _PREFILL_PAGE), mx.uint8)
+                        mx.eval(dev_u8)
+                    idx = mx.arange(pages_used, dtype=mx.int32)
+                    dev_u8[idx] = stage_u8[:pages_used]
+                    self._prefill_dev[slot_key] = dev_u8
+                    raw_dev = dev_u8.reshape(-1)[:used_bytes].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
                     parts.append(q2_experts._as_mlx(raw_dev, st_dtype))
                 else:
-                    parts.append(q2_experts._as_mlx(mx.array(stage_np[:m]), st_dtype))
+                    parts.append(q2_experts._as_mlx(mx.array(np_view), st_dtype))
             w, s, b = parts
             ref = getattr(switch, p)
             projs[p] = Projection(w, s, b, ref.group_size, ref.bits, mode=ref.mode)
@@ -661,8 +702,13 @@ class Demand:
             del active, projs, temp, seen_set
         if switch.layer == self.moe_indices[-1]:
             self._release_prefill_buffers()
-        else:
+        elif mx.metal.is_available() or mx.default_device() != mx.gpu:
             mx.clear_cache()
+        else:
+            from . import cuda_ple
+            room = cuda_ple.gpu_room()
+            if room is not None and int(room[0]) < max(int(self._free_least or 0), 256 << 20):
+                mx.clear_cache()
 
     def _read_one(self, layer, expert, worker_slot):
         with self._stream_lock:
@@ -705,7 +751,7 @@ class Demand:
                 self._after_prefill = True
                 self._decode_steps = 0
             if needed.size > self.slots:
-                cap = self._prefill_cap()
+                cap = self._prefill_cap(layer)
                 in_layer_mode = prefill.in_layer() and self.num_experts <= cap
                 nxt = self.next_moe.get(layer)
                 host = self._host()

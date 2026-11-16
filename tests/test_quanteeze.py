@@ -1033,6 +1033,8 @@ def _random_ggml_blocks(rng, kind, n_blocks):
         raw[:, 108:110] = f16_bytes(1)
     elif kind == iq_experts.Q6_K:
         raw[:, 208:210] = f16_bytes(1)
+    elif kind == iq_experts.MXFP4:
+        raw[:, 0] = rng.integers(120, 132, size=n_blocks, dtype=np.uint8)
     elif kind == iq_experts.IQ1_M:
         # Top 4 bits of sc[0..3] (at bytes 48..55) pack fp16 super-scale d_m = 0x2e66 (~0.1).
         for byte_idx, nib in ((49, 0x6), (51, 0x6), (53, 0xe), (55, 0x2)):
@@ -1079,7 +1081,7 @@ def _write_gguf(path, tensors, alignment=32):
 
 @pytest.mark.parametrize('kind,name', sorted(__import__('quanteeze.iq_experts', fromlist=['TYPES']).TYPES.items()))
 def test_iq_experts_and_gguf_qmv_all_21_types(kind, name):
-    """All 21 ggml types decode identically via `requant.dequantize` and match `gguf_qmv` on GPU."""
+    """All 22 ggml types (including MXFP4) decode identically via `requant.dequantize` and match `gguf_qmv` on GPU."""
     import mlx.nn as nn
     from quanteeze import cuda_kernels, gguf_qmv, iq_experts
 
@@ -1942,21 +1944,28 @@ def test_efforts_qwen36_preopened_response_template_and_chat_template_kwargs():
 
 
 def test_gguf_qmv_cuda_sources_and_dispatch(tmp_path, monkeypatch):
-    """Compile and execute `_CUDA_HEADER` (`qz_decode_octad`) across all 21 ggml formats in C++17,
-    type-check `_CUDA_SOURCE` and `_CUDA_TILED` verbatim, and verify CUDA Python dispatch/padding."""
+    """Compile and execute `_CUDA_HEADER` (`qz_decode_octad` aligned/unaligned and `qz_load_bytes`)
+    across all 22 ggml formats in C++17, type-check `_CUDA_SOURCE`, `_CUDA_GATE_UP`, and `_CUDA_TILED`,
+    and verify CUDA decode/fused-switch/prefill dispatch and padding."""
     import ctypes
     import shutil
     import subprocess
     import mlx.nn as nn
-    from quanteeze import cuda_kernels, gguf_qmv, iq_experts
+    from quanteeze import cuda_kernels, expert_qmv, gguf_qmv, iq_experts
 
     cxx = shutil.which('c++') or shutil.which('clang++') or shutil.which('g++')
     if cxx is not None:
         cases = '\n'.join(
-            f'      case {k}: qz_decode_octad<{k}>(blk, grid, oct, bo + oct * 8u); break;'
+            f'      case {k}: if (aligned4) {{ qz_decode_octad<{k}, true>(blk, grid, oct, bo + oct * 8u); }} '
+            f'else {{ qz_decode_octad<{k}, false>(blk, grid, oct, bo + oct * 8u); }} break;'
             for k in sorted(iq_experts.TYPES)
         )
+        load_cases = '\n'.join(
+            f'      case {bb}: qz_load_bytes<{bb}>(dst, src, static_cast<uint32_t>(nbytes), lane); break;'
+            for bb in sorted(set(iq_experts.BLOCK.values()))
+        )
         cpp = f"""
+#include <cmath>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -1966,6 +1975,8 @@ def test_gguf_qmv_cuda_sources_and_dispatch(tmp_path, monkeypatch):
 #define __shared__
 #define __align__(x) alignas(x)
 
+struct alignas(8) uint2 {{ uint32_t x, y; }};
+struct alignas(16) uint4 {{ uint32_t x, y, z, w; }};
 struct float4 {{ float x, y, z, w; }};
 struct dim3_stub {{ uint32_t x, y, z; }};
 static thread_local dim3_stub blockIdx{{0, 0, 0}}, threadIdx{{0, 0, 0}};
@@ -1988,6 +1999,16 @@ inline float __half2float(uint16_t h) {{
   return __uint_as_float(s | (static_cast<uint32_t>(e + 112) << 23) | (m << 13));
 }}
 struct QzSum {{ template <typename U> U operator()(U a, U b) const {{ return a + b; }} }};
+struct Sigmoid {{
+  template <typename U> U operator()(U x) const {{
+    return static_cast<U>(1.0f / (1.0f + std::exp(-static_cast<float>(x))));
+  }}
+}};
+struct Multiply {{
+  template <typename U> U operator()(U a, U b) const {{
+    return static_cast<U>(static_cast<float>(a) * static_cast<float>(b));
+  }}
+}};
 struct StubBF16 {{
   uint16_t v;
   StubBF16() = default;
@@ -2007,9 +2028,17 @@ template <int N, typename U, typename Op> U reduce(Tile<N>, U val, Op) {{ return
 
 {gguf_qmv._CUDA_HEADER}
 
-template <typename T, int K_SIZE, int K_BLOCKS, int N_SIZE, int KIND, int PB, int BB, int ROWS, int WARPS>
+template <typename T, int K_SIZE, int K_BLOCKS, int N_SIZE, int KIND, int PB, int BB, int ROWS, int WARPS, int X_DIV>
 void instantiate_qmv(const T* x, const uint8_t* w, const uint16_t* grid, const int* idx, T* y) {{
 {gguf_qmv._CUDA_SOURCE}
+}}
+
+template <typename T, int K_SIZE, int N_SIZE, int X_DIV,
+          int KIND_G, int PB_G, int BB_G, int KB_G,
+          int KIND_U, int PB_U, int BB_U, int KB_U, int ROWS>
+void instantiate_gate_up(const T* x, const uint8_t* wg, const uint16_t* grid_g,
+                         const uint8_t* wu, const uint16_t* grid_u, const int* idx, T* y) {{
+{gguf_qmv._CUDA_GATE_UP}
 }}
 
 template <typename T, int K_SIZE, int K_BLOCKS, int N_SIZE, int KIND, int PB, int BB>
@@ -2017,24 +2046,45 @@ void instantiate_mm(const T* x, const uint8_t* w, const uint16_t* grid, const in
 {gguf_qmv._CUDA_TILED}
 }}
 
-template void instantiate_qmv<float, 256, 1, 36, 16, 256, 66, 4, 4>(
+template void instantiate_qmv<float, 256, 1, 36, 16, 256, 66, 4, 4, 1>(
     const float*, const uint8_t*, const uint16_t*, const int*, float*);
-template void instantiate_qmv<StubBF16, 256, 1, 36, 16, 256, 66, 4, 4>(
+template void instantiate_qmv<StubBF16, 256, 1, 36, 16, 256, 66, 4, 4, 8>(
     const StubBF16*, const uint8_t*, const uint16_t*, const int*, StubBF16*);
+template void instantiate_gate_up<float, 256, 36, 8, 13, 256, 176, 1, 12, 256, 144, 1, 4>(
+    const float*, const uint8_t*, const uint16_t*, const uint8_t*, const uint16_t*, const int*, float*);
+template void instantiate_gate_up<StubBF16, 256, 36, 8, 13, 256, 176, 1, 12, 256, 144, 1, 4>(
+    const StubBF16*, const uint8_t*, const uint16_t*, const uint8_t*, const uint16_t*, const int*, StubBF16*);
+template void instantiate_gate_up<float, 256, 36, 1, 14, 256, 210, 1, 18, 256, 98, 1, 4>(
+    const float*, const uint8_t*, const uint16_t*, const uint8_t*, const uint16_t*, const int*, float*);
+template void instantiate_gate_up<StubBF16, 256, 36, 1, 14, 256, 210, 1, 18, 256, 98, 1, 4>(
+    const StubBF16*, const uint8_t*, const uint16_t*, const uint8_t*, const uint16_t*, const int*, StubBF16*);
 template void instantiate_mm<float, 256, 1, 36, 16, 256, 66>(
     const float*, const uint8_t*, const uint16_t*, const int*, float*);
 template void instantiate_mm<StubBF16, 256, 1, 36, 16, 256, 66>(
     const StubBF16*, const uint8_t*, const uint16_t*, const int*, StubBF16*);
 
 extern "C" void decode_blocks(int kind, const uint8_t* w, const uint16_t* grid, int n_blocks, int pb, int bb,
-                              float* out) {{
+                              int aligned4, float* out) {{
+  alignas(16) uint8_t ablk[256];
   for (int b = 0; b < n_blocks; ++b) {{
     const uint8_t* blk = w + b * bb;
+    if (aligned4) {{
+      std::memcpy(ablk, blk, static_cast<size_t>(bb));
+      blk = ablk;
+    }}
     float* bo = out + b * pb;
     for (uint32_t oct = 0; oct < static_cast<uint32_t>(pb / 8); ++oct) {{
       switch (kind) {{
 {cases}
       }}
+    }}
+  }}
+}}
+
+extern "C" void check_load_bytes(int bb, const uint8_t* src, int nbytes, uint8_t* dst) {{
+  for (uint32_t lane = 0; lane < 32u; ++lane) {{
+    switch (bb) {{
+{load_cases}
     }}
   }}
 }}
@@ -2045,8 +2095,10 @@ extern "C" void decode_blocks(int kind, const uint8_t* w, const uint16_t* grid, 
         subprocess.run([cxx, '-std=c++17', '-O2', '-shared', '-fPIC', str(src_path), '-o', str(so_path)], check=True)
         lib = ctypes.CDLL(str(so_path))
         lib.decode_blocks.argtypes = [
-            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
         ]
+        lib.check_load_bytes.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
         grids = iq_experts.compact_grids()
         dummy_grid = np.zeros((8,), dtype=np.uint16)
         rng = np.random.default_rng(2026)
@@ -2055,37 +2107,83 @@ extern "C" void decode_blocks(int kind, const uint8_t* w, const uint16_t* grid, 
             n_blocks = 4
             raw = _random_ggml_blocks(rng, kind, n_blocks)
             grid_np = np.array(grids[kind], dtype=np.uint16) if kind in grids else dummy_grid
-            got = np.empty((n_blocks, pb), dtype=np.float32)
-            lib.decode_blocks(kind, raw.ctypes.data, grid_np.ctypes.data, n_blocks, pb, bb, got.ctypes.data)
             want = np.array(iq_experts.decode(mx.array(raw), kind))
-            np.testing.assert_allclose(got, want, rtol=0, atol=0)
+            for aligned4 in ([0, 1] if (pb == 256 or bb % 4 == 0) else [0]):
+                got = np.empty((n_blocks, pb), dtype=np.float32)
+                lib.decode_blocks(
+                    kind, raw.ctypes.data, grid_np.ctypes.data, n_blocks, pb, bb, aligned4, got.ctypes.data
+                )
+                np.testing.assert_allclose(got, want, rtol=0, atol=0)
 
-    # Verify Python CUDA dispatch, padding for < 4 rows, and tiled index sorting/restoring
+        for kind, bb in sorted({(k, iq_experts.BLOCK[k]) for k in iq_experts.TYPES}):
+            pb = iq_experts.per_block(kind)
+            for nbytes in sorted({bb, (256 // pb) * bb}):
+                src_raw = np.empty(1024, dtype=np.uint8)
+                dst_raw = np.empty(1024, dtype=np.uint8)
+                off_src = (-src_raw.ctypes.data) % 16
+                off_dst = (-dst_raw.ctypes.data) % 16
+                src_al = src_raw[off_src:off_src + nbytes]
+                dst_al = dst_raw[off_dst:off_dst + nbytes]
+                src_al[:] = rng.integers(0, 256, size=nbytes, dtype=np.uint8)
+                dst_al.fill(0)
+                lib.check_load_bytes(bb, src_al.ctypes.data, nbytes, dst_al.ctypes.data)
+                np.testing.assert_array_equal(dst_al, src_al)
+                if bb % 2 == 0 and bb % 4 != 0:
+                    src_mis = src_raw[off_src + 2:off_src + 2 + nbytes]
+                    src_mis[:] = rng.integers(0, 256, size=nbytes, dtype=np.uint8)
+                    dst_al.fill(0)
+                    lib.check_load_bytes(bb, src_mis.ctypes.data, nbytes, dst_al.ctypes.data)
+                    np.testing.assert_array_equal(dst_al, src_mis)
+
+    # Verify Python CUDA dispatch, padding for < 4 rows, fused gate_up+SwiGLU, and single-sync prefill plan
     captured = {}
+    dispatch_log = []
 
     class FakeCudaKernel:
         def __init__(self, tag):
             self.tag = tag
 
         def __call__(self, inputs, template, grid, threadgroup, output_shapes, output_dtypes):
-            captured[self.tag] = {
-                'inputs': inputs, 'template': dict(template),
+            t = dict(template)
+            entry = {
+                'inputs': inputs, 'template': t,
                 'grid': grid, 'threadgroup': threadgroup,
                 'output_shapes': output_shapes, 'output_dtypes': output_dtypes,
             }
+            captured[self.tag] = entry
+            dispatch_log.append(self.tag)
             if self.tag == 'qmv':
                 xs, w, _grid, idx = inputs
-                t = dict(template)
                 w_unp = iq_experts.decode(w.reshape(-1, w.shape[-1]), t['KIND']).reshape(
                     w.shape[0], t['N_SIZE'], t['K_SIZE']
                 ).astype(t['T'])
-                rows_used = idx[:xs.shape[0]].astype(mx.uint32)
-                ref = mx.gather_mm(xs[:, None, :], w_unp.swapaxes(-1, -2), rhs_indices=rows_used).reshape(-1)
+                x_div = t['X_DIV']
+                slots = xs.shape[0] * x_div
+                rows_used = idx[:slots].astype(mx.uint32)
+                x_rep = xs[:, None, :] if x_div == 1 else xs[mx.arange(slots, dtype=mx.int32) // x_div, None, :]
+                ref = mx.gather_mm(x_rep, w_unp.swapaxes(-1, -2), rhs_indices=rows_used).reshape(-1)
+                pad = output_shapes[0][0] - ref.size
+                out = mx.pad(ref, (0, pad)) if pad > 0 else ref
+                return [out]
+            if self.tag == 'gate_up':
+                xs, wg, _gg, wu, _gu, idx = inputs
+                x_div = t['X_DIV']
+                slots = xs.shape[0] * x_div
+                rows_used = idx[:slots].astype(mx.uint32)
+                x_rep = xs[:, None, :] if x_div == 1 else xs[mx.arange(slots, dtype=mx.int32) // x_div, None, :]
+                wg_unp = iq_experts.decode(wg.reshape(-1, wg.shape[-1]), t['KIND_G']).reshape(
+                    wg.shape[0], t['N_SIZE'], t['K_SIZE']
+                ).astype(t['T'])
+                wu_unp = iq_experts.decode(wu.reshape(-1, wu.shape[-1]), t['KIND_U']).reshape(
+                    wu.shape[0], t['N_SIZE'], t['K_SIZE']
+                ).astype(t['T'])
+                gv = mx.gather_mm(x_rep, wg_unp.swapaxes(-1, -2), rhs_indices=rows_used).reshape(slots, t['N_SIZE'])
+                uv = mx.gather_mm(x_rep, wu_unp.swapaxes(-1, -2), rhs_indices=rows_used).reshape(slots, t['N_SIZE'])
+                ref = (nn.silu(gv) * uv).reshape(-1)
                 pad = output_shapes[0][0] - ref.size
                 out = mx.pad(ref, (0, pad)) if pad > 0 else ref
                 return [out]
             xs, w, _grid, tiles = inputs
-            t = dict(template)
             w_np = np.array(
                 iq_experts.decode(w.reshape(-1, w.shape[-1]), t['KIND']).reshape(w.shape[0], t['N_SIZE'], t['K_SIZE']),
                 dtype=np.float32,
@@ -2108,7 +2206,11 @@ extern "C" void decode_blocks(int kind, const uint8_t* w, const uint16_t* grid, 
     monkeypatch.setattr(cuda_kernels, 'available', lambda: True)
     monkeypatch.setattr(gguf_qmv.mx, 'default_device', lambda: mx.gpu)
     monkeypatch.setattr(gguf_qmv, '_cuda_kernel', lambda: FakeCudaKernel('qmv'))
+    monkeypatch.setattr(gguf_qmv, '_cuda_gate_up', lambda: FakeCudaKernel('gate_up'))
     monkeypatch.setattr(gguf_qmv, '_cuda_tiled', lambda: FakeCudaKernel('mm'))
+    monkeypatch.setattr(gguf_qmv, 'CHOICE', {})
+    monkeypatch.setattr(gguf_qmv, 'CHECKED', {})
+    monkeypatch.setattr(gguf_qmv, 'STATS', dict(served=0, checked=0, mismatched=0))
 
     rng = np.random.default_rng(909)
     raw = _random_ggml_blocks(rng, iq_experts.Q4_K, 4 * 20 * 1).reshape(4, 20, 1, iq_experts.BLOCK[iq_experts.Q4_K])
@@ -2121,7 +2223,7 @@ extern "C" void decode_blocks(int kind, const uint8_t* w, const uint16_t* grid, 
 
     w_dec = iq_experts.decode(proj.weight.reshape(-1, proj.weight.shape[-1]), iq_experts.Q4_K).reshape(4, 20, 256)
 
-    # Single-row decode (`rows == 1`) pads `idx` to 4 int32s (16 bytes) and sets CUDA WARPS grid
+    # Single-row decode (`rows == 1`) pads `idx` to 4 int32s (16 bytes) and sets CUDA WARPS + X_DIV
     x_one = mx.array(rng.standard_normal((1, 1, 256)).astype(np.float32), dtype=mx.bfloat16)
     idx_one = mx.array([[2]], dtype=mx.uint32)
     assert gguf_qmv.takes(proj, x_one, idx_one)
@@ -2132,6 +2234,7 @@ extern "C" void decode_blocks(int kind, const uint8_t* w, const uint16_t* grid, 
     np.testing.assert_allclose(np.array(y_one.astype(mx.float32)), np.array(want_one.astype(mx.float32)), rtol=1e-2, atol=1e-2)
     assert captured['qmv']['inputs'][3].shape == (4,)
     assert captured['qmv']['template']['WARPS'] == gguf_qmv.WARPS
+    assert captured['qmv']['template']['X_DIV'] == 1
     assert captured['qmv']['threadgroup'] == (32 * gguf_qmv.WARPS, 1, 1)
     assert captured['qmv']['grid'] == (32 * gguf_qmv.WARPS * 2, 1, 1)
 
@@ -2159,6 +2262,82 @@ extern "C" void decode_blocks(int kind, const uint8_t* w, const uint16_t* grid, 
     assert float(mx.abs(y_pre - want_pre).max().item()) <= (
         gguf_qmv.TOLERANCE * max(float(mx.abs(want_pre).max().item()), 1e-30)
     )
+
+    # Fused GGUF SwitchGLU decode (`expert_qmv.decode` -> `gguf_qmv.decode_switch`) on mixed types (Q5_K/Q4_K/Q6_K)
+    from mlx_vlm.models.qwen3_next.language import SwitchGLU
+
+    sw_mix = SwitchGLU(input_dims=256, hidden_dims=256, num_experts=8, bias=False)
+    for p_name, k_kind, bits in (
+        ('gate_proj', iq_experts.Q5_K, 5),
+        ('up_proj', iq_experts.Q4_K, 4),
+        ('down_proj', iq_experts.Q6_K, 6),
+    ):
+        pr = nn.Module()
+        pr.weight = mx.array(
+            _random_ggml_blocks(rng, k_kind, 8 * 256).reshape(8, 256, 1, iq_experts.BLOCK[k_kind])
+        )
+        pr.mode = f'gguf:{iq_experts.TYPES[k_kind].lower()}'
+        pr.group_size = 256
+        pr.bits = bits
+        setattr(sw_mix, p_name, pr)
+    mx.eval(sw_mix.parameters())
+
+    for b_sz in (1, 4):
+        x_dec = mx.array(rng.standard_normal((b_sz, 1, 256)).astype(np.float32), dtype=mx.bfloat16)
+        idx_dec = mx.array(((np.arange(b_sz * 4, dtype=np.uint32) * 3 + 1) % 8).reshape(b_sz, 1, 4))
+        mx.eval(x_dec, idx_dec)
+        want_dec = expert_qmv.stock(sw_mix, x_dec, idx_dec)
+        mx.eval(want_dec)
+        prev_served = gguf_qmv.STATS['served']
+        for _ in range(gguf_qmv.CHECKS + 2):
+            dispatch_log.clear()
+            got_dec = expert_qmv.decode(sw_mix, x_dec, idx_dec)
+            mx.eval(got_dec)
+            assert float(mx.abs(got_dec.astype(mx.float32) - want_dec.astype(mx.float32)).max().item()) <= (
+                gguf_qmv.TOLERANCE * max(float(mx.abs(want_dec.astype(mx.float32)).max().item()), 1e-30)
+            )
+        assert dispatch_log == ['gate_up', 'qmv']
+        assert captured['gate_up']['template']['X_DIV'] == 4
+        assert captured['gate_up']['inputs'][0].shape == (b_sz, 256)
+        assert captured['qmv']['template']['X_DIV'] == 1
+        assert gguf_qmv.STATS['served'] >= prev_served + 2
+        assert gguf_qmv.STATS['mismatched'] == 0
+
+    # GGUF prefill `expert_qmv.stock` with M = 128 routes to `_cuda_tiled` and builds `prepare_rows` once per layer
+    orig_prepare = gguf_qmv.prepare_rows
+    prepare_calls = []
+    monkeypatch.setattr(gguf_qmv, 'prepare_rows', lambda ind: (prepare_calls.append(1), orig_prepare(ind))[1])
+    for sorted_flag in (False, True):
+        x_pre16 = mx.array(rng.standard_normal((1, 16, 256)).astype(np.float32), dtype=mx.bfloat16)
+        if sorted_flag:
+            idx_np16 = np.sort((np.arange(128, dtype=np.uint32) * 5) % 8).reshape(1, 16, 8)
+        else:
+            idx_np16 = ((np.arange(128, dtype=np.uint32) * 5 + 3) % 8).reshape(1, 16, 8)
+        idx_pre16 = mx.array(idx_np16, dtype=mx.uint32)
+        mx.eval(x_pre16, idx_pre16)
+        for run_i in range(gguf_qmv.CHECKS + 1):
+            prepare_calls.clear()
+            dispatch_log.clear()
+            y_stock = expert_qmv.stock(sw_mix, x_pre16, idx_pre16)
+            mx.eval(y_stock)
+            if run_i == gguf_qmv.CHECKS:
+                assert len(prepare_calls) == 1
+                assert dispatch_log == ['mm', 'mm', 'mm']
+        x_u = mx.expand_dims(x_pre16, (-2, -3))
+
+        def _ref_mm(proj_m, inp):
+            w_u = iq_experts.decode(proj_m.weight.reshape(-1, proj_m.weight.shape[-1]), gguf_qmv.kind_of(proj_m)).reshape(
+                proj_m.weight.shape[0], proj_m.weight.shape[1], 256
+            ).astype(inp.dtype)
+            return mx.gather_mm(inp, w_u.swapaxes(-1, -2), rhs_indices=idx_pre16)
+
+        ref_hid = sw_mix.activation(_ref_mm(sw_mix.up_proj, x_u), _ref_mm(sw_mix.gate_proj, x_u))
+        ref_y = _ref_mm(sw_mix.down_proj, ref_hid).squeeze(-2)
+        mx.eval(ref_y)
+        assert float(mx.abs(y_stock.astype(mx.float32) - ref_y.astype(mx.float32)).max().item()) <= (
+            gguf_qmv.TOLERANCE * max(float(mx.abs(ref_y.astype(mx.float32)).max().item()), 1e-30)
+        )
+    assert gguf_qmv.STATS['mismatched'] == 0
 
 
 def test_gguf_experts_host_copy_and_mixed_precision_prefill(tmp_path, monkeypatch):
@@ -2293,11 +2472,23 @@ def test_gguf_experts_host_copy_and_mixed_precision_prefill(tmp_path, monkeypatc
         assert len(dem._stage_ring) == demand._STAGE_RING
         prefill.install(m_ssd.layers, chunk=16, enabled=lambda: True)
 
-        # Prompt prefill (> 1 chunk) exercises mixed-precision `_load_prefill_projs` and stale-key eviction
+        # Prompt prefill (> 1 chunk) reuses flat `(p, part)` staging/device buffers across mixed-precision layers
         prompt_len = 48
         x_pre = mx.array(rng.standard_normal((1, prompt_len, d_in)).astype(np.float32), dtype=mx.bfloat16)
         idx_pre = mx.array((np.arange(prompt_len * 4, dtype=np.uint32).reshape(1, prompt_len, 4)) % n_exp)
         mx.eval(x_pre, idx_pre)
+
+        seen_dev_keys = []
+        seen_stage_keys = []
+        orig_load_pre = dem._load_prefill_projs
+
+        def _spy_load_pre(layer, switch, expert_ids, cap_rows):
+            res = orig_load_pre(layer, switch, expert_ids, cap_rows)
+            seen_stage_keys.append(set(dem._prefill_stage.keys()))
+            seen_dev_keys.append(set(dem._prefill_dev.keys()))
+            return res
+
+        dem._load_prefill_projs = _spy_load_pre
 
         c_mem, c_ssd = m_mem.make_cache(), m_ssd.make_cache()
         h_mem, h_ssd = x_pre, x_pre
@@ -2310,6 +2501,9 @@ def test_gguf_experts_host_copy_and_mixed_precision_prefill(tmp_path, monkeypatc
             np.array(h_mem.astype(mx.float32)),
             rtol=2e-2, atol=2e-2,
         )
+        expected_slot_keys = {('gate_proj', 'weight'), ('up_proj', 'weight'), ('down_proj', 'weight')}
+        assert len(seen_stage_keys) == 2 and all(k == expected_slot_keys for k in seen_stage_keys)
+        assert len(seen_dev_keys) == 2 and all(k == expected_slot_keys for k in seen_dev_keys)
         assert dem.prefill_layers == 2
         assert len(src._ahead) == 0
         assert len(dem._prefill_stage) == 0
@@ -2335,6 +2529,7 @@ def test_gguf_experts_host_copy_and_mixed_precision_prefill(tmp_path, monkeypatc
                 np.array(y_mem.astype(mx.float32)),
                 rtol=2e-2, atol=2e-2,
             )
+        assert all(set(ring_map.keys()) <= expected_slot_keys for ring_map in dem._stage_ring)
         assert dem.misses > 0
         assert dem.host_served == dem.misses
     finally:
@@ -2691,5 +2886,340 @@ def test_multirow_decode_dispatch_and_qwen3_5_moe_left_padded_prefill(tmp_path, 
         )
     finally:
         d_fast.close()
+
+
+def test_mxfp4_uniform_quant_gguf_and_cuda_experts(tmp_path, monkeypatch):
+    """Verify full MXFP4 support: C++17 `cuda_experts.MXFP4_DECODE_HEADER` bit-for-bit bfloat16 parity
+    against `mx.dequantize`, CUDA `cuda_experts` (unstaged & staged) dispatch + `cuda_moe` opt-out,
+    `QUANTEEZE_BITS=mxfp4` (`lower_model`, `Flat`, `QuantCache`/`CachedCheckpoint`, `Demand`), and
+    GGUF `MXFP4` (kind 39) in-memory and `HostCopy` + `Demand` execution."""
+    import ctypes
+    import shutil
+    import subprocess
+    import mlx.nn as nn
+    from quanteeze import control, cuda_experts, cuda_kernels, cuda_moe, demand, fitting, gguf_experts, home, iq_experts, prefill, q2_experts, requant, serve
+
+    # 1. C++17 bit-for-bit BF16 parity of `qz_e8m0_bf162` & `qz_deq_mxfp4` vs `mx.dequantize`
+    cxx = shutil.which('c++') or shutil.which('clang++') or shutil.which('g++')
+    if cxx is not None:
+        cpp = f"""
+#include <cstdint>
+#include <cstring>
+
+#define __device__
+#define __forceinline__ inline
+
+struct alignas(4) __nv_bfloat162 {{
+  uint16_t lo, hi;
+}};
+
+inline float stub_bf16_to_f32(uint16_t b) {{
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
+}}
+
+inline uint16_t stub_f32_to_bf16_rn(float f) {{
+  uint32_t u;
+  std::memcpy(&u, &f, sizeof(u));
+  if ((u & 0x7fffffffu) > 0x7f800000u) return static_cast<uint16_t>((u >> 16) | 0x0040u);
+  uint32_t bias = 0x7fffu + ((u >> 16) & 1u);
+  return static_cast<uint16_t>((u + bias) >> 16);
+}}
+
+inline __nv_bfloat162 __hmul2(__nv_bfloat162 a, __nv_bfloat162 b) {{
+  return {{
+      stub_f32_to_bf16_rn(stub_bf16_to_f32(a.lo) * stub_bf16_to_f32(b.lo)),
+      stub_f32_to_bf16_rn(stub_bf16_to_f32(a.hi) * stub_bf16_to_f32(b.hi)),
+  }};
+}}
+
+{cuda_experts.MXFP4_DECODE_HEADER}
+
+extern "C" void deq_mxfp4_words(const uint32_t* w, const uint8_t* scales, int n_groups, uint16_t* out_bf16) {{
+  for (int g = 0; g < n_groups; ++g) {{
+    const __nv_bfloat162 s2 = qz_e8m0_bf162(scales[g]);
+    for (int k = 0; k < 4; ++k) {{
+      const uint32_t word = w[g * 4 + k];
+      for (int t = 0; t < 4; ++t) {{
+        const unsigned pair = qz_deq_mxfp4(word, t, s2);
+        out_bf16[g * 32 + k * 8 + 2 * t] = static_cast<uint16_t>(pair & 0xffffu);
+        out_bf16[g * 32 + k * 8 + 2 * t + 1] = static_cast<uint16_t>(pair >> 16);
+      }}
+    }}
+  }}
+}}
+"""
+        src = tmp_path / 'check_mxfp4_cuda.cpp'
+        so = tmp_path / 'check_mxfp4_cuda.so'
+        src.write_text(cpp, encoding='utf-8')
+        subprocess.run([cxx, '-std=c++17', '-O2', '-shared', '-fPIC', str(src), '-o', str(so)], check=True)
+        lib = ctypes.CDLL(str(so))
+        lib.deq_mxfp4_words.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+
+        exps = np.arange(2, 253, dtype=np.uint8)
+        n_groups = exps.size
+        rng = np.random.default_rng(771)
+        w_np = rng.integers(0, 1 << 32, size=(n_groups, 4), dtype=np.uint32)
+        # Cover all 16 E2M1 nibbles explicitly in groups 0..15 across every byte slot
+        for g in range(16):
+            nib_word = sum(((g + i) & 0xf) << (4 * i) for i in range(8))
+            w_np[g, :] = nib_word
+        got_u16 = np.empty((n_groups, 32), dtype=np.uint16)
+        lib.deq_mxfp4_words(w_np.ctypes.data, exps.ctypes.data, n_groups, got_u16.ctypes.data)
+        want_bf16 = mx.dequantize(
+            mx.array(w_np), scales=mx.array(exps[:, None]), group_size=32, bits=4, mode='mxfp4', dtype=mx.bfloat16
+        )
+        mx.eval(want_bf16)
+        np.testing.assert_array_equal(got_u16, np.array(want_bf16.view(mx.uint16)))
+
+    # 2. `cuda_experts` (unstaged & staged) dispatch + `cuda_moe` opt-out for `mxfp4`
+    def make_mxfp4_switch(k_dim, n_dim, num_experts=16):
+        sw = SwitchGLU(input_dims=k_dim, hidden_dims=n_dim, num_experts=num_experts, bias=False)
+        for p_name in ('gate_proj', 'up_proj', 'down_proj'):
+            p = getattr(sw, p_name)
+            p.weight = p.weight.astype(mx.bfloat16)
+            setattr(sw, p_name, p.to_quantized(group_size=32, bits=4, mode='mxfp4'))
+        mx.eval(sw.parameters())
+        return sw
+
+    mx.random.seed(772)
+    sw_small = make_mxfp4_switch(128, 128)
+    sw_staged = make_mxfp4_switch(512, 128)
+    assert cuda_experts._staged_smem(512, 32, mxfp4=True) < cuda_experts._staged_smem(512, 32, mxfp4=False)
+    assert cuda_experts.staged(128, 512, 32, mxfp4=True)
+
+    with monkeypatch.context() as mp:
+        calls = []
+
+        class FakeExpertsKernel:
+            def __init__(self, kind_tag):
+                self.kind_tag = kind_tag
+
+            def __call__(self, inputs, template, grid, threadgroup, output_shapes, output_dtypes):
+                t = dict(template)
+                calls.append((self.kind_tag, t, inputs))
+                assert t['MXFP4'] is True
+                x_in, w, s, b_arg, idx, w2, s2, b2_arg = inputs
+                # biases slots carry `scales` uint8 when MXFP4=True
+                assert b_arg.dtype == mx.uint8 and b2_arg.dtype == mx.uint8
+                slots, n_out = output_shapes[0]
+                k_in = t['K']
+                gs = t['GS']
+                if self.kind_tag == 'staged' or t.get('PAIR'):
+                    x_mat = x_in.reshape(-1, k_in)
+                    rows_in = x_mat.shape[0]
+                    top_k = max(1, slots // rows_in)
+                    x_4d = x_mat.reshape(rows_in, 1, 1, 1, k_in)
+                    rhs = idx.reshape(rows_in, 1, top_k)
+                    g_val = mx.gather_qmm(x_4d, w, scales=s, transpose=True, group_size=gs, bits=4, mode='mxfp4',
+                                          rhs_indices=rhs)
+                    u_val = mx.gather_qmm(x_4d, w2, scales=s2, transpose=True, group_size=gs, bits=4, mode='mxfp4',
+                                          rhs_indices=rhs)
+                    return [sw_small.activation(u_val, g_val).reshape(slots, n_out)]
+                rhs = idx.reshape(2, 1, slots // 2)
+                return [mx.gather_qmm(x_in.reshape(2, 1, slots // 2, 1, k_in), w, scales=s, transpose=True,
+                                      group_size=gs, bits=4, mode='mxfp4', rhs_indices=rhs).reshape(slots, n_out)]
+
+        mp.setattr(cuda_experts.mx.metal, 'is_available', lambda: False)
+        mp.setattr(cuda_experts.mx, 'default_device', lambda: mx.gpu)
+        mp.setattr(cuda_moe.mx.metal, 'is_available', lambda: False)
+        mp.setattr(cuda_moe.mx, 'default_device', lambda: mx.gpu)
+        mp.setattr(cuda_kernels, 'available', lambda: True)
+        mp.setattr(cuda_experts, '_kernel', lambda: FakeExpertsKernel('plain'))
+        mp.setattr(cuda_experts, '_staged_kernel', lambda k, gs, mxfp4=False: FakeExpertsKernel('staged'))
+        mp.setattr(cuda_experts, 'ON', [True])
+        mp.setattr(cuda_experts, 'CHOICE', {})
+        mp.setattr(cuda_experts, 'CHECKED', {})
+        mp.setattr(cuda_experts, 'STATS', dict(served=0, checked=0, mismatched=0))
+
+        for k_dim, sw_cur, exp_tag in ((128, sw_small, 'plain'), (512, sw_staged, 'staged')):
+            x_tok = mx.random.normal((2, 1, k_dim)).astype(mx.bfloat16)
+            ind_tok = mx.array([[[0, 2, 5, 7]], [[1, 3, 6, 9]]], dtype=mx.uint32)
+            mx.eval(x_tok, ind_tok)
+            assert cuda_experts.takes(sw_cur, x_tok, ind_tok)
+            for _ in range(cuda_experts.CHECKS + 1):
+                got = cuda_experts.decode(sw_cur, x_tok, ind_tok, lambda s=sw_cur, x=x_tok, i=ind_tok: expert_qmv.stock(s, x, i))
+                want = expert_qmv.stock(sw_cur, x_tok, ind_tok)
+                mx.eval(got, want)
+                assert mx.array_equal(got, want)
+            assert any(tag == exp_tag for tag, _, _ in calls)
+        assert cuda_experts.STATS['mismatched'] == 0
+        assert cuda_experts.STATS['served'] >= 2
+
+        # `cuda_moe.takes` must opt out when `down_proj.mode == 'mxfp4'`
+        dummy_block = nn.Module()
+        dummy_block.top_k = 8
+        dummy_block.gate = nn.Linear(128, 16, bias=False).to_quantized(group_size=64, bits=8)
+        dummy_block.shared_expert_gate = nn.Linear(128, 1, bias=False).to_quantized(group_size=64, bits=8)
+        sh = nn.Module()
+        for pn, (in_d, out_d) in (('gate_proj', (128, 64)), ('up_proj', (128, 64)), ('down_proj', (64, 128))):
+            setattr(sh, pn, nn.Linear(in_d, out_d, bias=False).to_quantized(group_size=64, bits=4))
+        dummy_block.shared_expert = sh
+        dummy_block.switch_mlp = sw_small
+        mx.eval(dummy_block.parameters())
+        assert not cuda_moe.takes(
+            dummy_block, mx.zeros((1, 1, 128), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 128), dtype=mx.bfloat16), mx.ones((1, 1, 1), dtype=mx.bfloat16),
+        )
+
+    # 3. `QUANTEEZE_BITS=mxfp4`: fitting, serve, control, home, requant, QuantCache, HostCopy, Demand
+    assert fitting.group_size('mxfp4') == 32
+    assert fitting.quantized_bytes(32, 'mxfp4') == 17.0
+    assert fitting.quantized_bytes(128, 'mxfp4') == 68.0
+    with monkeypatch.context() as mp:
+        mp.setenv('QUANTEEZE_SETTINGS', str(tmp_path / 'settings.json'))
+        mp.setenv('QUANTEEZE_BITS', 'mxfp4')
+        assert serve._uniform_bits() == ('mxfp4', 32)
+        assert serve._uniform_label(('mxfp4', 32)) == 'uniform MXFP4 (group size 32)'
+        assert control._uniform_bits() == 'mxfp4'
+        mp.setenv('QUANTEEZE_BITS', '')
+        res_mxfp4 = control.change({'QUANTEEZE_BITS': 'mxfp4'})
+        assert 'QUANTEEZE_BITS' in res_mxfp4['applied'] and not res_mxfp4['rejected']
+        assert control._uniform_bits() == 'mxfp4'
+
+    class ToyMoELayer(nn.Module):
+        def __init__(self, sw):
+            super().__init__()
+            mlp = nn.Module()
+            mlp.switch_mlp = sw
+            self.mlp = mlp
+
+    class ToyLM(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.layers = layers
+
+    ckpt_dir = tmp_path / 'bf16_ckpt'
+    ckpt_dir.mkdir()
+    bf16_tensors = {}
+    mx.random.seed(773)
+    for layer_idx in range(2):
+        sw = SwitchGLU(input_dims=128, hidden_dims=128, num_experts=12, bias=False)
+        for p_name in ('gate_proj', 'up_proj', 'down_proj'):
+            w_bf16 = getattr(sw, p_name).weight.astype(mx.bfloat16)
+            getattr(sw, p_name).weight = w_bf16
+            bf16_tensors[f'layers.{layer_idx}.mlp.switch_mlp.{p_name}.weight'] = w_bf16
+    mx.eval(*bf16_tensors.values())
+    (ckpt_dir / 'config.json').write_text('{"num_hidden_layers": 2}', encoding='utf-8')
+    mx.save_safetensors(str(ckpt_dir / 'model.safetensors'), bf16_tensors)
+
+    ub_map, stock_bits = home.uniform_bytes(ckpt_dir)
+    assert stock_bits == 16 and 'mxfp4' in ub_map
+    assert ub_map['mxfp4'] == int(fitting.quantized_bytes(2 * 3 * 12 * 128 * 128, 'mxfp4'))
+
+    def make_bf16_model():
+        layers = []
+        for layer_idx in range(2):
+            sw = SwitchGLU(input_dims=128, hidden_dims=128, num_experts=12, bias=False)
+            for p_name in ('gate_proj', 'up_proj', 'down_proj'):
+                getattr(sw, p_name).weight = bf16_tensors[f'layers.{layer_idx}.mlp.switch_mlp.{p_name}.weight']
+            layers.append(ToyMoELayer(sw))
+        mx.eval([l.parameters() for l in layers])
+        return ToyLM(layers)
+
+    m_lowered = make_bf16_model()
+    with monkeypatch.context() as mp:
+        cache_dir = tmp_path / 'qcache'
+        mp.setenv('QUANTEEZE_QUANT_CACHE', str(cache_dir))
+        requant.lower_model(m_lowered.layers, ckpt_dir, 'mxfp4')
+        for layer in m_lowered.layers:
+            for p_name in ('gate_proj', 'up_proj', 'down_proj'):
+                proj = getattr(layer.mlp.switch_mlp, p_name)
+                assert proj.mode == 'mxfp4'
+                assert proj.bits == 4
+                assert proj.group_size == 32
+                assert proj.get('biases') is None
+                assert proj.scales.dtype == mx.uint8
+
+        cached = requant.cached_checkpoint(m_lowered.layers, ckpt_dir, 'mxfp4')
+        assert isinstance(cached, requant.CachedCheckpoint)
+        assert cached.mode(0, 'gate_proj') == 'mxfp4'
+        assert cached.quantization(0, 'gate_proj', 128) == (32, 4)
+
+        m_flat = make_bf16_model()
+        m_cached = make_bf16_model()
+        d_flat = demand.Demand(m_flat, requant.Flat(ckpt_dir, 'mxfp4'), budget_bytes=1, workers=2)
+        held = q2_experts.hold(cached, budget=1 << 24, workers=2, by_rows=True)
+        d_cached = None
+        try:
+            held.wait()
+            d_cached = demand.Demand(m_cached, cached, budget_bytes=1, workers=2)
+            assert d_flat.switches[0].gate_proj.mode == 'mxfp4'
+            assert d_cached.switches[0].gate_proj.mode == 'mxfp4'
+            x_test = mx.random.normal((2, 3, 128)).astype(mx.bfloat16)
+            idx_test = mx.array([[[0, 3, 7, 11]] * 3, [[1, 4, 8, 10]] * 3], dtype=mx.uint32)
+            x_all = mx.random.normal((1, 3, 128)).astype(mx.bfloat16)
+            idx_all = mx.array([[[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]], dtype=mx.uint32)
+            mx.eval(x_test, idx_test, x_all, idx_all)
+            for l_idx in range(2):
+                y_ref = m_lowered.layers[l_idx].mlp.switch_mlp(x_test, idx_test)
+                y_fl = m_flat.layers[l_idx].mlp.switch_mlp(x_test, idx_test)
+                y_ca = m_cached.layers[l_idx].mlp.switch_mlp(x_test, idx_test)
+                yp_ref = m_lowered.layers[l_idx].mlp.switch_mlp(x_all, idx_all)
+                yp_fl = m_flat.layers[l_idx].mlp.switch_mlp(x_all, idx_all)
+                yp_ca = m_cached.layers[l_idx].mlp.switch_mlp(x_all, idx_all)
+                mx.eval(y_ref, y_fl, y_ca, yp_ref, yp_fl, yp_ca)
+                assert mx.array_equal(y_fl, y_ref)
+                assert mx.array_equal(y_ca, y_ref)
+                assert mx.array_equal(yp_fl, yp_ref)
+                assert mx.array_equal(yp_ca, yp_ref)
+        finally:
+            if d_cached is not None:
+                d_cached.close()
+            d_flat.close()
+            q2_experts.let_go(cached.path)
+
+    # 4. GGUF `MXFP4` (`kind == 39`): in-memory `load_model` and `HostCopy` + `Demand`
+    gguf_path = tmp_path / 'experts-mxfp4.gguf'
+    gguf_rng = np.random.default_rng(774)
+    n_exp, d_in, d_hid = 16, 128, 128
+    tensors_spec = []
+    for l_idx in range(2):
+        for gguf_name, rows, cols in (
+            ('ffn_gate_exps', d_hid, d_in),
+            ('ffn_up_exps', d_hid, d_in),
+            ('ffn_down_exps', d_in, d_hid),
+        ):
+            kb = cols // iq_experts.per_block(iq_experts.MXFP4)
+            arr = _random_ggml_blocks(gguf_rng, iq_experts.MXFP4, n_exp * rows * kb).reshape(
+                n_exp, rows, kb, iq_experts.BLOCK[iq_experts.MXFP4]
+            )
+            tensors_spec.append((f'blk.{l_idx}.{gguf_name}.weight', (cols, rows, n_exp), iq_experts.MXFP4, arr.tobytes()))
+    _write_gguf(gguf_path, tensors_spec)
+
+    src_mem = gguf_experts.ExpertGGUF(gguf_path)
+    src_dem = gguf_experts.ExpertGGUF(gguf_path)
+    m_mem = make_bf16_model()
+    for l_idx in range(2):
+        m_mem.layers[l_idx].mlp.switch_mlp = SwitchGLU(input_dims=d_in, hidden_dims=d_hid, num_experts=n_exp, bias=False)
+    m_dem = make_bf16_model()
+    for l_idx in range(2):
+        m_dem.layers[l_idx].mlp.switch_mlp = SwitchGLU(input_dims=d_in, hidden_dims=d_hid, num_experts=n_exp, bias=False)
+    assert 'MXFP4' in src_mem.format_label([0, 1])
+
+    gguf_experts.load_model(m_mem.layers, src_mem)
+    assert m_mem.layers[0].mlp.switch_mlp.gate_proj.mode == 'gguf:mxfp4'
+    held_gguf = q2_experts.hold(src_dem, budget=1 << 24, workers=2, by_rows=True)
+    dem_gguf = None
+    try:
+        held_gguf.wait()
+        dem_gguf = demand.Demand(m_dem, src_dem, budget_bytes=1, workers=2)
+        x_dec = mx.random.normal((1, 1, d_in)).astype(mx.bfloat16)
+        idx_dec = mx.array([[[8, 9, 10, 11]]], dtype=mx.uint32)
+        mx.eval(x_dec, idx_dec)
+        for l_idx in range(2):
+            ym = m_mem.layers[l_idx].mlp.switch_mlp(x_dec, idx_dec)
+            yd = m_dem.layers[l_idx].mlp.switch_mlp(x_dec, idx_dec)
+            mx.eval(ym, yd)
+            np.testing.assert_allclose(np.array(yd.astype(mx.float32)), np.array(ym.astype(mx.float32)), rtol=1e-2, atol=1e-2)
+        assert dem_gguf.host_served == 8
+    finally:
+        if dem_gguf is not None:
+            dem_gguf.close()
+        q2_experts.let_go(src_dem)
+        src_mem.close()
+
 
 

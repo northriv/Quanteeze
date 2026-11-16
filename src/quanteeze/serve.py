@@ -174,16 +174,20 @@ def _uniform_bits():
     value = (variables.get('QUANTEEZE_BITS') or '').strip().lower()
     if value in ('', 'off'):
         return None
+    if value == 'mxfp4':
+        return value, 32
     if value in requant.GGML_MODES:
         return value, 256
     if not value.isdigit() or int(value) not in UNIFORM_BITS:
-        choices = [*map(str, UNIFORM_BITS), *requant.GGML_MODES]
+        choices = [*map(str, UNIFORM_BITS), *requant.UNIFORM_MODES]
         raise SystemExit(f'quanteeze: QUANTEEZE_BITS={value}: one of {", ".join(choices)}, or off')
     b = int(value)
     return b, fitting.group_size(b)
 
 
 def _uniform_label(uniform):
+    if uniform[0] == 'mxfp4':
+        return 'uniform MXFP4 (group size 32)'
     if uniform[0] in requant.GGML_MODES:
         return f'uniform {uniform[0].upper()} (block size 256)'
     return f'uniform {uniform[0]} bits (group size {uniform[1]}, least squares)'
@@ -378,7 +382,7 @@ def _load_serving(*args, **kwargs):
         if stock_bits == fitting.FLOAT_BITS and target_bits is None and experts_gguf is None:
             raise SystemExit(
                 'quanteeze: on-demand SSD streaming requires quantized experts, QUANTEEZE_EXPERTS_GGUF, or '
-                'QUANTEEZE_BITS=4/3/2/1/q3_k/q2_k/iq2_xs'
+                'QUANTEEZE_BITS=4/3/2/1/mxfp4/q3_k/q2_k/iq2_xs'
             )
         gb = on_demand
         if gb == 'auto':

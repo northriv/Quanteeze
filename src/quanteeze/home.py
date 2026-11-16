@@ -36,7 +36,8 @@ REPO = re.compile(r'^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$')
 EXPERTS = ('num_experts', 'n_routed_experts', 'num_local_experts')
 UNIFORM_BITS = (1, 2, 3, 4, 8)
 UNIFORM_GGML = ('q3_k', 'q2_k', 'iq2_xs')
-UNIFORM_CHOICES = (*UNIFORM_BITS, *UNIFORM_GGML)
+UNIFORM_MODES = ('mxfp4', *UNIFORM_GGML)
+UNIFORM_CHOICES = (*UNIFORM_BITS, *UNIFORM_MODES)
 ITEMSIZE = {
     'BOOL': 1, 'U8': 1, 'I8': 1, 'U16': 2, 'I16': 2,
     'F16': 2, 'BF16': 2, 'U32': 4, 'I32': 4, 'F32': 4,
@@ -476,7 +477,7 @@ def experts_bytes(path):
 
 def uniform_bytes(path):
     """`({bits: bytes}, stock_bits)` the checkpoint's routed experts take uniformly at each of
-    `UNIFORM_CHOICES` (least squares at 1-8 bits, plus standard ggml `q3_k`, `q2_k`, `iq2_xs`)."""
+    `UNIFORM_CHOICES` (least squares at 1-8 bits, `'mxfp4'`, plus standard ggml `q3_k`, `q2_k`, `iq2_xs`)."""
     from . import requant
     reader = requant.Flat(path, 2)
     weights = 0
@@ -485,7 +486,7 @@ def uniform_bytes(path):
         for p in ('gate_proj', 'up_proj', 'down_proj'):
             if reader.base.has(layer, p, 'weight'):
                 _, dtype, shape, _ = reader.base.tensors[reader.base.name(layer, p, 'weight')]
-                b = reader._quantization(layer, p)[2]
+                b = reader._quantization(layer, p)[2] or (ITEMSIZE.get(dtype, 2) * 8)
                 if stock_bits is None:
                     stock_bits = b
                 weights += int(np.prod(shape)) * ITEMSIZE.get(dtype, 1) * 8 // b
@@ -511,15 +512,16 @@ def room_gb(info, table=0.0):
 
 def start(path, bits=None, from_ssd_gb=None):
     """Load the checkpoint at `path` with uniform expert quantization `bits` (`None`/`''`/`'off'`
-    for checkpoint precision, `1`/`2`/`3`/`4`/`8` for uniform least-squares quantization, or
-    `'q3_k'`/`'q2_k'`/`'iq2_xs'` for uniform ggml quantization) and optional `from_ssd_gb`
-    (`None`/`''` for automatic in-memory when fitting else on-demand SSD).  Returns `control.model_state()`."""
+    for checkpoint precision, `1`/`2`/`3`/`4`/`8` for uniform least-squares quantization, `'mxfp4'`
+    for uniform MXFP4, or `'q3_k'`/`'q2_k'`/`'iq2_xs'` for uniform ggml quantization) and optional
+    `from_ssd_gb` (`None`/`''` for automatic in-memory when fitting else on-demand SSD).  Returns
+    `control.model_state()`."""
     if not (Path(path).expanduser() / 'config.json').is_file():
         raise ValueError(f'{path}: no checkpoint there')
     bits_norm = str(bits).strip().lower() if bits not in (None, '', 0) else ''
-    valid = {*map(str, UNIFORM_BITS), *UNIFORM_GGML}
+    valid = {*map(str, UNIFORM_BITS), *UNIFORM_MODES}
     if bits_norm not in ('', 'off') and bits_norm not in valid:
-        choices = [*map(str, UNIFORM_BITS), *UNIFORM_GGML]
+        choices = [*map(str, UNIFORM_BITS), *UNIFORM_MODES]
         raise ValueError(f'bits: {", ".join(choices)}, or off, not {bits!r}')
     previous = {name: variables.get(name) for name in ('QUANTEEZE_BITS', 'QUANTEEZE_FROM_SSD_GB')}
     changes = {'QUANTEEZE_BITS': bits_norm if bits_norm not in ('', 'off') else ''}

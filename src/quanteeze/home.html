@@ -506,6 +506,7 @@ function renderPrecision() {
   if (m.uniform_gb) {
     const ladder = [
       {bits: '4', minStock: 5, title: '4 bits (least-squares)', desc: 'All routed experts lowered uniformly to 4-bit'},
+      {bits: 'mxfp4', minStock: 5, title: 'MXFP4 (microscaling FP4)', desc: 'All routed experts quantized uniformly to MXFP4 (4.25 bpw)'},
       {bits: 'q3_k', minStock: 4, title: 'Q3_K (ggml K-quant)', desc: 'Intermediate size (3.44 bpw); slower at load, from SSD, and on CUDA', kquant: true},
       {bits: '3', minStock: 4, title: '3 bits (least-squares)', desc: 'All routed experts lowered uniformly to 3-bit'},
       {bits: 'q2_k', minStock: 3, title: 'Q2_K (ggml K-quant)', desc: 'Intermediate size (2.63 bpw); slower at load, from SSD, and on CUDA', kquant: true},
@@ -953,6 +954,7 @@ init();
     [/^Original \((.+)-bit\)$/, '元の精度（$1 ビット）'],
     [/^(\d+) bits? \(least-squares\)$/, '$1 ビット（最小二乗）'],
     [/^(Q3_K|Q2_K) \(ggml K-quant\)$/, '$1（ggml K-quant）'],
+    [/^MXFP4 \(microscaling FP4\)$/, 'MXFP4（マイクロスケール FP4）'],
     [/^IQ2_XS \(ggml importance grid\)$/, 'IQ2_XS（ggml 格子量子化）'],
     [/^All routed experts lowered uniformly to (\d+)-bit$/, '全ルーティング・エキスパートを均一に $1 ビットへ量子化'],
     [/^All routed experts quantized uniformly to (.+)$/, '全ルーティング・エキスパートを均一に $1 へ量子化'],
@@ -968,9 +970,9 @@ init();
   const FRAGMENTS = [
     ['all weights in memory', '全重みをメモリ保持'],
     [/(\d+)-bit experts \(lowered from (\d+)-bit by least squares\)/, '$1ビット・エキスパート（$2ビットから最小二乗で量子化）'],
-    [/(Q3_K|Q2_K|IQ2_XS) experts \(lowered from (\d+)-bit\)/, '$1 エキスパート（$2ビットから均一量子化）'],
+    [/(MXFP4|Q3_K|Q2_K|IQ2_XS) experts \(lowered from (\d+)-bit\)/, '$1 エキスパート（$2ビットから均一量子化）'],
     [/(\d+)-bit experts/, '$1ビット・エキスパート'],
-    [/(Q3_K|Q2_K|IQ2_XS) experts/, '$1 エキスパート'],
+    [/(MXFP4|Q3_K|Q2_K|IQ2_XS) experts/, '$1 エキスパート'],
     [/streaming on demand from SSD \((.+?) of (.+?) GB kept in memory\)/, 'SSD オンデマンド配信（$2 GB 中 $1 GB をメモリ保持）'],
     ['opening the checkpoint', 'チェックポイントを開いています'],
     ['reading the weights', '重みを読み込んでいます'],

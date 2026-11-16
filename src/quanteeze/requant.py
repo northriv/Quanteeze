@@ -38,10 +38,11 @@ GROUP_SIZE = 128                      # group size for 1..3-bit least-squares qu
 ITERATIONS = 8
 FORMATS = {'mxfp4': (32, 4), 'nvfp4': (16, 4), 'mxfp8': (32, 8)}     # mode: (group size, bits)
 GGML_MODES = ('q3_k', 'q2_k', 'iq2_xs')
+UNIFORM_MODES = ('mxfp4',) + GGML_MODES
 
 
 def _norm_bits(bits):
-    if isinstance(bits, str) and bits.strip().lower() in GGML_MODES:
+    if isinstance(bits, str) and bits.strip().lower() in UNIFORM_MODES:
         return bits.strip().lower()
     return int(bits)
 
@@ -49,6 +50,10 @@ def _norm_bits(bits):
 def effective_format(bits, in_dims, group_size=None):
     """Return `(int_bits, group_size, mode)` for uniform quantization spec `bits` on rows of width `in_dims`."""
     b = _norm_bits(bits)
+    if b == 'mxfp4':
+        if in_dims % 32 == 0:
+            return 4, 32, 'mxfp4'
+        return 4, 64, 'affine'
     if b in GGML_MODES:
         from . import ggml_quants
         fb = ggml_quants.FORMAT_BITS[b]
@@ -64,7 +69,7 @@ def effective_format(bits, in_dims, group_size=None):
 def source(path, bits, group_size=GROUP_SIZE):
     """The source string of a uniform quantization computed from `path`."""
     b = _norm_bits(bits)
-    gs = 256 if b in GGML_MODES else int(group_size)
+    gs = 256 if b in GGML_MODES else (32 if b == 'mxfp4' else int(group_size))
     inner = str(path) if str(path).startswith(SCHEME + ':') else Path(path).expanduser().resolve()
     return f'{SCHEME}:{b}:{gs}:{inner}'
 
@@ -316,10 +321,16 @@ def _cuda():
 
 
 def quantize(w, bits, group_size=GROUP_SIZE, iterations=ITERATIONS):
-    """Weights w [..., out, in] as MLX affine arrays `[weight uint32, scales, biases]` (bf16) or
-    ggml K/IQ packed `[body uint8, d float16, dmin float16|None]` when `bits in GGML_MODES`."""
+    """Weights w [..., out, in] as MLX affine arrays `[weight uint32, scales, biases]` (bf16),
+    MXFP4 `[weight uint32, scales uint8, None]` when `bits == 'mxfp4'`, or ggml K/IQ packed
+    `[body uint8, d float16, dmin float16|None]` when `bits in GGML_MODES`."""
     global _kernel, _cuda_kernel
     b = _norm_bits(bits)
+    if b == 'mxfp4':
+        if w.shape[-1] % 32 == 0:
+            wq, sq = mx.quantize(w, group_size=32, bits=4, mode='mxfp4')
+            return [wq, sq, None]
+        return quantize(w, 4, 64, iterations)
     if b in GGML_MODES:
         from . import ggml_quants
         if w.shape[-1] % 256 == 0:
@@ -487,7 +498,7 @@ class Reader:
     def __init__(self, path, bits, group_size=GROUP_SIZE, chunk=32, cache=None):
         self.base = q2_experts.Checkpoint(path)
         self.bits = _norm_bits(bits)
-        self.group_size = 256 if self.bits in GGML_MODES else int(group_size)
+        self.group_size = 256 if self.bits in GGML_MODES else (32 if self.bits == 'mxfp4' else int(group_size))
         self.path, self.chunk = self.base.path, chunk
         self.origin = source(path, self.bits, self.group_size)
         self._config = None
@@ -528,9 +539,12 @@ class Reader:
         parts = []
         for s in range(0, experts.size, self.chunk):
             weight, scales, biases = self.base.experts(layer, projection, experts[s:s + self.chunk])
-            w = weight if mode is None else dequantize(weight, scales, biases, group_size=group_size,
-                                                       bits=bits, mode=mode)
-            part = quantize(w, self.bits, self.group_size)
+            if mode == 'mxfp4' and self.bits == 'mxfp4':
+                part = [weight, scales, None]
+            else:
+                w = weight if mode is None else dequantize(weight, scales, biases, group_size=group_size,
+                                                           bits=bits, mode=mode)
+                part = quantize(w, self.bits, self.group_size)
             mx.eval(*[t for t in part if t is not None])
             parts.append(part)
         return [mx.concatenate([p[i] for p in parts]) if parts[0][i] is not None else None for i in range(3)]
@@ -543,7 +557,7 @@ class Flat:
     def __init__(self, path, bits, group_size=GROUP_SIZE):
         self.base = q2_experts.Checkpoint(path)
         self.bits = _norm_bits(bits)
-        self.group_size = 256 if self.bits in GGML_MODES else int(group_size)
+        self.group_size = 256 if self.bits in GGML_MODES else (32 if self.bits == 'mxfp4' else int(group_size))
         self.path = self.base.path
         self.origin = source(self.path, self.bits, self.group_size)
         self._config, self._lock = None, threading.Lock()
@@ -559,15 +573,18 @@ class Flat:
         arrays = self.base.expert(layer, projection, expert, buf, cache=cache)
         mode, group_size, bits = self._quantization(layer, projection)
         with self._lock:
-            w = arrays[0] if mode is None else dequantize(*arrays, group_size=group_size, bits=bits, mode=mode)
-            part = quantize(w, self.bits, self.group_size)
+            if mode == 'mxfp4' and self.bits == 'mxfp4':
+                part = [arrays[0], arrays[1], None]
+            else:
+                w = arrays[0] if mode is None else dequantize(*arrays, group_size=group_size, bits=bits, mode=mode)
+                part = quantize(w, self.bits, self.group_size)
             mx.eval(*[t for t in part if t is not None])
         return part
 
 
 def lower_model(layers, path, bits, group_size=None, on_layer=None):
-    """Lower every MoE layer's `SwitchGLU` in `layers` uniformly to `bits` (integer affine least-squares
-    or ggml `'q3_k'`, `'q2_k'`, `'iq2_xs'`), streaming from `path` in chunks of 32 experts."""
+    """Lower every MoE layer's `SwitchGLU` in `layers` uniformly to `bits` (integer affine least-squares,
+    `'mxfp4'`, or ggml `'q3_k'`, `'q2_k'`, `'iq2_xs'`), streaming from `path` in chunks of 32 experts."""
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear
     from . import fitting, ggml_quants
     bits_spec = _norm_bits(bits)
@@ -586,8 +603,10 @@ def lower_model(layers, path, bits, group_size=None, on_layer=None):
                 eff_mode = bits_spec
                 out_dims, in_dims = w.shape[1], w.shape[2] * 256
             else:
-                eff_bits = ggml_quants.FORMAT_BITS[bits_spec] if bits_spec in GGML_MODES else int(bits_spec)
-                eff_mode = 'affine'
+                eff_bits = (4 if bits_spec == 'mxfp4'
+                            else ggml_quants.FORMAT_BITS[bits_spec] if bits_spec in GGML_MODES
+                            else int(bits_spec))
+                eff_mode = 'mxfp4' if (bits_spec == 'mxfp4' and b is None) else 'affine'
                 out_dims = w.shape[1]
                 in_dims = w.shape[2] * 32 // eff_bits
                 eff_gs = in_dims // s.shape[-1]
@@ -595,7 +614,7 @@ def lower_model(layers, path, bits, group_size=None, on_layer=None):
                 init_gs = eff_gs if eff_gs in (32, 64, 128) else 64
                 init_bits = eff_bits if eff_bits in (2, 3, 4, 8) else 4
                 proj = QuantizedSwitchLinear(in_dims, out_dims, n_experts, bias=False,
-                                             group_size=init_gs, bits=init_bits, mode='affine')
+                                             group_size=init_gs, bits=init_bits, mode=eff_mode)
                 setattr(switch, p, proj)
             proj.weight = w
             proj.scales = s
@@ -648,14 +667,23 @@ class CachedCheckpoint(q2_experts.Checkpoint):
 
     def mode(self, layer, projection):
         w_shape = self.tensors[self.name(layer, projection, 'weight')][2]
-        return self.bits if len(w_shape) == 4 else 'affine'
+        if len(w_shape) == 4:
+            return self.bits
+        if not self.has(layer, projection, 'biases'):
+            return 'mxfp4' if self.bits == 'mxfp4' else super().mode(layer, projection)
+        return 'affine'
 
     def quantization(self, layer, projection, input_dims):
         from . import ggml_quants
         w_shape = self.tensors[self.name(layer, projection, 'weight')][2]
         if len(w_shape) == 4:
             return 256, ggml_quants.FORMAT_BITS[self.bits]
-        eff_bits = ggml_quants.FORMAT_BITS[self.bits] if self.bits in GGML_MODES else int(self.bits)
+        if self.bits == 'mxfp4':
+            eff_bits = 4
+        elif self.bits in GGML_MODES:
+            eff_bits = ggml_quants.FORMAT_BITS[self.bits]
+        else:
+            eff_bits = int(self.bits)
         scales_shape = self.tensors[self.name(layer, projection, 'scales')][2]
         return input_dims // scales_shape[-1], eff_bits
 

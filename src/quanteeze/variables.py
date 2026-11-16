@@ -112,9 +112,9 @@ _TABLE = [
     ('QUANTEEZE_THROTTLE_MAX_REST', '2', 'memory', 'load', 'seconds a rest at most'),
     # -- uniform expert quantization & on-demand SSD streaming (quanteeze.serve, requant, demand)
     ('QUANTEEZE_BITS', None, 'experts', 'load',
-     'serve every routed expert uniformly at this precision (8, 4, 3, 2, 1, q3_k, q2_k, or iq2_xs), computed '
-     'from the checkpoint in memory when the lowered model fits, or as each expert is read from the SSD when it '
-     'does not.  Unset or off: keep the checkpoint\'s original precision'),
+     'serve every routed expert uniformly at this precision (8, 4, 3, 2, 1, mxfp4, q3_k, q2_k, or iq2_xs), '
+     'computed from the checkpoint in memory when the lowered model fits, or as each expert is read from the SSD '
+     'when it does not.  Unset or off: keep the checkpoint\'s original precision'),
     ('QUANTEEZE_EXPERTS_GGUF', None, 'experts', 'load',
      'read routed MoE expert weights directly from this pre-distributed GGUF path (single file, split shards, '
      'or directory), keeping the model trunk, Vision, and MTP from the MLX checkpoint (--experts-gguf). '
@@ -238,8 +238,8 @@ _TABLE = [
      'kernels and MLX\'s cache update and matmul where mlx-vlm runs some forty, each softmax size checked bit for bit '
      'first (off: mlx-vlm\'s)'),
     ('QUANTEEZE_CUDA_EXPERTS', 'on', 'speed', 'start',
-     'on MLX\'s CUDA backend, a decode token\'s routed experts in two kernels (gate+up+swiglu; down) where '
-     'mlx-vlm runs four, checked bit for bit first (off: mlx-vlm\'s)'),
+     'on MLX\'s CUDA backend, a decode token\'s 4-bit affine or MXFP4 routed experts in two kernels '
+     '(gate+up+swiglu; down) where mlx-vlm runs four, checked bit for bit first (off: mlx-vlm\'s)'),
     ('QUANTEEZE_CUDA_ROUTER', 'on', 'speed', 'start',
      'on MLX\'s CUDA backend, a decode token\'s routing in one kernel where MLX runs six, checked bit for bit '
      'first (off: MLX\'s ops)'),

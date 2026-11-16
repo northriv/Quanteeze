@@ -296,6 +296,7 @@ def takes(block, x, hyper, weights):
     logits = mx.zeros((1, 1, block.gate.weight.shape[0]), x.dtype)
     indices = mx.zeros((1, 1, slots), mx.uint32)
     return (cuda_router.takes(logits, slots) and cuda_experts.takes(switch, x, indices)
+            and getattr(switch.down_proj, 'mode', None) == 'affine'
             and switch.down_proj.weight.shape[1] == k and k % 8 == 0
             and hyper.dtype == x.dtype and weights.dtype == x.dtype and hyper.size == weights.size * k)
 

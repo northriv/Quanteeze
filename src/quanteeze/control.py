@@ -85,7 +85,7 @@ OWN = ('QUANTEEZE_CONTROL_TOKEN', 'QUANTEEZE_SETTINGS')
 SAMPLING = {'QUANTEEZE_TEMPERATURE': 'temperature', 'QUANTEEZE_SEED': 'seed'}
 CHOICES = {
     'QUANTEEZE_ALLOCATOR': ('auto', 'on', 'off'),
-    'QUANTEEZE_BITS': ('1', '2', '3', '4', '8', 'q3_k', 'q2_k', 'iq2_xs', 'off'),
+    'QUANTEEZE_BITS': ('1', '2', '3', '4', '8', 'mxfp4', 'q3_k', 'q2_k', 'iq2_xs', 'off'),
     'QUANTEEZE_LOAD_WHOLE': ('on', 'off'),
     'QUANTEEZE_APC_ENCRYPT': ('on', 'off'),
     'QUANTEEZE_COMPACT': ('on', 'off'),
@@ -348,9 +348,9 @@ def model_state():
 
 
 def _uniform_bits():
-    """The bits or ggml mode QUANTEEZE_BITS asks every routed expert at (quanteeze.serve), else None."""
+    """The bits or uniform mode QUANTEEZE_BITS asks every routed expert at (quanteeze.serve), else None."""
     value = (variables.get('QUANTEEZE_BITS') or '').strip().lower()
-    if value in ('q3_k', 'q2_k', 'iq2_xs'):
+    if value in ('mxfp4', 'q3_k', 'q2_k', 'iq2_xs'):
         return value
     return int(value) if value.isdigit() and int(value) else None
 
