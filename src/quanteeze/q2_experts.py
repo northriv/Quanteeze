@@ -302,6 +302,7 @@ class HostCopy:
         self.by_rows = bool(by_rows)
         self.layer_of, self.expert_in, self.slot_of, self.experts = {}, {}, {}, {}
         self._layer_names = {}
+        self._reading_done = False
         routed = [(layer, n) for layer, n in checkpoint.routed(layers=True) if layers is None or layer in layers]
         names = [n for _, n in routed]
         self.total = sum(checkpoint.nbytes(name) for name in names)
@@ -316,6 +317,7 @@ class HostCopy:
                 self.arrays[name] = np.empty(shape, _SAFETENSORS[dtype])
                 self.pending[name] = self._pool.submit(checkpoint._from_file, name, None, False, self.arrays[name])
                 self.bytes += size
+            self._reading_done = not self.pending
             return
         by_layer = {}
         for layer, name in routed:
@@ -347,6 +349,7 @@ class HostCopy:
                 self.arrays[name] = np.empty((ids.size,) + tuple(shape[1:]), _SAFETENSORS[dtype])
                 self.pending[name] = self._pool.submit(checkpoint._from_file, name, ids, False, self.arrays[name])
         self.bytes = int(sum(a.nbytes for a in self.arrays.values()))
+        self._reading_done = not self.pending
 
     def _ready(self, name):
         pending = self.pending.get(name)
@@ -449,7 +452,7 @@ class HostCopy:
                     np.take(held, slots, axis=0, out=out_slice, mode='clip')
 
             big = [item for item in work if item[1].nbytes >= (1 << 19)]
-            if self._workers > 1 and len(big) > 1:
+            if self._workers > 1 and len(big) > 1 and not self.reading():
                 small = [item for item in work if item[1].nbytes < (1 << 19)]
                 futs = [self._pool.submit(_copy_one, held, out_slice) for held, out_slice in big[:-1]]
                 _copy_one(*big[-1])
@@ -464,7 +467,12 @@ class HostCopy:
 
     def reading(self):
         """Whether any background read into `self.arrays` is still in flight."""
-        return any(not p.done() for p in list(self.pending.values()))
+        if self._reading_done:
+            return False
+        busy = any(not p.done() for p in list(self.pending.values()))
+        if not busy:
+            self._reading_done = True
+        return busy
 
     def read(self):
         """Bytes held and read so far."""
@@ -476,10 +484,12 @@ class HostCopy:
         for pending in list(self.pending.values()):
             if not pending.cancelled():
                 pending.result()
+        self._reading_done = True
 
     def close(self):
         with self.lock:
             self.arrays, self.pending = {}, {}
+            self._reading_done = True
         self._pool.shutdown(wait=True, cancel_futures=True)
 
 

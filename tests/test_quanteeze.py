@@ -2852,6 +2852,101 @@ def test_demand_prefill_cap_reclaims_mlx_cache_for_in_layer_mode(tmp_path, monke
         q2_experts.let_go(model_dir)
 
 
+def test_host_copy_layer_bypasses_pool_while_background_reading_active(tmp_path):
+    """`HostCopy.copy_layer` copies directly on the caller thread while background SSD reads
+    occupy `HostCopy._pool`, preventing head-of-line stalls right after server startup, and
+    resumes parallel `_pool` copying once `reading()` completes."""
+    import threading
+    import time
+    from quanteeze import q2_experts
+
+    rng = np.random.default_rng(73)
+    tensors = {}
+    for l_idx in range(2):
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            tensors[f'layers.{l_idx}.mlp.switch_mlp.{proj}.weight'] = mx.array(
+                rng.integers(0, 1 << 31, size=(8, 256, 128), dtype=np.uint32)
+            )
+            tensors[f'layers.{l_idx}.mlp.switch_mlp.{proj}.scales'] = mx.ones((8, 256, 4), dtype=mx.bfloat16)
+            tensors[f'layers.{l_idx}.mlp.switch_mlp.{proj}.biases'] = mx.zeros((8, 256, 4), dtype=mx.bfloat16)
+    mx.eval(list(tensors.values()))
+    ckpt_dir = tmp_path / 'hc_stall'
+    ckpt_dir.mkdir()
+    mx.save_safetensors(str(ckpt_dir / 'model.safetensors'), tensors)
+
+    ckpt = q2_experts.Checkpoint(ckpt_dir)
+    gate = threading.Event()
+    orig_from_file = ckpt._from_file
+
+    def gated_from_file(name, rows=None, cache=False, out=None):
+        if name.startswith('layers.1.'):
+            gate.wait(timeout=5.0)
+        return orig_from_file(name, rows, cache, out)
+
+    ckpt._from_file = gated_from_file
+    hc = q2_experts.HostCopy(ckpt, budget=1 << 28, workers=2, by_rows=True)
+    try:
+        deadline = time.monotonic() + 2.0
+        while not hc.holds_layer(0) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert hc.holds_layer(0)
+        assert hc.reading()
+
+        layer0_names = [
+            ckpt.name(0, proj, part)
+            for proj in ('gate_proj', 'up_proj', 'down_proj')
+            for part in ('weight', 'scales', 'biases')
+        ]
+        ref_np = {
+            name: np.asarray(tensors[name].view(mx.uint16) if tensors[name].dtype == mx.bfloat16 else tensors[name])
+            for name in layer0_names
+        }
+
+        def _alloc_targets(n_rows):
+            out = []
+            for name in layer0_names:
+                _, st_dtype, full_shape, _ = ckpt.tensors[name]
+                np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
+                out.append((name, np.empty((n_rows,) + tuple(full_shape[1:]), np_dt)))
+            return out
+
+        submitted = []
+        orig_submit = hc._pool.submit
+
+        def spy_submit(fn, *args, **kwargs):
+            submitted.append(fn)
+            return orig_submit(fn, *args, **kwargs)
+
+        hc._pool.submit = spy_submit
+
+        subset = np.array([1, 3, 5, 7], dtype=np.int64)
+        targets = _alloc_targets(8)
+        sub_targets = _alloc_targets(subset.size)
+        t0 = time.monotonic()
+        assert hc.copy_layer(0, None, targets) is True
+        assert hc.copy_layer(0, subset, sub_targets) is True
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0
+        assert submitted == []
+        for (name, full_arr), (_, sub_arr) in zip(targets, sub_targets):
+            np.testing.assert_array_equal(full_arr, ref_np[name])
+            np.testing.assert_array_equal(sub_arr, ref_np[name][subset])
+
+        gate.set()
+        hc.wait()
+        assert not hc.reading()
+        assert hc._reading_done is True
+
+        targets_after = _alloc_targets(8)
+        assert hc.copy_layer(0, None, targets_after) is True
+        assert len(submitted) >= 2
+        for (_, before_arr), (_, after_arr) in zip(targets, targets_after):
+            np.testing.assert_array_equal(after_arr, before_arr)
+    finally:
+        gate.set()
+        hc.close()
+
+
 def test_admission_short_lengths_wanted_and_on_demand_coalesce(monkeypatch):
     """Per-row `lengths`/`wanted` budgeting admits all short concurrent prompts (`rows == 4`),
     `admission.install` forwards `(lengths, wanted)` from `_unprocessed_sequences`, and

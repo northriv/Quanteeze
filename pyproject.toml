@@ -1,6 +1,6 @@
 [project]
 name = "quanteeze"
-version = "0.1.7"
+version = "0.1.8"
 description = "Fast uniform least-squares quantization and speculative MoE serving on Apple Silicon and CUDA"
 readme = "README.md"
 license = "GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0"
