@@ -103,13 +103,26 @@ _TABLE = [
      'named loaded as its checkpoint'),
     ('QUANTEEZE_HOST_NGRAM_GB', 'auto', 'memory', 'load',
      'GB of the n-gram tables (Flash-Next\'s PLE, DeepSeek V4.1\'s Engram) read once into the host\'s memory '
-     'and looked up there, not in the file (auto: on a GPU with memory of its own, CUDA, as many as the '
-     'host\'s memory or the job\'s cgroup leaves, before the experts\' copy; none on a Mac, or where the '
-     'checkpoint is in memory already, /dev/shm; off: none)'),
+     'and looked up there, not in the file (auto: on a discrete CUDA GPU with memory of its own, as many as the '
+     'host\'s memory or the job\'s cgroup leaves, before the experts\' copy; none on a Mac, an integrated CUDA GPU '
+     'sharing host memory, or where the checkpoint is in memory already, /dev/shm; off: none)'),
     ('QUANTEEZE_THROTTLE_AT', '2', 'memory', 'load', 'macOS thermal pressure level the throttle starts at (off: none)'),
     ('QUANTEEZE_THROTTLE_DUTY', None, 'memory', 'load',
      'the GPU\'s share of the time while hot: one share, or <level>:<share>,... (guards.DUTIES)'),
     ('QUANTEEZE_THROTTLE_MAX_REST', '2', 'memory', 'load', 'seconds a rest at most'),
+    ('QUANTEEZE_CPU_THREADS', 'auto', 'memory', 'start',
+     'worker threads that compute experts on the CPU from the host\'s copy (quanteeze.cpu_experts; auto: physical '
+     'cores on the GPU\'s NUMA node/socket less RESERVE_CORES, capped at MAX_AUTO_THREADS, each pinned to its core)'),
+    ('QUANTEEZE_CPU_PRIORITY', 'auto', 'memory', 'start',
+     'CPU expert worker scheduling priority: auto (normal inside SLURM/PBS/LSB/PJM/SGE batch jobs, idle elsewhere), '
+     'idle (SCHED_IDLE on Linux, yielding to foreground tasks), nice (nice 19), normal (process default), or wake '
+     '(sleep at normal priority for fast wakeup, switch to SCHED_IDLE while computing)'),
+    ('QUANTEEZE_CPU_MIN_THREADS', '4', 'memory', 'start',
+     'fewest workers CPU expert offload runs with: fewer lose to copying the expert over PCIe, so the GPU path '
+     'is taken instead'),
+    ('QUANTEEZE_CPU_YIELD_AT', '25', 'memory', 'start',
+     'percent of CPU used by other processes within this process\'s cpuset at which CPU expert workers stop at once '
+     'under QUANTEEZE_CPU_EXPERTS=auto (returning one worker at a time after 2.5 s under half of it)'),
     # -- uniform expert quantization & on-demand SSD streaming (quanteeze.serve, requant, demand)
     ('QUANTEEZE_BITS', None, 'experts', 'load',
      'serve every routed expert uniformly at this precision (8, 4, 3, 2, 1, mxfp4, q3_k, q2_k, or iq2_xs), '
@@ -125,21 +138,29 @@ _TABLE = [
      'memory (auto: what fits).  Unset: whole in memory where the experts fit, else on demand within the room'),
     ('QUANTEEZE_LOAD_WHOLE', None, 'experts', 'load',
      'on: every model loaded whole into memory, even where its experts do not fit'),
-    ('QUANTEEZE_READ_THREADS', '4', 'experts', 'load',
-     'threads reading experts from the checkpoint on demand (a Mac\'s SSD is full at 4; a network file system '
-     'wants more)'),
+    ('QUANTEEZE_READ_THREADS', 'auto', 'experts', 'load',
+     'threads reading experts from the checkpoint on demand (auto: 4 on local storage, 16 on Lustre/GPFS/NFS and '
+     'other network file systems)'),
     ('QUANTEEZE_HOST_EXPERTS_BY', 'auto', 'experts', 'load',
      'how the host\'s copy of the experts (QUANTEEZE_HOST_EXPERTS_GB) is chosen: rows, an equal share of every '
-     'layer\'s experts; layers, whole tensors from the first layer on; auto, rows, but layers where the checkpoint '
-     'lies on a network\'s file system (Lustre, NFS)'),
+     'layer\'s experts; layers, whole tensors from the first layer on; auto, rows (but layers on a network file '
+     'system when host memory does not hold all routed experts)'),
     ('QUANTEEZE_WARM_UP', 'on', 'experts', 'load',
      'on CUDA, the model run once before the first request, so that quanteeze\'s own kernels are compiled then, '
      'not while it waits (not where experts are read on demand)'),
     ('QUANTEEZE_HOST_EXPERTS_GB', 'auto', 'experts', 'load',
      'GB of the checkpoint\'s routed experts held in the host\'s memory and read from there, not the disk '
-     '(auto: on a GPU with memory of its own, CUDA, as many as the host\'s memory or the job\'s cgroup leaves, '
-     'less a tenth of it and 3 GB for what the server adds after; none on a Mac, or where the checkpoint is in '
-     'memory already, /dev/shm; off: none)'),
+     '(auto: on a discrete CUDA GPU with memory of its own, as many as the host\'s memory or the job\'s cgroup '
+     'leaves, less a tenth of it and 3 GB for what the server adds after; none on a Mac, an integrated CUDA GPU '
+     'sharing host memory, or where the checkpoint is in memory already, /dev/shm; off: none)'),
+    ('QUANTEEZE_CPU_EXPERTS', 'auto', 'experts', 'load',
+     'when serving on demand with a host-RAM expert copy (QUANTEEZE_HOST_EXPERTS_GB), compute a 1-token decode '
+     'step\'s missing experts held in host memory on the CPU instead of copying them over PCIe '
+     '(quanteeze.cpu_experts: workers pinned to NUMA-local physical cores, a C++ server thread answering the GPU '
+     'in parallel with GPU-resident experts): auto (default; enabled on discrete CUDA GPUs with AVX2/AVX-512 when '
+     'CPU threads and PCIe balance favor offload, yielding to other processes within the cpuset via '
+     'QUANTEEZE_CPU_YIELD_AT / QUANTEEZE_CPU_MIN_THREADS; off on Metal, integrated CUDA, non-SIMD hosts, or wide '
+     'PCIe Gen5 with small desktop CPUs); on, always attempt; off, stage over PCIe onto the GPU bit for bit'),
     ('QUANTEEZE_DEMAND_PROMPT_GB', '2', 'experts', 'load',
      'GB of experts a prefill pass on demand reads into temporary GPU memory at once, batching larger selections '
      'bit for bit (off: unbounded)'),

@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import weakref
+from pathlib import Path
 
 import mlx.core as mx
 import mlx_vlm.server as _server
@@ -279,7 +280,7 @@ def _load_serving(*args, **kwargs):
             mx.clear_cache()
     switches = [arch.switch_of(layer) for layer in layers if arch.switch_of(layer) is not None]
     has_experts = bool(switches)
-    _hold_tables(model)
+    _hold_tables(model, path)
 
     if known:
         blocks = known.install(model)
@@ -413,7 +414,7 @@ def _load_serving(*args, **kwargs):
                        else variables.number('QUANTEEZE_DEMAND_PROMPT_GB') * 1e9)
         served = demand.Demand(
             model, source, gb * 1e9,
-            workers=variables.integer('QUANTEEZE_READ_THREADS'),
+            workers=q2_experts.read_threads(str(source.path) if hasattr(source, 'path') else path),
             prompt_room=prompt_room,
         )
         if _ADMISSION[0] is not None:
@@ -705,11 +706,15 @@ def _resident(model, switches):
 HELD_AFTER = 3e9
 
 
-def _host_by_rows(path, by=None):
+def _host_by_rows(path, by=None, budget=None, total=None):
     """Whether the host's copy holds checkpoint `path`'s experts by rows (`QUANTEEZE_HOST_EXPERTS_BY`):
     `False` for whole tensors from the first layer on; else `True` (as many of every layer by rows)."""
-    value = by or (variables.get('QUANTEEZE_HOST_EXPERTS_BY') or 'auto').strip().lower()
-    return not (value == 'layers' or (value == 'auto' and q2_experts.on_network(path)))
+    value = (by or variables.get('QUANTEEZE_HOST_EXPERTS_BY') or 'auto').strip().lower()
+    if value == 'layers':
+        return False
+    if value == 'rows' or not q2_experts.on_network(path):
+        return True
+    return bool(budget is not None and total is not None and budget >= total)
 
 
 def _hold_experts(source_or_path, passing=0):
@@ -723,7 +728,8 @@ def _hold_experts(source_or_path, passing=0):
     if value == 'off':
         return None
     if value == 'auto':
-        if mx.metal.is_available() or mx.default_device() != mx.gpu or q2_experts.in_memory(check_path):
+        if (mx.metal.is_available() or mx.default_device() != mx.gpu or cuda_ple.integrated()
+                or q2_experts.in_memory(check_path)):
             return None
         budget = (fitting.host_room() or 0) - ngram_prefetch.unread() - passing - HELD_AFTER
         if budget <= 0:
@@ -731,9 +737,26 @@ def _hold_experts(source_or_path, passing=0):
     else:
         budget = float(value) * 1e9
     t = time.time()
-    by_rows = _host_by_rows(check_path)
+    owned = parallel.owned()
+    routed_total = None
+    by_mode = (variables.get('QUANTEEZE_HOST_EXPERTS_BY') or 'auto').strip().lower()
+    if by_mode == 'auto' and q2_experts.on_network(check_path):
+        ckpt_obj = ckpt
+        if ckpt_obj is None:
+            resolved = Path(check_path).expanduser().resolve()
+            if resolved.suffix.lower() == '.gguf' or (
+                resolved.is_dir() and not any(resolved.glob('*.safetensors')) and any(resolved.glob('*.gguf'))
+            ):
+                ckpt_obj = gguf_experts.ExpertGGUF(resolved)
+            else:
+                ckpt_obj = q2_experts.Checkpoint(resolved)
+            ckpt = ckpt_obj
+        routed_total = sum(
+            ckpt_obj.nbytes(n) for layer, n in ckpt_obj.routed(layers=True) if owned is None or layer in owned
+        )
+    by_rows = _host_by_rows(check_path, by=by_mode, budget=budget, total=routed_total)
     held = q2_experts.hold(ckpt if ckpt is not None else check_path, budget,
-                           variables.integer('QUANTEEZE_READ_THREADS'), parallel.owned(), by_rows)
+                           q2_experts.read_threads(check_path), owned, by_rows)
     if not held.bytes:
         return None
     if held.by_rows:
@@ -760,12 +783,12 @@ def _hold_experts(source_or_path, passing=0):
     return held
 
 
-def _hold_tables(model):
+def _hold_tables(model, path=None):
     value = (variables.get('QUANTEEZE_HOST_NGRAM_GB') or 'auto').strip().lower()
     if value == 'off':
         return None
     if value == 'auto':
-        if mx.metal.is_available() or mx.default_device() != mx.gpu:
+        if mx.metal.is_available() or mx.default_device() != mx.gpu or cuda_ple.integrated():
             return None
         budget = fitting.host_room()
         if not budget:
@@ -773,7 +796,7 @@ def _hold_tables(model):
     else:
         budget = float(value) * 1e9
     t = time.time()
-    held = ngram_prefetch.hold(model, budget, variables.integer('QUANTEEZE_READ_THREADS'), q2_experts.in_memory)
+    held = ngram_prefetch.hold(model, budget, q2_experts.read_threads(path), q2_experts.in_memory)
     if held is None or not held.bytes:
         return None
     print(f'quanteeze: reading {held.bytes / 1e9:.1f} GB of the n-gram tables\' {held.total / 1e9:.1f} into '

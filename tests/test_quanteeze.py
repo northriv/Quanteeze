@@ -421,6 +421,7 @@ def test_uniform_ggml_lower_model_and_demand(tmp_path, monkeypatch, mode):
     from quanteeze import demand
 
     monkeypatch.setenv('QUANTEEZE_QUANT_CACHE', str(tmp_path / 'qcache'))
+    monkeypatch.setenv('QUANTEEZE_CPU_EXPERTS', 'off')
     mx.random.seed(303)
     sw_stock = SwitchGLU(input_dims=256, hidden_dims=256, num_experts=8, bias=False)
     for proj in ('gate_proj', 'up_proj', 'down_proj'):
@@ -1338,10 +1339,12 @@ def test_cli_experts_gguf_flag(tmp_path, monkeypatch):
         serve._experts_gguf((2, 64))
 
 
-def test_host_copy_whole_and_by_rows(tmp_path):
+def test_host_copy_whole_and_by_rows(tmp_path, monkeypatch):
     """`HostCopy` holds whole tensors (`by_rows=False`) or equal per-layer row slices (`by_rows=True`)."""
     import mlx.nn as nn
     from quanteeze import demand, q2_experts
+
+    monkeypatch.setenv('QUANTEEZE_CPU_EXPERTS', 'off')
 
     mx.random.seed(13)
     tensors = {}
@@ -1385,7 +1388,7 @@ def test_host_copy_whole_and_by_rows(tmp_path):
         assert whole.rows(layer1_name) is None
         d_whole = demand.Demand(make_model(), ckpt, budget_bytes=1, workers=1)
         assert d_whole._host() is None
-        d_whole._pool.shutdown(wait=True)
+        d_whole.close()
     finally:
         q2_experts.let_go(tmp_path)
 
@@ -1401,7 +1404,7 @@ def test_host_copy_whole_and_by_rows(tmp_path):
         assert by_rows.rows(sample_name, [8]) is None
         d_rows = demand.Demand(make_model(), ckpt, budget_bytes=1, workers=1)
         assert d_rows._host() is by_rows
-        d_rows._pool.shutdown(wait=True)
+        d_rows.close()
     finally:
         q2_experts.let_go(tmp_path)
 
@@ -1413,6 +1416,7 @@ def test_uniform_bf16_on_demand_cached_checkpoint_and_host_copy(tmp_path, monkey
     from quanteeze import demand, q2_experts
 
     monkeypatch.setenv('QUANTEEZE_QUANT_CACHE', str(tmp_path / 'qcache'))
+    monkeypatch.setenv('QUANTEEZE_CPU_EXPERTS', 'off')
     mx.random.seed(404)
     tensors = {}
     for layer in range(2):
@@ -1556,11 +1560,13 @@ def test_idle_false_during_host_copy_and_clean_shutdown_helpers(tmp_path, monkey
     assert exc_ungraceful.value.code == 128 + signal.SIGTERM
 
 
-def test_demand_batched_place_many_and_ring_staging(tmp_path):
+def test_demand_batched_place_many_and_ring_staging(tmp_path, monkeypatch):
     """`Demand` updates all missed slots in one `place_many` batch, updates `_local` in place, wraps
     `_STAGE_RING` cleanly over many decode steps, and matches stock `SwitchGLU` bit-for-bit."""
     import mlx.nn as nn
     from quanteeze import demand, q2_experts
+
+    monkeypatch.setenv('QUANTEEZE_CPU_EXPERTS', 'off')
 
     mx.random.seed(505)
     tensors = {}

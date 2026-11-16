@@ -114,6 +114,10 @@ CHOICES = {
     'QUANTEEZE_CUDA_EXPERTS': ('on', 'off'),
     'QUANTEEZE_CUDA_ROUTER': ('on', 'off'),
     'QUANTEEZE_NUMPY_HUGE_PAGES': ('on', 'off'),
+    'QUANTEEZE_CPU_EXPERTS': ('auto', 'on', 'off'),
+    'QUANTEEZE_CPU_PRIORITY': ('auto', 'idle', 'nice', 'normal', 'wake'),
+    'QUANTEEZE_HOST_EXPERTS_BY': ('auto', 'rows', 'layers'),
+    'QUANTEEZE_PARALLEL': ('auto', 'layers', 'off'),
 }
 
 _SOURCE = {}
@@ -267,6 +271,10 @@ def check(name, value):
         return f'a number, or {" or ".join(WORDS)} (the default is {setting.default})'
     if value and name in CHOICES and value not in CHOICES[name]:
         return f'one of {", ".join(CHOICES[name])}'
+    if value and name in ('QUANTEEZE_READ_THREADS', 'QUANTEEZE_CPU_THREADS') and value.lower() != 'auto' and not (
+        value.isdigit() and int(value) > 0
+    ):
+        return 'a positive whole number or auto'
     if value and name == 'QUANTEEZE_PROMPT_MOE_TOKENS' and value.lower() not in WORDS and not (
         value.isdigit() and int(value) > 0
     ):

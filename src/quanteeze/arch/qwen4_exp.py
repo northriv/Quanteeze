@@ -116,6 +116,8 @@ class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
         return _weighted(self._experts(block, x, indices), scores, shared)
 
     def _experts(self, block, x, indices):
+        if getattr(block.switch_mlp, 'demand', None) is not None:
+            return block.switch_mlp(x, indices)
         from .. import cuda_experts
         return cuda_experts.switch_glu(self, block.switch_mlp, x, indices)
 

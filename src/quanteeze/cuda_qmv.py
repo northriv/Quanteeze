@@ -26,6 +26,8 @@ input in shared memory: a row of 10240 had waited on its 20 steps one after anot
 qz_qmv8_row, MLX's 8-bit qmv (8 inputs a lane a step of 256, each weight exactly to bfloat16, times
 its scale and plus its bias rounded there, multiply-added in float32).
 """
+# Portions of the CUDA kernel arithmetic and layout below are adapted from Apple MLX
+# (Copyright © 2023-2026 Apple Inc., MIT License — see LICENSE).
 import sys
 from functools import lru_cache
 

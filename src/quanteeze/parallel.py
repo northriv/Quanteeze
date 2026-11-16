@@ -51,14 +51,19 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import variables
+from . import fitting, guards, q2_experts, variables
 
 GROUP = [None]       # the NCCL group of the ranks, once init() made it
 _OWNED = [None]      # this rank's decoder layer range, once split() made it
 _PEERS = []          # rank 0: a connection to each other rank, in order; the others: the one to rank 0
 _SENT = {}           # rank 0: the variables as last sent
 _LAST = [None]       # the last collective this rank issued (_collective)
-_LAYER = re.compile(r'(?:^|\.)(?:language_model\.)?model\.layers\.(\d+)\.')
+_LAYER = re.compile(r'^(?:language_model\.)?(?:model\.)?layers\.(\d+)\.')
+_STACKED_EXPERT = re.compile(
+    r'^(?:language_model\.)?(?:model\.)?layers\.(\d+)\.(.+)\.(gate_proj|up_proj|down_proj)\.(weight|scales?|biases)$'
+)
+_VISION_PREFIXES = ('vision.', 'aligner.', 'vision_tower.', 'model.visual.', 'visual.', 'model.vision_tower.')
+_EMBED_KEYS = ('embed.weight', 'model.embed_tokens.weight', 'language_model.model.embed_tokens.weight')
 SHARED = ('QUANTEEZE_', 'MLX_VLM_')         # the variables rank 0 hands on as they change
 OWN = ('QUANTEEZE_PARALLEL', 'QUANTEEZE_CONTROL_TOKEN')    # but these, each rank's
 
@@ -98,29 +103,160 @@ def _gpus():
     return out
 
 
-def sizes(path):
+def _gpus_with_free():
+    """[(name, total_bytes, free_bytes)] for GPUs this process may use, or `[]` when unavailable."""
+    try:
+        out = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,uuid,memory.total,memory.free', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = [[f.strip() for f in line.split(',')] for line in out.splitlines() if line.count(',') == 3]
+    gpus = [(uuid, int(total) << 20, int(free) << 20, index) for index, uuid, total, free in found]
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible is None:
+        return [(uuid, total, free) for uuid, total, free, _ in gpus]
+    out = []
+    for name in (v.strip() for v in visible.split(',') if v.strip()):
+        match = [g for g in gpus if name in (g[3], g[0]) or (name.startswith('GPU-') and g[0].startswith(name))]
+        if match:
+            out.append((name, match[0][1], match[0][2]))
+    return out
+
+
+def _bits_target():
+    raw = (variables.get('QUANTEEZE_BITS') or '').strip().lower()
+    if raw in ('', 'off'):
+        return None
+    if raw in ('mxfp4', *fitting.GGML_MODES):
+        return raw
+    if raw.isdigit():
+        return int(raw)
+    return None
+
+
+def _flag_value(argv, name):
+    for i, a in enumerate(argv or ()):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(name + '='):
+            return a.partition('=')[2]
+    return None
+
+
+def _experts_gguf_path(argv=None):
+    raw = _flag_value(argv, '--experts-gguf') or variables.get('QUANTEEZE_EXPERTS_GGUF')
+    if not raw or raw.strip().lower() == 'off':
+        return None
+    return Path(raw).expanduser()
+
+
+def _config_meta(path):
+    import json
+    cfg_path = Path(path) / 'config.json'
+    if not cfg_path.is_file():
+        return {}
+    try:
+        return json.loads(cfg_path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _tensor_elements(dtype, shape, scales_shape, q_bits, q_group):
+    import math
+    lead = math.prod(shape[:-1]) if len(shape) > 1 else 1
+    cols = shape[-1]
+    if dtype in ('BF16', 'F16', 'F32'):
+        return lead * cols
+    if dtype in ('I8', 'U8'):
+        if scales_shape and cols * 2 == scales_shape[-1] * 32:
+            return lead * cols * 2
+        return lead * cols * (2 if q_bits == 4 else 1)
+    if dtype == 'U32':
+        if scales_shape and q_group:
+            return lead * scales_shape[-1] * int(q_group)
+        return lead * cols * (32 // int(q_bits or 4))
+    return lead * cols
+
+
+def sizes(path, experts_gguf=None):
     """({decoder layer: bytes}, bytes of the rest) of the language model in the checkpoint at
-    `path`, from its safetensors headers (an MTP head's left out: it is the drafter's; so is the
-    n-gram table of a view whose config names a ple_storage manifest, read from the host's memory
-    or the disk, never the GPU's: 5.75 GB of Flash-Next's layer 1)."""
+    `path`, from its safetensors headers, accounting for off-GPU tables, `QUANTEEZE_BITS`, and
+    `--experts-gguf` / `QUANTEEZE_EXPERTS_GGUF`."""
     import json
     import struct
-    config = json.loads((Path(path) / 'config.json').read_text()) if (Path(path) / 'config.json').is_file() else {}
-    off_gpu = bool((config.get('text_config') or {}).get('ple_storage') or config.get('ple_storage'))
+    config = _config_meta(path)
+    text_cfg = config.get('text_config') or {}
+    model_type = config.get('model_type') or text_cfg.get('model_type')
+    off_gpu = bool(text_cfg.get('ple_storage') or config.get('ple_storage'))
+    quant_cfg = config.get('quantization') or text_cfg.get('quantization') or {}
+    q_bits = quant_cfg.get('bits')
+    q_group = quant_cfg.get('group_size')
+    v41_img = (variables.get('QUANTEEZE_V41_READS_IMAGES') or 'on').strip().lower()
+    skip_embed = model_type == 'deepseek_v41' or (variables.get('QUANTEEZE_EMBED_SSD') or '').strip().lower() == 'on'
+    skip_vision = (
+        (model_type == 'deepseek_v41' and v41_img in ('off', 'ssd'))
+        or (variables.get('QUANTEEZE_VISION_SSD') or '').strip().lower() == 'on'
+    )
+    gguf_path = Path(experts_gguf).expanduser() if experts_gguf is not None else _experts_gguf_path()
+    target_bits = None if gguf_path is not None else _bits_target()
+
     layers, rest = {}, 0
+    headers = []
+    all_shapes = {}
     for file in sorted(Path(path).glob('*.safetensors')):
         with open(file, 'rb') as f:
             n = struct.unpack('<Q', f.read(8))[0]
             header = json.loads(f.read(n))
+        headers.append(header)
         for key, tensor in header.items():
-            if key == '__metadata__' or 'mtp' in key.split('.') or (off_gpu and '.ple_embedding.' in key):
+            if key != '__metadata__':
+                all_shapes[key] = tuple(tensor['shape'])
+
+    for header in headers:
+        for key, tensor in header.items():
+            if key == '__metadata__' or 'mtp' in key.split('.') or '.engram.embed.' in key:
                 continue
+            if off_gpu and '.ple_embedding.' in key:
+                continue
+            if skip_embed and key in _EMBED_KEYS:
+                continue
+            if skip_vision and key.startswith(_VISION_PREFIXES):
+                continue
+
+            shape = tuple(tensor['shape'])
+            pm = q2_experts.PER_EXPERT_RE.match(key)
+            sm = None if pm else (_STACKED_EXPERT.match(key) if len(shape) >= 3 else None)
+            if pm or sm:
+                layer_idx = int((pm or sm).group(2 if pm else 1))
+                part = (pm.group(6) if pm else sm.group(4))
+                if gguf_path is not None:
+                    continue
+                if target_bits is not None:
+                    if part == 'weight':
+                        if pm:
+                            skey_s = key.rsplit('.', 1)[0] + '.scales'
+                            skey_1 = key.rsplit('.', 1)[0] + '.scale'
+                            scales_shape = all_shapes.get(skey_s) or all_shapes.get(skey_1)
+                        else:
+                            scales_shape = all_shapes.get(key.rsplit('.', 1)[0] + '.scales')
+                        elems = _tensor_elements(tensor['dtype'], shape, scales_shape, q_bits, q_group)
+                        layers[layer_idx] = layers.get(layer_idx, 0) + int(fitting.quantized_bytes(elems, target_bits))
+                    continue
+
             nbytes = tensor['data_offsets'][1] - tensor['data_offsets'][0]
             m = _LAYER.search(key)
             if m:
                 layers[int(m.group(1))] = layers.get(int(m.group(1)), 0) + nbytes
             else:
                 rest += nbytes
+
+    if gguf_path is not None:
+        from . import gguf_experts
+        eg = gguf_experts.ExpertGGUF(gguf_path)
+        for layer_idx, name in eg.routed(layers=True):
+            layers[layer_idx] = layers.get(layer_idx, 0) + eg.nbytes(name)
     return layers, rest
 
 
@@ -137,12 +273,7 @@ def bounds(layer_bytes, n):
 
 
 def _model_argument(argv):
-    for i, a in enumerate(argv):
-        if a == '--model' and i + 1 < len(argv):
-            return argv[i + 1]
-        if a.startswith('--model='):
-            return a.partition('=')[2]
-    return None
+    return _flag_value(argv, '--model')
 
 
 def plan(argv, gpus=None):
@@ -153,10 +284,14 @@ def plan(argv, gpus=None):
     if mode not in ('auto', 'layers'):
         raise SystemExit(f'quanteeze: QUANTEEZE_PARALLEL is auto, layers or off, not {mode!r} '
                          '(experts apart over the GPUs is not yet)')
-    gpus = _gpus() if gpus is None else gpus
     want = (variables.get('QUANTEEZE_GPUS') or 'auto').strip().lower()
+    if gpus is None:
+        entries = _gpus_with_free() or [(n, t, t) for n, t in _gpus()]
+    else:
+        entries = [(g[0], g[1], g[2] if len(g) > 2 else g[1]) for g in gpus]
     if want != 'auto':
-        gpus = gpus[:int(want)]
+        entries = entries[:int(want)]
+    gpus = [(n, t) for n, t, _ in entries]
     model = _model_argument(argv)
     why = None
     if len(gpus) < 2:
@@ -167,16 +302,29 @@ def plan(argv, gpus=None):
         if mode == 'layers':
             raise SystemExit(f'quanteeze: QUANTEEZE_PARALLEL=layers: {why}')
         return None, why
-    from . import fitting
-    share = variables.number('QUANTEEZE_WORKING_SET_SHARE')
-    room = min(total for _, total in gpus) * share * (1 - fitting.reserve())
-    layer_bytes, rest = sizes(Path(model).expanduser())
+    model_path = Path(model).expanduser()
+    config = _config_meta(model_path)
+    model_type = config.get('model_type') or (config.get('text_config') or {}).get('model_type')
+    if model_type and model_type not in _ADAPTERS:
+        msg = f'{model_type!r} cannot be split over GPUs yet (quanteeze.parallel knows {sorted(_ADAPTERS)})'
+        if mode == 'layers':
+            raise SystemExit(f'quanteeze: {msg}')
+        return None, msg
+    share = guards.working_set_share()
+    if not variables.is_set('QUANTEEZE_MEMORY_RESERVE') and model_type in fitting.RESERVE_ON_CUDA:
+        reserve = fitting.RESERVE_ON_CUDA[model_type]
+    else:
+        reserve = fitting.reserve()
+    usable = min((free if share is None else total * share) for _, total, free in entries)
+    room = usable * (1 - reserve)
+    layer_bytes, rest = sizes(model_path, experts_gguf=_experts_gguf_path(argv))
     whole = sum(layer_bytes.values()) + rest
     order = [layer_bytes.get(i, 0) for i in range(max(layer_bytes, default=-1) + 1)]
     cut = bounds(order, len(gpus))
     most = max(sum(order[cut[r]:cut[r + 1]]) for r in range(len(gpus))) + rest
+    share_label = 'auto' if share is None else f'{share:g}'
     said = (f'{whole / 1e9:.1f} GB of weights, {room / 1e9:.1f} GB of room a GPU (QUANTEEZE_WORKING_SET_SHARE '
-            f'{share:g}, QUANTEEZE_MEMORY_RESERVE {fitting.reserve():g})')
+            f'{share_label}, QUANTEEZE_MEMORY_RESERVE {reserve:g})')
     if mode == 'auto' and whole <= room:
         return None, f'{said}: one GPU holds it'
     if most > room:
@@ -360,16 +508,21 @@ def _handing(cls):
     return type(cls.__name__, (cls,), {'__call__': __call__, 'quanteeze_hands_on': True})
 
 
-def _qwen4_exp(model, own):
+def _qwen4_exp(model, holder, layers, cut, own, ends):
     """Flash-Next: the masks made from this rank's first full-attention and linear layers'
     caches (the model's first of each may be another rank's), and the batch-invariant forward,
     which calls a layer's parts itself, passing over an absent layer and handing on after a
     run's last."""
     from mlx_vlm.models.qwen4_exp import language as q4
-    inner = model.language_model.model
+    for i, layer in enumerate(layers):
+        if i not in own:
+            layers[i] = Absent(layer.is_linear, i in ends)
+        elif i in ends:
+            layer.__class__ = _handing(type(layer))
+    holder.layers = layers
     try:
-        inner.fa_idx = next(i for i in own if not inner.layers[i].is_linear)
-        inner.ssm_idx = next(i for i in own if inner.layers[i].is_linear)
+        holder.fa_idx = next(i for i in own if not holder.layers[i].is_linear)
+        holder.ssm_idx = next(i for i in own if holder.layers[i].is_linear)
     except StopIteration:
         raise SystemExit(f'quanteeze: rank {rank()}\'s layers {own.start}-{own.stop - 1} lack a full-attention or '
                          'a linear layer, whose caches the masks are made from: fewer GPUs (QUANTEEZE_GPUS)')
@@ -387,7 +540,166 @@ def _qwen4_exp(model, own):
     forward._layer = _layer
 
 
-_ADAPTERS = {'qwen4_exp': _qwen4_exp}
+class _AbsentAttn:
+    indexer = None
+
+
+class _GlmAbsent(Absent):
+    """Absent `glm5_next` decoder layer forwarding `(hidden, topk)` tuple."""
+
+    def __init__(self, hands_on):
+        super().__init__(False, hands_on)
+        self.block_type = 'absent'
+        self.self_attn = _AbsentAttn()
+        self.mlp = None
+        self.engram = None
+
+    def __call__(self, h, mask=None, cache=None, prev_topk_indices=None, *args, **kwargs):
+        return (hand_on(h, False), None) if self.hands_on else (h, prev_topk_indices)
+
+
+def _glm_handing(cls):
+    """`glm5_next` decoder layer subclass handing its hidden output across ranks."""
+    def __call__(self, *args, **kwargs):
+        h, topk = cls.__call__(self, *args, **kwargs)
+        return hand_on(h, True), topk
+    return type(cls.__name__, (cls,), {'__call__': __call__, 'quanteeze_hands_on': True})
+
+
+def _glm5_next(model, holder, layers, cut, own, ends):
+    """GLM-5.3: verify the rank's first full-attention layer owns an indexer and wrap layers."""
+    first_attn = next((i for i in own if not getattr(layers[i], 'is_linear', False)), None)
+    if first_attn is not None and getattr(getattr(layers[first_attn], 'self_attn', None), 'indexer', None) is None:
+        raise SystemExit(
+            f'quanteeze: rank {rank()}\'s layers {own.start}-{own.stop - 1} start attention at layer {first_attn}, '
+            'which shares top-k indices from an earlier rank: fewer GPUs (QUANTEEZE_GPUS)'
+        )
+    for i, layer in enumerate(layers):
+        if i not in own:
+            layers[i] = _GlmAbsent(i in ends)
+        elif i in ends:
+            layer.__class__ = _glm_handing(type(layer))
+    holder.layers = layers
+
+
+def _v41_hand_on(h, pre_mix, entry, next_cut, run_start, config, n_layers, owner):
+    """Hand `deepseek_v41` hidden states, pre-mix, and any cross-rank KV/indexer state across ranks."""
+    h = hand_on(h, owner)
+    pre_mix = hand_on(pre_mix, owner)
+    if (
+        0 < next_cut < n_layers
+        and entry is not None
+        and config.compress_ratios[next_cut] > 0
+        and next_cut not in config.kv_source_layer_ids
+    ):
+        s = max((k for k in config.kv_source_layer_ids if k < next_cut), default=None)
+        if s is not None:
+            rows = entry.rows if hasattr(entry, 'rows') else [entry]
+            b = 1 if hasattr(entry, 'rows') else h.shape[0]
+            width = h.shape[1]
+            ratio = config.compress_ratios[s]
+            need_kv = run_start <= s < next_cut
+            cand_id = config.candidate_source_layer_id
+            need_cand = 0 <= cand_id < next_cut and run_start <= cand_id < next_cut
+            idx_s = (
+                None if next_cut in config.index_source_layer_ids
+                else max((k for k in config.index_source_layer_ids if k < next_cut), default=None)
+            )
+            need_topk = idx_s is not None and run_start <= idx_s < next_cut
+            if need_kv or need_cand or need_topk:
+                for r_idx, row in enumerate(rows):
+                    start, stop = entry._bounds(r_idx, width) if hasattr(entry, '_bounds') else (0, width)
+                    if start == stop:
+                        continue
+                    seqlen = stop - start
+                    start_pos, end_pos = row.offset, row.offset + seqlen
+                    comp_len = end_pos // ratio
+                    n_latent = comp_len - (start_pos // ratio)
+                    if need_kv:
+                        if n_latent > 0:
+                            pkv = hand_on(
+                                row.compress[s][:, -n_latent:].astype(h.dtype)
+                                if owner else mx.zeros((b, n_latent, config.head_dim), dtype=h.dtype),
+                                owner,
+                            )
+                            ik = hand_on(
+                                row.keys[s][:, -n_latent:].astype(h.dtype)
+                                if owner else mx.zeros((b, n_latent, config.index_head_dim), dtype=h.dtype),
+                                owner,
+                            )
+                            if not owner:
+                                row.append_compressed(s, pkv)
+                                row.append_index_keys(s, ik)
+                        if not owner:
+                            row.compress_kv = row.compress[s]
+                            row.index_k = row.keys[s]
+                    if need_cand:
+                        cand_len = end_pos // config.compress_ratios[cand_id]
+                        if cand_len > 0:
+                            cand = hand_on(
+                                row.candidates.astype(mx.int32)
+                                if owner else mx.zeros((b, seqlen, cand_len), dtype=mx.int32),
+                                owner,
+                            )
+                            if not owner:
+                                row.candidates = cand.astype(mx.bool_)
+                    if need_topk:
+                        idx_len = end_pos // config.compress_ratios[idx_s]
+                        if idx_len > 0:
+                            tk = min(config.index_topk, idx_len)
+                            t_idxs = hand_on(
+                                row.topk_idxs if owner else mx.zeros((b, seqlen, tk), dtype=mx.int32),
+                                owner,
+                            )
+                            if not owner:
+                                row.topk_idxs = t_idxs
+    return h, pre_mix
+
+
+class _V41Absent(Absent):
+    """Absent `deepseek_v41` block forwarding `(h, pre_mix)` and receiving cross-rank cache state."""
+
+    def __init__(self, hands_on, next_cut=0, run_start=0, config=None, n_layers=0):
+        super().__init__(False, hands_on)
+        self.engram = None
+        self.next_cut = next_cut
+        self.run_start = run_start
+        self.config = config
+        self.n_layers = n_layers
+
+    def __call__(self, h, pre_mix, image_mask=None, cache=None, *args, **kwargs):
+        if not self.hands_on:
+            return h, pre_mix
+        return _v41_hand_on(h, pre_mix, cache, self.next_cut, self.run_start, self.config, self.n_layers, False)
+
+
+def _v41_handing(cls, next_cut, run_start, config, n_layers):
+    """`deepseek_v41` block subclass handing `h`, `pre_mix`, and shared cache state to later ranks."""
+    def __call__(self, h, pre_mix, image_mask=None, cache=None, *args, **kwargs):
+        out_h, out_mix = cls.__call__(self, h, pre_mix, image_mask, cache, *args, **kwargs)
+        return _v41_hand_on(out_h, out_mix, cache, next_cut, run_start, config, n_layers, True)
+    return type(cls.__name__, (cls,), {'__call__': __call__, 'quanteeze_hands_on': True})
+
+
+def _deepseek_v41(model, holder, layers, cut, own, ends):
+    """DeepSeek V4.1: wrap absent/boundary blocks with cross-rank state and compressed-KV handoffs."""
+    config = getattr(holder, 'config', None) or getattr(model, 'config', None)
+    n_layers = len(layers)
+    runs = {cut[r + 1] - 1: (cut[r], cut[r + 1]) for r in range(len(cut) - 1) if cut[r + 1] > cut[r]}
+    for i, layer in enumerate(layers):
+        if i not in own:
+            if i in ends:
+                run_start, next_cut = runs[i]
+                layers[i] = _V41Absent(True, next_cut, run_start, config, n_layers)
+            else:
+                layers[i] = _V41Absent(False)
+        elif i in ends:
+            run_start, next_cut = runs[i]
+            layer.__class__ = _v41_handing(type(layer), next_cut, run_start, config, n_layers)
+    holder.layers = layers
+
+
+_ADAPTERS = {'qwen4_exp': _qwen4_exp, 'glm5_next': _glm5_next, 'deepseek_v41': _deepseek_v41}
 
 
 def split(model):
@@ -399,30 +711,29 @@ def split(model):
     from mlx_vlm.models.cache import ArraysCache
 
     from . import arch
-    kind = getattr(model.config, 'model_type', None)
+    config = getattr(model, 'config', None) or getattr(model, 'args', None)
+    kind = getattr(config, 'model_type', None) if config is not None else None
     if kind not in _ADAPTERS:
         raise SystemExit(f'quanteeze: {kind!r} cannot be split over GPUs yet (quanteeze.parallel knows '
                          f'{sorted(_ADAPTERS)})')
     lm = arch.language_model(model)
-    inner = lm.model
-    layers = list(inner.layers)
-    cut = bounds([sum(v.nbytes for _, v in tree_flatten(layer.parameters())) for layer in layers], size())
+    holder = lm.model if getattr(lm, 'model', None) is not None and hasattr(lm.model, 'layers') else lm
+    layers = list(holder.layers)
+    cut = bounds(
+        [sum(v.nbytes for k, v in tree_flatten(layer.parameters()) if arch.ROW_BY_ROW not in k) for layer in layers],
+        size(),
+    )
     own = range(cut[rank()], cut[rank() + 1])
-    ends = {b - 1 for b in cut[1:]}
-    for i, layer in enumerate(layers):
-        if i not in own:
-            layers[i] = Absent(layer.is_linear, i in ends)
-        elif i in ends:
-            layer.__class__ = _handing(type(layer))
-    inner.layers = layers
-    _ADAPTERS[kind](model, own)
+    ends = {b - 1 for b in cut[1:] if b > 0}
+    _ADAPTERS[kind](model, holder, layers, cut, own, ends)
     make_cache = lm.make_cache
 
     def own_caches():
         caches = make_cache()
-        for i, layer in enumerate(layers):
-            if isinstance(layer, Absent):
-                caches[i] = ArraysCache(0)
+        if len(caches) == len(layers) and kind != 'deepseek_v41':
+            for i, layer in enumerate(layers):
+                if isinstance(layer, Absent):
+                    caches[i] = ArraysCache(0)
         return caches
     lm.make_cache = own_caches
     print(f'quanteeze: rank {rank()} of {size()}: layers {own.start}-{own.stop - 1} of {len(layers)} '

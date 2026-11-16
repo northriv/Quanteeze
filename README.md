@@ -151,7 +151,7 @@ curl http://127.0.0.1:8765/v1/chat/completions \
 
 ### Linux（NVIDIA GPU）のクイックスタート
 
-Linux + NVIDIA GPU 環境でもそのまま動きます。MoE エキスパートが GPU の VRAM に入りきらない場合、Quanteeze は空いている**メインメモリ（ホスト RAM）**にエキスパートや PLE / Engram テーブル（PLE はピン留め対応）を自動キャッシュし、PCIe 経由で GPU に転送しながら推論できます。また複数の GPU がある場合は `QUANTEEZE_PARALLEL=auto` で自動的にレイヤー並列を行います。
+Linux + NVIDIA GPU 環境でもそのまま動きます。MoE エキスパートが GPU の VRAM に入りきらない場合、Quanteeze は空いている**メインメモリ（ホスト RAM）**にエキスパートや PLE / Engram テーブル（PLE はピン留め対応）を自動キャッシュし（統合メモリ型 CUDA GPU や `/dev/shm` 上では重複確保を自動回避）、PCIe 経由で GPU に転送しながら推論できます。また `g++` が利用可能な AVX2 / AVX-512 ホストでは、`QUANTEEZE_CPU_EXPERTS=auto`（既定）により 1 トークンデコード時のホスト RAM 常駐ミスを GPU 常駐エキスパートと並行して GPU と同一 NUMA ノードの CPU 側（`cpuset` 内での自動譲歩＋バッチジョブ時は通常優先度）で自動計算します。また複数の GPU がある場合は `QUANTEEZE_PARALLEL=auto` で `qwen4_exp`・`glm5_next`・`deepseek_v41` を自動的にレイヤー並列で分割配信します。
 
 **1. 必要なもの**
 
@@ -284,7 +284,7 @@ Apple Silicon MacBook Pro（128 GB Unified Memory / M5 Max / 内蔵 SSD）で、
 - **MTP & DSpark 投機的デコーディング（`QUANTEEZE_MTP`）**
   - チェックポイント付属の MTP ヘッドや DeepSeek V4.1 の信頼度ゲート付き DSpark ヘッドで複数トークンを先読みし、1 トークンずつのデコードとビット一致する `QUANTEEZE_MTP_EXACT=bits`、またはより高速な `distribution` モードで検証します。
 - **マルチ GPU レイヤー並列（`QUANTEEZE_PARALLEL`）**
-  - 単一 GPU に収まらないチェックポイントを認識済みの複数 GPU に自動でレイヤー分割します（`QUANTEEZE_PARALLEL=auto`）。
+  - 単一 GPU に収まらないチェックポイント（`qwen4_exp`・`glm5_next`・`deepseek_v41`）を、`QUANTEEZE_BITS` や `--experts-gguf` のサイズ縮減および実際の GPU 空き VRAM に応じて複数 GPU へ自動でレイヤー分割します（`QUANTEEZE_PARALLEL=auto`）。
 - **省 RSS・ロックフリーのホストプールアロケータ（[kamepoolalloc](https://github.com/northriv/kamepoolalloc)、`QUANTEEZE_ALLOCATOR`）**
   - 同梱の [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)（`rss-zero-loss` ブランチ）を macOS（`DYLD_INSERT_LIBRARIES`）および Linux（`LD_PRELOAD`）で自動ビルド・プリロードします。
   - 小〜中サイズのホスト割り当て（`16 B .. 32 KiB`）をロックフリーなスレッドごとのフリーリストから遅延 1 ページ確保で供給して未接触ページの RSS 上昇を抑え、SSD 読み込み用の一時スライスバッファ（`32 KiB .. 32 MiB`）を再利用して `mmap`/`munmap` のオーバーヘッドを減らし、モデル切り替えやメモリ回収時に自動でトリムします。
@@ -324,10 +324,11 @@ uv run python -m quanteeze.variables --markdown
 | `QUANTEEZE_QUANT_CACHE` | 未設定 | 量子化済みエキスパート重みを保存し、再起動時に再利用するディレクトリ。 |
 | `QUANTEEZE_FROM_SSD_GB` | 未設定 | エキスパートを SSD からオンデマンド読み込みし、メモリに保持する容量 GB（`auto` は空き容量に合わせる）。 |
 | `QUANTEEZE_LOAD_WHOLE` | 未設定 | `on` で空き容量に関わらず全重みをメモリへ読み込む。 |
-| `QUANTEEZE_HOST_EXPERTS_GB` | `auto` | CUDA 環境でホスト RAM に保持するエキスパート容量 GB（MLX safetensors / `--experts-gguf` 両対応）。 |
+| `QUANTEEZE_HOST_EXPERTS_GB` | `auto` | CUDA 環境でホスト RAM に保持するエキスパート容量 GB（MLX safetensors / `--experts-gguf` 両対応）。統合メモリ型 GPU や `/dev/shm` 上では自動無効化。 |
+| `QUANTEEZE_CPU_EXPERTS` | `auto` | `HostCopy` 常駐の 1 トークンデコードミスを PCIe 転送せず CPU で並行計算する（`auto` / `on` / `off`、`cpuset` 内の他プロセス負荷に応じて自動譲歩）。 |
 | `QUANTEEZE_PREFILL_LAYERS` | `16384` | SSD ストリーミング時、この長さ以下のプロンプトを 1 レイヤーずつプリフィル処理する。 |
 | `QUANTEEZE_DEMAND_PROMPT_GB` | `2` | オンデマンドプリフィル時に一時的な GPU メモリへまとめて読むエキスパートの上限 GB。 |
-| `QUANTEEZE_READ_THREADS` | `4` | オンデマンド SSD 読み込みに使うスレッド数。 |
+| `QUANTEEZE_READ_THREADS` | `auto` | オンデマンド読込に使うスレッド数（`auto`: ローカル SSD では 4、Lustre/GPFS/NFS 等では 16）。 |
 
 ### メモリ・オフロード・ハードウェア保護
 
@@ -335,6 +336,10 @@ uv run python -m quanteeze.variables --markdown
 |---|---|---|
 | `QUANTEEZE_ALLOCATOR` | `auto` | 同梱 [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)（`rss-zero-loss`）の自動ビルド・プリロード（`auto` / `on` / `off`）。 |
 | `QUANTEEZE_MEMORY_RESERVE` | `0.3` | KV キャッシュや推論用バッファのために GPU/Metal 作業領域から差し引いておく割合。 |
+| `QUANTEEZE_CPU_THREADS` | `auto` | CPU エキスパート計算のワーカースレッド数（`auto`: GPU 直結 NUMA ノードの物理コア数から予約コアを除き上限 24 で各物理コアに固定）。 |
+| `QUANTEEZE_CPU_PRIORITY` | `auto` | CPU エキスパートワーカーの優先度（`auto`: SLURM/PBS 等バッチジョブ時は `normal`・それ以外は `idle`、`idle` / `nice` / `normal` / `wake`）。 |
+| `QUANTEEZE_CPU_MIN_THREADS` | `4` | CPU エキスパートオフロードを実行する最小スレッド数（下回ると PCIe 転送側へフォールバック）。 |
+| `QUANTEEZE_CPU_YIELD_AT` | `25` | `QUANTEEZE_CPU_EXPERTS=auto` 時に他プロセスの CPU 使用率（%）がこの値以上で即座にワーカーを停止。 |
 | `QUANTEEZE_COMPACT` | `off` | `on` で `NGRAM_SSD=on`、`VISION_SSD=on`、`EMBED_SSD=on`、`V41_READS_IMAGES=ssd`、`MTP=off` を一括有効化しエキスパート用メモリを最大化（`QUANTEEZE_COMPACT_KEEP` で個別に除外可能）。 |
 | `QUANTEEZE_NGRAM_SSD` | `auto` | PLE / Engram n-gram テーブルの SSD 行単位ストリーミング（`auto` / `on` / `off`）。 |
 | `QUANTEEZE_HOST_NGRAM_GB` | `auto` | CUDA 環境でホスト RAM に常駐させる n-gram テーブル容量 GB。 |

@@ -422,7 +422,7 @@ class QuantCache:
 
     def _rows(self, paths, experts):
         if self._pool is None:
-            self._workers = max(1, variables.integer('QUANTEEZE_READ_THREADS'))
+            self._workers = q2_experts.read_threads(paths[0] if paths else self.path)
             self._pool = ThreadPoolExecutor(self._workers, thread_name_prefix='quant-cache')
         for header in [self._pool.submit(self._header, path) for path in paths if path not in self._headers]:
             header.result()

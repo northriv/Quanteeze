@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -253,7 +254,7 @@ class Demand:
     """On-demand expert streaming manager across all MoE layers of `model`."""
 
     def __init__(self, model, checkpoint, budget_bytes, workers=4, prompt_room=None):
-        from . import cuda_ple, fitting
+        from . import cpu_experts, cuda_ple, fitting
         self.checkpoint = checkpoint
         self.base = checkpoint.base if isinstance(checkpoint, requant.Flat) else checkpoint
         self.workers = max(1, int(workers))
@@ -265,6 +266,15 @@ class Demand:
         self._decode_steps = 0
         self._after_prefill = False
         self.trimmed = 0
+        self._cpu_mode = cpu_experts.cpu_setting()
+        self._cpu = None
+        self._cpu_why = None
+        self._cpu_load = cpu_experts.Load(cpu_experts.default_threads()).start() if self._cpu_mode == 'auto' else None
+        self._cpu_status = []
+        self._cpu_counts = []
+        self.cpu_served = 0
+        self.cpu_late = 0
+        self.cpu_wait_ms = 0.0
 
         layers = arch.decoder_layers(model)
         moe_indices = [i for i, l in enumerate(layers) if arch.switch_of(l) is not None]
@@ -392,6 +402,301 @@ class Demand:
             return None
         held = self.base.held()
         return held if held is not None and held.by_rows else None
+
+    def _cpu_allowed(self):
+        """Worker threads currently permitted for CPU expert offload (`0` when disabled or yielded)."""
+        if self._cpu_why is not None or self._cpu_mode == 'off':
+            return 0
+        if self._cpu_mode == 'auto':
+            return int(self._cpu_load.allowed()) if self._cpu_load is not None else 0
+        return self._cpu.pool.threads if self._cpu is not None else 1
+
+    def _flush_cpu_counts(self):
+        """Evaluate accumulated CUDA `CPU_WAIT` status telemetry into scalar counters."""
+        if self._cpu_status:
+            self._cpu_counts.append(mx.sum(mx.stack(self._cpu_status)[:, 1::2], axis=0))
+            self._cpu_status = []
+        if self._cpu_counts:
+            totals = mx.sum(mx.stack(self._cpu_counts), axis=0)
+            mx.eval(totals)
+            self.cpu_late += int(totals[0].item())
+            self.cpu_wait_ms += float(totals[1].item()) / 1e3
+            self._cpu_counts = []
+            if self.cpu_late > 0 and self._cpu_why is None:
+                self._cpu_why = 'CPU expert server timed out'
+
+    def _step_cpu(self):
+        """Fold the previous step's CPU statuses asynchronously and refresh allowed worker count."""
+        if self._cpu_status:
+            late = mx.sum(mx.stack(self._cpu_status)[:, 1::2], axis=0)
+            mx.async_eval(late)
+            self._cpu_counts.append(late)
+            self._cpu_status = []
+            if len(self._cpu_counts) >= 16:
+                self._flush_cpu_counts()
+        if self._cpu is not None:
+            allowed = self._cpu_allowed()
+            self._cpu.active = allowed
+            if self._cpu.server is not None:
+                self._cpu.server.active(allowed)
+
+    def _cpu_layer(self, layer, switch, hidden_dim, host):
+        """Ensure the CPU worker pool/server are started and `layer` is registered, or return False."""
+        from . import cpu_experts, cuda_kernels
+        if self._cpu_why is not None or self._cpu_mode == 'off' or host is None or not self._has_tensor_table():
+            return False
+        if self._cpu is not None:
+            if layer in self._cpu.layers:
+                return True
+            if layer in self._cpu.declined:
+                return False
+
+        act_name = type(switch.activation).__name__
+        if 'SwiGLU' not in act_name:
+            if self._cpu is not None:
+                self._cpu.declined.add(layer)
+            return False
+        weighs = bool(getattr(switch, 'weighs', False))
+        activation = 'deepseek_v41' if (weighs or act_name == 'DeepseekV41SwiGLU') else 'plain'
+        limit = float(getattr(switch.activation, 'limit', 0.0) or 0.0)
+
+        arrays, groups = [], {}
+        layer_kind, layer_bits = None, None
+        for p in PROJECTIONS:
+            p_mode = self.base.mode(layer, p) or 'affine'
+            if p_mode not in ('affine', 'mxfp4'):
+                if self._cpu is not None:
+                    self._cpu.declined.add(layer)
+                return False
+            out_d, in_d = _proj_dims(getattr(switch, p))
+            if p_mode == 'affine':
+                if not (self.base.has(layer, p, 'weight') and self.base.has(layer, p, 'scales')
+                        and self.base.has(layer, p, 'biases')):
+                    return False
+                gs, bits = self.base.quantization(layer, p, in_d)
+                w_st = self.base.tensors[self.base.name(layer, p, 'weight')][1]
+                s_st = self.base.tensors[self.base.name(layer, p, 'scales')][1]
+                b_st = self.base.tensors[self.base.name(layer, p, 'biases')][1]
+                if (bits not in (2, 4, 8) or gs <= 0 or in_d % gs or in_d % (32 // bits)
+                        or w_st != 'U32' or s_st != 'BF16' or b_st != 'BF16'):
+                    return False
+            else:
+                if not (self.base.has(layer, p, 'weight') and self.base.has(layer, p, 'scales')) or self.base.has(
+                    layer, p, 'biases'
+                ):
+                    return False
+                gs, bits = self.base.quantization(layer, p, in_d)
+                w_st = self.base.tensors[self.base.name(layer, p, 'weight')][1]
+                s_st = self.base.tensors[self.base.name(layer, p, 'scales')][1]
+                if bits != 4 or gs != 32 or in_d % 32 or w_st not in ('U32', 'I8', 'U8') or s_st not in ('U8', 'F8_E8M0'):
+                    return False
+            if p == 'gate_proj' and activation == 'deepseek_v41' and out_d % 32:
+                return False
+            if layer_kind is None:
+                layer_kind, layer_bits = p_mode, bits
+            elif (layer_kind, layer_bits) != (p_mode, bits):
+                return False
+            groups[p] = gs
+            for part in NAMES:
+                if not self.base.has(layer, p, part):
+                    continue
+                t_name = self.base.name(layer, p, part)
+                arr = host.arrays.get(t_name)
+                if arr is None or arr.shape[0] == 0:
+                    return False
+                arrays.append((p, part, arr))
+
+        spec = cpu_experts.layer_spec(arrays, groups, layer_kind, layer_bits)
+        try:
+            if self._cpu is None:
+                if cpu_experts.lib() is None or cpu_experts.isa() is None:
+                    raise ValueError('CPU experts C++ library failed to build')
+                if cpu_experts.openblas_one_thread():
+                    print('quanteeze: numpy OpenBLAS held to 1 thread alongside CPU expert workers',
+                          file=sys.stderr, flush=True)
+                pool = cpu_experts.Pool()
+                if self._cpu_load is not None:
+                    self._cpu_load.threads = pool.threads
+                rng = np.random.default_rng(0)
+                n_held = int(next(iter(spec['arrays']['gate_proj'].values())).shape[0])
+                for slot in range(cpu_experts.CHECKS):
+                    xs = rng.normal(0, 1, hidden_dim).astype(np.float32)
+                    if pool.expert(cpu_experts.layer_expert(spec, slot % n_held), xs) is None and cpu_experts.verified()[1]:
+                        pool.close()
+                        raise ValueError(cpu_experts.verified()[1])
+                active_init = self._cpu_load.allowed() if self._cpu_load is not None else pool.threads
+                on_cuda = cuda_kernels.available() and not mx.metal.is_available()
+                try:
+                    server = cpu_experts.Server(pool, self.moe_indices, hidden_dim) if on_cuda else None
+                except Exception:
+                    pool.close()
+                    raise
+                if server is not None:
+                    server.active(active_init)
+                self._cpu = SimpleNamespace(
+                    pool=pool, server=server, layers=set(), specs={}, declined=set(),
+                    active=active_init,
+                )
+                where = (f'server thread on CPUs {server.cpus}' if server is not None else 'direct pool')
+                print(
+                    f'quanteeze: decode misses in host memory computed on the CPU '
+                    f'(QUANTEEZE_CPU_EXPERTS={self._cpu_mode}): {pool.threads} workers on CPUs {pool.cpus}, '
+                    f'{where}, {cpu_experts.ISA_NAMES[pool.isa]}',
+                    file=sys.stderr, flush=True,
+                )
+            if self._cpu.server is not None:
+                self._cpu.server.add(layer, spec, limit, activation)
+                self._cpu.server.start()
+            self._cpu.specs[layer] = (spec, limit, activation)
+            self._cpu.layers.add(layer)
+            return True
+        except (ValueError, OSError) as e:
+            self._cpu_why = f'{type(e).__name__}: {e}'
+            print(f'quanteeze: CPU expert offload off ({self._cpu_why})', file=sys.stderr, flush=True)
+            return False
+
+    def _load_disk_missing(self, layer, switch, disk_victims, disk_missing):
+        """Read `disk_missing` experts from disk using `_pool` and place them into `disk_victims`."""
+        for start in range(0, len(disk_victims), self.workers):
+            batch_slots = disk_victims[start:start + self.workers]
+            batch_exps = disk_missing[start:start + len(batch_slots)]
+            futures = [
+                self._pool.submit(self._read_one, layer, e, w_idx)
+                for w_idx, e in enumerate(batch_exps)
+            ]
+            results = [fut.result() for fut in futures]
+            batch_exps_done = [int(r[0]) for r in results]
+            if len(results) == 1:
+                batch_arrays = results[0][1]
+            else:
+                batch_arrays = {
+                    p: [
+                        None if results[0][1][p][i] is None
+                        else mx.concatenate([r[1][p][i] for r in results], axis=0)
+                        for i in range(len(NAMES))
+                    ]
+                    for p in PROJECTIONS
+                }
+            batch_written = switch.place_many(batch_slots, batch_exps_done, batch_arrays)
+            if batch_written:
+                mx.eval(batch_written)
+
+    def _cpu_offload(self, layer, switch, x, indices, scores, ids, active_ids, present_mask, missing, host, in_host):
+        """Compute `in_host` decode misses on CPU in parallel with GPU-resident experts, or return None."""
+        from . import cpu_experts
+        if (x.ndim != 3 or x.shape[0] != 1 or x.shape[1] != 1
+                or x.dtype not in (mx.bfloat16, mx.float16, mx.float32)):
+            return None
+        if self._cpu_allowed() <= 0 or not self._cpu_layer(layer, switch, int(x.shape[-1]), host):
+            return None
+        c = self._cpu
+        cpu_exps = in_host[:cpu_experts.SERVE_MMAX]
+        cpu_pos = {int(e): i for i, e in enumerate(cpu_exps.tolist())}
+        if switch.weighs:
+            req_exps, inv_list, handled = [], [], set()
+            for e in ids.tolist():
+                if e in cpu_pos and len(req_exps) < cpu_experts.SERVE_MMAX:
+                    inv_list.append(len(req_exps))
+                    req_exps.append(e)
+                    handled.add(e)
+                else:
+                    inv_list.append(-1)
+            if not req_exps:
+                return None
+        else:
+            inv_list = [cpu_pos.get(int(e), -1) for e in ids.tolist()]
+            req_exps = cpu_exps.tolist()
+            handled = set(req_exps)
+
+        gpu_missing = np.array([int(e) for e in missing.tolist() if int(e) not in handled], dtype=np.int64)
+        gpu_in_host = np.array([int(e) for e in in_host.tolist() if int(e) not in handled], dtype=np.int64)
+        if gpu_missing.size:
+            free_mask = np.ones(switch.experts.size, dtype=bool)
+            if present_mask.any():
+                free_mask[switch.route[active_ids[present_mask]]] = False
+            cand = np.flatnonzero(free_mask)
+            victims = cand[np.argsort(self.weight[layer][switch.experts[cand]], kind='stable')[:gpu_missing.size]]
+            self._drain_layer_inflight(layer)
+            written = []
+            ring = None
+            if gpu_in_host.size:
+                ring, copied = self._stage_host_experts(layer, gpu_in_host)
+                written = switch.place_many(victims[:gpu_in_host.size], gpu_in_host, copied)
+            disk_victims = victims[gpu_in_host.size:]
+            gpu_in_host_set = set(gpu_in_host.tolist())
+            disk_missing = np.array([int(e) for e in gpu_missing.tolist() if int(e) not in gpu_in_host_set],
+                                    dtype=np.int64)
+            if disk_missing.size == 0:
+                if written:
+                    self._stage_inflight[ring] = (layer, written)
+                    del written
+            else:
+                if written:
+                    mx.eval(written)
+                    written.clear()
+                self._load_disk_missing(layer, switch, disk_victims, disk_missing)
+
+        req_slots = host.slot_of[layer][np.asarray(req_exps, dtype=np.int64)].astype(np.int32)
+        inv = np.asarray(inv_list, dtype=np.int32)
+        weights = scores if switch.weighs else None
+        has_gpu_slots = bool((inv < 0).any())
+
+        if c.server is not None:
+            rows_mx = mx.array(req_slots, dtype=mx.int32)
+            inv_mx = mx.array(inv, dtype=mx.int32)
+            token = cpu_experts.cpu_ask(c.server.addr[layer], x, rows_mx, inv_mx, weights)
+            if has_gpu_slots:
+                y_gpu = expert_qmv.decode(switch, x, switch._local_indices(indices), weights)
+            else:
+                y_gpu = mx.zeros((1, 1, int(ids.size), int(x.shape[-1])), dtype=x.dtype)
+            out, status = cpu_experts.cpu_wait(c.server.addr[layer], token, y_gpu, inv_mx, most=int(req_slots.size))
+            mx.async_eval(out, status)
+            self._cpu_status.append(status)
+        else:
+            if has_gpu_slots:
+                y_gpu = expert_qmv.decode(switch, x, switch._local_indices(indices), weights)
+                mx.async_eval(y_gpu)
+            xf = np.array(x.astype(mx.float32)).reshape(-1)
+            w_np = np.array(scores.astype(mx.float32)).reshape(-1) if switch.weighs else None
+            spec, limit, activation = c.specs[layer]
+            computed = []
+            for m, slot in enumerate(req_slots.tolist()):
+                w_val = 1.0
+                if switch.weighs and w_np is not None:
+                    for j, iv in enumerate(inv_list):
+                        if iv == m:
+                            w_val = float(w_np[j])
+                            break
+                res = c.pool.expert(cpu_experts.layer_expert(spec, int(slot)), xf, limit, w_val, activation)
+                if res is None:
+                    self._cpu_why = cpu_experts.verified()[1] or 'CPU expert computation failed'
+                    return None
+                computed.append(res)
+            stacked = np.stack(computed, axis=0)
+            valid_inv = np.where(inv >= 0, inv, 0)
+            cpu_y = mx.array(stacked[valid_inv]).astype(x.dtype).reshape(1, 1, int(ids.size), int(x.shape[-1]))
+            out = mx.where(mx.array(inv >= 0).reshape(1, 1, -1, 1), cpu_y, y_gpu) if has_gpu_slots else cpu_y
+
+        self.host_served += int(gpu_in_host.size + len(handled))
+        self.cpu_served += int(len(handled))
+        return out
+
+    def _close_cpu(self):
+        """Flush telemetry and stop the CPU worker pool, polling server, and load monitor."""
+        self._flush_cpu_counts()
+        if self._cpu is not None:
+            try:
+                mx.synchronize()
+            except Exception:
+                pass
+            if self._cpu.server is not None:
+                self._cpu.server.close()
+            if self._cpu.pool is not None:
+                self._cpu.pool.close()
+            self._cpu = None
+        if self._cpu_load is not None:
+            self._cpu_load.close()
+            self._cpu_load = None
 
     def _drain_layer_inflight(self, layer):
         """Ensure any async stage write targeting `layer` has completed and been cleared so bank
@@ -888,6 +1193,8 @@ class Demand:
                 return y
 
         active_ids = needed
+        if is_decode and layer == self.moe_indices[0]:
+            self._step_cpu()
 
         present_mask = switch.route[active_ids] >= 0
         self.hits += int(present_mask.sum())
@@ -898,6 +1205,21 @@ class Demand:
             t0 = time.perf_counter()
             host = self._host()
             in_host = host.held_in(layer, missing) if host is not None else missing[:0]
+            if is_decode and in_host.size:
+                out = self._cpu_offload(
+                    layer, switch, x, indices, scores, ids, active_ids, present_mask, missing, host, in_host
+                )
+                if out is not None:
+                    self.read_s += time.perf_counter() - t0
+                    if layer == self.moe_indices[-1]:
+                        self._decode_steps += 1
+                        if self._after_prefill or self._decode_steps % 64 == 0:
+                            self._after_prefill = False
+                            self._room_back()
+                    return out
+                present_mask = switch.route[active_ids] >= 0
+                missing = active_ids[~present_mask]
+                in_host = host.held_in(layer, missing) if host is not None else missing[:0]
             if in_host.size:
                 missing = np.concatenate([in_host, missing[~np.isin(missing, in_host)]])
             free_mask = np.ones(switch.experts.size, dtype=bool)
@@ -925,29 +1247,7 @@ class Demand:
                 if written:
                     mx.eval(written)
                     written.clear()
-                for start in range(0, len(disk_victims), self.workers):
-                    batch_slots = disk_victims[start:start + self.workers]
-                    batch_exps = disk_missing[start:start + len(batch_slots)]
-                    futures = [
-                        self._pool.submit(self._read_one, layer, e, w_idx)
-                        for w_idx, e in enumerate(batch_exps)
-                    ]
-                    results = [fut.result() for fut in futures]
-                    batch_exps_done = [int(r[0]) for r in results]
-                    if len(results) == 1:
-                        batch_arrays = results[0][1]
-                    else:
-                        batch_arrays = {
-                            p: [
-                                None if results[0][1][p][i] is None
-                                else mx.concatenate([r[1][p][i] for r in results], axis=0)
-                                for i in range(len(NAMES))
-                            ]
-                            for p in PROJECTIONS
-                        }
-                    batch_written = switch.place_many(batch_slots, batch_exps_done, batch_arrays)
-                    if batch_written:
-                        mx.eval(batch_written)
+                self._load_disk_missing(layer, switch, disk_victims, disk_missing)
             if in_host.size:
                 self.host_served += int(in_host.size)
             elapsed = time.perf_counter() - t0
@@ -972,8 +1272,9 @@ class Demand:
         return out
 
     def summary(self):
+        self._flush_cpu_counts()
         total = self.hits + self.misses
-        return {
+        out = {
             'slots': self.slots,
             'num_experts': self.num_experts,
             'hits': self.hits,
@@ -985,9 +1286,23 @@ class Demand:
             'host_served': self.host_served,
             'trimmed': self.trimmed,
         }
+        if self._cpu is not None or self.cpu_served or self._cpu_why is not None:
+            out['cpu_served'] = self.cpu_served
+            out['cpu_late'] = self.cpu_late
+            out['cpu_wait_ms'] = round(self.cpu_wait_ms, 2)
+            if self._cpu is not None and self._cpu.server is not None:
+                c = self._cpu.server.counts()
+                out['cpu_requests'] = c['requests']
+                out['cpu_experts'] = c['experts']
+                out['cpu_failed'] = c['failed']
+                out['cpu_ms'] = round(c['compute_ns'] / 1e6, 2)
+            if self._cpu_why is not None:
+                out['cpu_off'] = self._cpu_why
+        return out
 
     def close(self):
         from . import cuda_ple
+        self._close_cpu()
         self._prefill_active = None
         for _, np_view, adv in self._prefill_stage.values():
             if adv:

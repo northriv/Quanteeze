@@ -11,6 +11,8 @@ the first CHECKS times a shape is met, each kernel's output is compared bit for 
 and it serves the shape only if they are the same.  Only a decode step of one request
 (QUANTEEZE_LINEAR_ATTN_KERNELS=off: mlx-vlm's).
 """
+# Portions of the Metal/CUDA kernel helpers below are adapted from Apple MLX
+# (Copyright © 2023-2026 Apple Inc., MIT License — see LICENSE).
 import sys
 from functools import lru_cache
 

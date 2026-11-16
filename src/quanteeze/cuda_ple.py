@@ -33,8 +33,11 @@ CHECKED = {}
 SAID = []
 PIN_SAID = []                   # what pinned() could not pin, said once each
 _DRIVER = []                    # [(libcuda, the device's primary context)] or [None]
+_INTEGRATED = []                # [bool] for CU_DEVICE_ATTRIBUTE_INTEGRATED on device 0
+_PCI_BUS_ID = []                # [str | None] lowercase PCI BDF of CUDA device 0
 _EXITING = []
 
+_CU_DEVICE_ATTRIBUTE_INTEGRATED = 18
 PORTABLE_DEVICEMAP = 0x01 | 0x02    # CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP
 Table = namedtuple('Table', 'starts pointers shards group_size strides')
 
@@ -158,6 +161,10 @@ def _driver():
                 cuda.cuCtxPopCurrent_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
                 if hasattr(cuda, 'cuMemAdvise'):
                     cuda.cuMemAdvise.argtypes = [ctypes.c_uint64, ctypes.c_size_t, ctypes.c_int, ctypes.c_int]
+                if hasattr(cuda, 'cuDeviceGetAttribute'):
+                    cuda.cuDeviceGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+                if hasattr(cuda, 'cuDeviceGetPCIBusId'):
+                    cuda.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
                 found = (cuda, context)
         except (OSError, AttributeError):
             pass
@@ -188,6 +195,62 @@ def gpu_room():
     finally:
         cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
     return int(free.value), max(0, int(reserved.value) - int(used.value))
+
+
+def integrated():
+    """Whether CUDA device 0 is an integrated GPU sharing physical memory with the host."""
+    if _INTEGRATED:
+        return _INTEGRATED[0]
+    if mx.metal.is_available() or not cuda_kernels.available():
+        _INTEGRATED.append(False)
+        return False
+    found = _driver()
+    if found is None:
+        _INTEGRATED.append(False)
+        return False
+    cuda, _ = found
+    result = False
+    try:
+        device, val = ctypes.c_int(), ctypes.c_int()
+        if (
+            hasattr(cuda, 'cuDeviceGetAttribute')
+            and not cuda.cuDeviceGet(ctypes.byref(device), 0)
+            and not cuda.cuDeviceGetAttribute(ctypes.byref(val), _CU_DEVICE_ATTRIBUTE_INTEGRATED, device.value)
+        ):
+            result = bool(val.value)
+    except (AttributeError, OSError):
+        result = False
+    _INTEGRATED.append(result)
+    return result
+
+
+def pci_bus_id():
+    """Lowercase PCI bus-device-function string for CUDA device 0, or `None` when unavailable."""
+    if _PCI_BUS_ID:
+        return _PCI_BUS_ID[0]
+    if mx.metal.is_available() or not cuda_kernels.available():
+        _PCI_BUS_ID.append(None)
+        return None
+    found = _driver()
+    if found is None:
+        _PCI_BUS_ID.append(None)
+        return None
+    cuda, _ = found
+    result = None
+    try:
+        device = ctypes.c_int()
+        buf = ctypes.create_string_buffer(32)
+        if (
+            hasattr(cuda, 'cuDeviceGetPCIBusId')
+            and not cuda.cuDeviceGet(ctypes.byref(device), 0)
+            and not cuda.cuDeviceGetPCIBusId(buf, 32, device.value)
+        ):
+            text = buf.value.decode('ascii', errors='ignore').strip('\x00 \t\r\n').lower()
+            result = text or None
+    except (AttributeError, OSError):
+        result = None
+    _PCI_BUS_ID.append(result)
+    return result
 
 
 ROOM_SLACK = 1e9

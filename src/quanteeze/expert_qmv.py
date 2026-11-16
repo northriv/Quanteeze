@@ -12,6 +12,8 @@ Every shape is checked bit for bit against stock `SwitchGLU` (`stock()`) the fir
 it is met, and served by the custom kernels only when identical.  `QUANTEEZE_EXPERT_QMV=off` keeps
 stock `SwitchGLU`.
 """
+# Portions of the Metal kernel ports below are adapted from Apple MLX
+# (Copyright © 2023-2026 Apple Inc., MIT License — see LICENSE).
 from functools import lru_cache
 import inspect
 import re

@@ -551,8 +551,19 @@ def in_memory(path, mounts='/proc/mounts'):
 
 
 NETWORK = ('lustre', 'nfs', 'nfs4', 'cifs', 'smb3', 'smbfs', 'beegfs', 'gpfs', 'ceph', 'fuse.sshfs', '9p')
+LOCAL_READ_THREADS = 4
+NETWORK_READ_THREADS = 16
 
 
 def on_network(path, mounts='/proc/mounts'):
     """Whether `path` lies on a network's file system (Lustre, NFS, ...)."""
     return file_system(path, mounts) in NETWORK
+
+
+def read_threads(path=None, mounts='/proc/mounts'):
+    """Reader thread count from `QUANTEEZE_READ_THREADS` (`auto`: 16 on network FS, else 4)."""
+    from . import variables
+    raw = (variables.get('QUANTEEZE_READ_THREADS') or 'auto').strip().lower()
+    if raw == 'auto':
+        return NETWORK_READ_THREADS if (path and on_network(path, mounts)) else LOCAL_READ_THREADS
+    return max(1, int(raw))

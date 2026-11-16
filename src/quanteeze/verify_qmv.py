@@ -54,6 +54,8 @@ computes such a projection with fp_qmv_wide, whose sums go another way.  verify_
 mlx-vlm's QuantizedMultiLinear (V4.1's wo_a, each output group its own weights) a group at a
 time.  quanteeze.arch.deepseek_v41 routes its projections here in its verify passes alone.
 """
+# Portions of the Metal kernel ports below are adapted from Apple MLX
+# (Copyright © 2023-2026 Apple Inc., MIT License — see LICENSE).
 import re
 import sys
 from functools import lru_cache

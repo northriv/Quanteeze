@@ -496,6 +496,8 @@ def decode(switch, x, indices, fallback):
 def switch_glu(forward, switch, x, indices):
     """forward._switch_glu(switch, x, indices) [1, 1, k, hidden], through gate_up() and down() where
     this shape matched it."""
+    if getattr(switch, 'demand', None) is not None:
+        return switch(x, indices)
     return decode(switch, x, indices, lambda: forward._switch_glu(switch, x, indices))
 
 
