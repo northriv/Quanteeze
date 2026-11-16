@@ -2711,6 +2711,147 @@ def test_demand_short_prefill_skips_resident_experts_and_parallel_host_copy(tmp_
         q2_experts.let_go(model_dir)
 
 
+def test_demand_prefill_cap_reclaims_mlx_cache_for_in_layer_mode(tmp_path, monkeypatch):
+    """`_prefill_cap` and `end_layer_prefill` reclaim MLX's cached CUDA pool bytes so
+    uniform 4-bit stays in `in_layer_mode` across all layers instead of reloading per chunk."""
+    import mlx.nn as nn
+    from quanteeze import cuda_ple, demand, prefill, q2_experts
+
+    class DummyCache:
+        def __init__(self):
+            self.offset = 0
+            self.max_size = None
+
+    cache_state = {'bytes': 0, 'layer_bytes': 0}
+
+    class CachedSplitLayer(nn.Module):
+        def __init__(self, sw):
+            super().__init__()
+            mlp = nn.Module()
+            mlp.switch_mlp = sw
+            mlp.top_k = 4
+            self.mlp = mlp
+
+        def _pre(self, x, idx, cache=None):
+            if cache is not None:
+                if cache.offset == 0:
+                    # Simulate earlier attention buffers lingering in MLX BufferCache on layer entry
+                    cache_state['bytes'] = cache_state['layer_bytes']
+                cache.offset += x.shape[1]
+            return x, idx
+
+        def _post(self, x, idx):
+            return self.mlp.switch_mlp(x, idx).sum(axis=-2)
+
+        def __call__(self, x, idx, cache=None):
+            h, i = self._pre(x, idx, cache=cache)
+            return self._post(h, i)
+
+    class ToyLM(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.layers = layers
+
+        def make_cache(self):
+            return [DummyCache() for _ in self.layers]
+
+    prefill.split(CachedSplitLayer, CachedSplitLayer._pre, CachedSplitLayer._post)
+
+    mx.random.seed(41)
+    n_exp, d_in, d_hid = 16, 64, 64
+    tensors = {}
+    ref_layers = []
+    for l_idx in range(2):
+        sw = SwitchGLU(input_dims=d_in, hidden_dims=d_hid, num_experts=n_exp, bias=False)
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            q = getattr(sw, proj).to_quantized(group_size=64, bits=4)
+            setattr(sw, proj, q)
+            tensors[f'layers.{l_idx}.mlp.switch_mlp.{proj}.weight'] = q.weight
+            tensors[f'layers.{l_idx}.mlp.switch_mlp.{proj}.scales'] = q.scales
+            tensors[f'layers.{l_idx}.mlp.switch_mlp.{proj}.biases'] = q.biases
+        mx.eval(sw.parameters())
+        ref_layers.append(CachedSplitLayer(sw))
+    m_ref = ToyLM(ref_layers)
+
+    model_dir = tmp_path / 'u4_moe'
+    model_dir.mkdir()
+    mx.save_safetensors(str(model_dir / 'model.safetensors'), tensors)
+
+    m_ssd = ToyLM([
+        CachedSplitLayer(SwitchGLU(input_dims=d_in, hidden_dims=d_hid, num_experts=n_exp, bias=False))
+        for _ in range(2)
+    ])
+    for layer in m_ssd.layers:
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            setattr(
+                layer.mlp.switch_mlp,
+                proj,
+                getattr(layer.mlp.switch_mlp, proj).to_quantized(group_size=64, bits=4),
+            )
+
+    dem = None
+    clear_calls = []
+    try:
+        dem = demand.Demand(m_ssd, q2_experts.Checkpoint(model_dir), budget_bytes=1, workers=2, prompt_room=None)
+        assert dem.slots == 8
+
+        full_layer = dem._layer_expert_bytes(0) * n_exp
+        reserve = max(int(dem._free_least or 0), 256 << 20)
+        base_free = reserve + full_layer + (1 << 12)
+        cache_state['layer_bytes'] = full_layer
+
+        orig_clear = demand.mx.clear_cache
+
+        def fake_clear_cache():
+            clear_calls.append((len(dem._prefill_dev), cache_state['bytes']))
+            cache_state['bytes'] = 0
+            orig_clear()
+
+        def fake_gpu_room():
+            held_dev = sum(int(a.nbytes) for a in dem._prefill_dev.values())
+            return (max(0, base_free - cache_state['bytes'] - held_dev), 0)
+
+        monkeypatch.setattr(demand.mx.metal, 'is_available', lambda: False)
+        monkeypatch.setattr(cuda_ple, 'gpu_room', fake_gpu_room)
+        monkeypatch.setattr(demand.mx, 'get_cache_memory', lambda: cache_state['bytes'])
+        monkeypatch.setattr(demand.mx, 'clear_cache', fake_clear_cache)
+
+        recorded_loads = []
+        orig_load_pre = dem._load_prefill_projs
+
+        def spy_load_pre(layer, switch, expert_ids, cap_rows):
+            recorded_loads.append((layer, int(cap_rows), -1 if expert_ids is None else len(expert_ids)))
+            return orig_load_pre(layer, switch, expert_ids, cap_rows)
+
+        dem._load_prefill_projs = spy_load_pre
+
+        prefill.install(m_ssd.layers, chunk=16, enabled=lambda: True)
+        prompt_len = 48
+        x_pre = mx.random.normal((1, prompt_len, d_in)).astype(mx.bfloat16)
+        idx_pre = mx.array((np.arange(prompt_len * 4, dtype=np.uint32).reshape(1, prompt_len, 4)) % n_exp)
+        mx.eval(x_pre, idx_pre)
+
+        c_ref, c_ssd = m_ref.make_cache(), m_ssd.make_cache()
+        h_ref, h_ssd = x_pre, x_pre
+        for l_idx in range(2):
+            h_ref = m_ref.layers[l_idx](h_ref, idx_pre, cache=c_ref[l_idx])
+            h_ssd = m_ssd.layers[l_idx](h_ssd, idx_pre, cache=c_ssd[l_idx])
+        mx.eval(h_ref, h_ssd)
+
+        assert mx.array_equal(h_ssd, h_ref)
+        assert dem.prefill_layers == 2
+        assert recorded_loads == [(0, n_exp, n_exp), (1, n_exp, n_exp)]
+        assert any(dev_len > 0 and prev_cache == 0 for dev_len, prev_cache in clear_calls)
+        assert any(dev_len > 0 and prev_cache == full_layer for dev_len, prev_cache in clear_calls)
+        assert len(dem._prefill_stage) == 0
+        assert len(dem._prefill_dev) == 0
+    finally:
+        prefill.release()
+        if dem is not None:
+            dem.close()
+        q2_experts.let_go(model_dir)
+
+
 def test_admission_short_lengths_wanted_and_on_demand_coalesce(monkeypatch):
     """Per-row `lengths`/`wanted` budgeting admits all short concurrent prompts (`rows == 4`),
     `admission.install` forwards `(lengths, wanted)` from `_unprocessed_sequences`, and

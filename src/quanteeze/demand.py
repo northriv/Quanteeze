@@ -485,12 +485,25 @@ class Demand:
             from . import cuda_ple
             if not self._prefill_dev:
                 mx.clear_cache()
-            room = cuda_ple.gpu_room()
-            if room is not None:
-                held_dev = sum(int(a.nbytes) for a in self._prefill_dev.values())
+            held_dev = sum(int(a.nbytes) for a in self._prefill_dev.values())
+            reserve = max(int(self._free_least or 0), 256 << 20)
+
+            def _usable_vram():
+                room = cuda_ple.gpu_room()
+                if room is None:
+                    return None
                 avail = int(room[0]) + int(room[1]) + held_dev
-                reserve = max(int(self._free_least or 0), 256 << 20)
-                usable = avail - reserve if avail > reserve else avail // 2
+                return avail - reserve if avail > reserve else avail // 2
+
+            usable = _usable_vram()
+            if usable is not None:
+                # Reclaim dead MLX cache tensors accumulated earlier in the layer (e.g. attention)
+                # so transient pool occupancy cannot push uniform 4-bit out of in_layer_mode.
+                if usable < self.num_experts * per_exp and mx.get_cache_memory() > 0:
+                    mx.clear_cache()
+                    usable = _usable_vram()
+                    if usable is None:
+                        return prompt_cap
                 vram_cap = max(8, self.slots // 2, int(usable // per_exp))
                 return min(prompt_cap, vram_cap)
         return prompt_cap
@@ -748,13 +761,8 @@ class Demand:
             del active, projs, temp, seen_set
         if switch.layer == self.moe_indices[-1]:
             self._release_prefill_buffers()
-        elif mx.metal.is_available() or mx.default_device() != mx.gpu:
-            mx.clear_cache()
         else:
-            from . import cuda_ple
-            room = cuda_ple.gpu_room()
-            if room is not None and int(room[0]) < max(int(self._free_least or 0), 256 << 20):
-                mx.clear_cache()
+            mx.clear_cache()
 
     def _read_one(self, layer, expert, worker_slot):
         with self._stream_lock:
