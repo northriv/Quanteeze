@@ -1010,7 +1010,7 @@ def run(experts, x, indices):
         n_blocks = (n + WARPS * ROWS - 1) // (WARPS * ROWS)
         out_elems = cuda_kernels.roomy(rows * n, x.dtype)
         y = _cuda_kernel()(
-            inputs=[xs, mx.contiguous(experts.weight), _grid_for(kind), idx],
+            inputs=[xs, experts.weight, _grid_for(kind), idx],
             template=template + [('WARPS', WARPS), ('X_DIV', x_div)],
             grid=(32 * WARPS * n_blocks, rows, 1),
             threadgroup=(32 * WARPS, 1, 1),
@@ -1021,7 +1021,7 @@ def run(experts, x, indices):
     xs = mx.contiguous(mx.broadcast_to(x, shape + (1, k)).reshape(rows, k))
     idx = mx.broadcast_to(indices, shape).reshape(rows).astype(mx.int32)
     y = _kernel()(
-        inputs=[xs, mx.contiguous(experts.weight), _grid_for(kind), idx],
+        inputs=[xs, experts.weight, _grid_for(kind), idx],
         template=template,
         grid=(32, (n + ROWS - 1) // ROWS, rows),
         threadgroup=(32, 1, 1),
@@ -1092,7 +1092,7 @@ def run_switch(switch, x, indices):
     n_blocks_gu = (inner + 2 * ROWS - 1) // (2 * ROWS)
     out_gu = cuda_kernels.roomy(slots * inner, x.dtype)
     h = _cuda_gate_up()(
-        inputs=[xs, mx.contiguous(gate.weight), _grid_for(kg), mx.contiguous(up.weight), _grid_for(ku), idx],
+        inputs=[xs, gate.weight, _grid_for(kg), up.weight, _grid_for(ku), idx],
         template=[
             ('T', x.dtype), ('K_SIZE', hidden), ('N_SIZE', inner), ('X_DIV', top_k),
             ('KIND_G', kg), ('PB_G', pbg), ('BB_G', bbg), ('KB_G', hidden // pbg),
@@ -1107,7 +1107,7 @@ def run_switch(switch, x, indices):
     n_blocks_d = (hidden + WARPS * ROWS - 1) // (WARPS * ROWS)
     out_d = cuda_kernels.roomy(slots * hidden, x.dtype)
     y = _cuda_kernel()(
-        inputs=[h, mx.contiguous(dn.weight), _grid_for(kd), idx],
+        inputs=[h, dn.weight, _grid_for(kd), idx],
         template=[
             ('T', x.dtype), ('K_SIZE', inner), ('K_BLOCKS', inner // pbd), ('N_SIZE', hidden),
             ('KIND', kd), ('PB', pbd), ('BB', bbd), ('ROWS', ROWS), ('WARPS', WARPS), ('X_DIV', 1),
@@ -1190,7 +1190,7 @@ def run_rows(experts, x, indices, plan=None):
     if cuda_kernels.available() and not mx.metal.is_available():
         out_elems = cuda_kernels.roomy(m * n, x.dtype)
         y = _cuda_tiled()(
-            inputs=[mx.contiguous(xs), mx.contiguous(experts.weight), _grid_for(kind), tiles_mx],
+            inputs=[mx.contiguous(xs), experts.weight, _grid_for(kind), tiles_mx],
             template=template,
             grid=(128 * n_col_tiles, n_tiles, 1),
             threadgroup=(128, 1, 1),
@@ -1199,7 +1199,7 @@ def run_rows(experts, x, indices, plan=None):
         )[0][:m * n].reshape(m, n)
     else:
         y = _tiled()(
-            inputs=[mx.contiguous(xs), mx.contiguous(experts.weight), _grid_for(kind), tiles_mx],
+            inputs=[mx.contiguous(xs), experts.weight, _grid_for(kind), tiles_mx],
             template=template,
             grid=(128 * n_col_tiles, n_tiles, 1),
             threadgroup=(128, 1, 1),

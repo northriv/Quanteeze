@@ -71,6 +71,7 @@ class Projection(nn.Module):
 
 _STAGE_RING = 8
 _PREFILL_PAGE = 65536
+_PREFILL_WORDS = _PREFILL_PAGE // 4
 
 
 def _to_device(arr):
@@ -81,14 +82,49 @@ def _to_device(arr):
     if mx.metal.is_available() or mx.default_device() != mx.gpu:
         mx.eval(arr)
         return arr
+    if arr.ndim == 0 or arr.shape[0] == 0:
+        dst = mx.zeros(arr.shape, dtype=arr.dtype)
+        mx.eval(dst)
+        return dst
+    if arr.dtype == mx.uint8 and (arr.size // arr.shape[0]) % 4 == 0:
+        words = (arr.size // arr.shape[0]) // 4
+        dst = mx.zeros((arr.shape[0], words), dtype=mx.uint32)
+        mx.eval(dst)
+        idx = mx.arange(arr.shape[0], dtype=mx.int32)
+        dst[idx] = arr.reshape(arr.shape[0], -1).view(mx.uint32)
+        out = dst.view(mx.uint8).reshape(arr.shape)
+        del dst
+        mx.eval(out)
+        return out
     dst = mx.zeros(arr.shape, dtype=arr.dtype)
     mx.eval(dst)
-    if arr.ndim == 0 or arr.shape[0] == 0:
-        return dst
     idx = mx.arange(arr.shape[0], dtype=mx.int32)
     dst[idx] = arr
     mx.eval(dst)
     return dst
+
+
+def _place_attr(proj, attr, idx, val):
+    cur = getattr(proj, attr)
+    sh = cur.shape
+    if cur.dtype == mx.uint8 and sh[0] > 0 and (cur.size // sh[0]) % 4 == 0:
+        setattr(proj, attr, None)
+        u32 = cur.reshape(sh[0], -1).view(mx.uint32)
+        del cur
+        u32[idx] = val.reshape(val.shape[0], -1).view(mx.uint32)
+        setattr(proj, attr, u32.view(mx.uint8).reshape(sh))
+    else:
+        cur[idx] = val
+
+
+def _take_rows(arr, take_idx):
+    if arr is None:
+        return None
+    sh = arr.shape
+    if arr.dtype == mx.uint8 and sh[0] > 0 and (arr.size // sh[0]) % 4 == 0:
+        taken = mx.take(arr.reshape(sh[0], -1).view(mx.uint32), take_idx, axis=0)
+        return taken.view(mx.uint8).reshape((take_idx.size,) + sh[1:])
+    return mx.take(arr, take_idx, axis=0)
 
 
 class DemandSwitchGLU(nn.Module):
@@ -142,13 +178,13 @@ class DemandSwitchGLU(nn.Module):
         for p in PROJECTIONS:
             proj = getattr(self, p)
             w, s, b = arrays_by_proj[p]
-            proj.weight[idx] = w
+            _place_attr(proj, 'weight', idx, w)
             written.append(proj.weight)
             if s is not None and getattr(proj, 'scales', None) is not None:
-                proj.scales[idx] = s
+                _place_attr(proj, 'scales', idx, s)
                 written.append(proj.scales)
             if b is not None and getattr(proj, 'biases', None) is not None:
-                proj.biases[idx] = b
+                _place_attr(proj, 'biases', idx, b)
                 written.append(proj.biases)
 
         still_evicted = list(dict.fromkeys(
@@ -391,21 +427,27 @@ class Demand:
                 row_bytes = int(np.prod(tail, dtype=np.int64)) * np_dt.itemsize
                 used_bytes = m * row_bytes
                 need_bytes = cap * row_bytes
+                need_words = max(1, (need_bytes + 3) // 4)
                 slot_key = (p, part)
                 entry = self._stage_ring[ring].get(slot_key)
-                if entry is None or entry[0].shape[0] < need_bytes:
+                if entry is None or entry[0].shape[0] < need_words:
                     if entry is not None and entry[2]:
                         cuda_ple.advise_host_staging(entry[1], enable=False)
-                    mlx_arr = mx.zeros((need_bytes,), mx.uint8, stream=mx.cpu)
+                    mlx_arr = mx.zeros((need_words,), mx.uint32, stream=mx.cpu)
                     mx.eval(mlx_arr)
-                    np_view = np.asarray(mlx_arr)
+                    np_view = np.asarray(mlx_arr).view(np.uint8)
                     adv = cuda_ple.advise_host_staging(np_view, enable=True)
                     entry = (mlx_arr, np_view, adv)
                     self._stage_ring[ring][slot_key] = entry
                 mlx_arr, np_u8, _ = entry
                 out_view = np_u8[:used_bytes].view(np_dt).reshape((m,) + tail)
                 targets.append((t_name, out_view))
-                raw_part = mlx_arr[:used_bytes].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
+                if np_dt == np.uint32:
+                    raw_part = mlx_arr[:used_bytes // 4].reshape((m,) + tail)
+                elif (used_bytes % 4) == 0:
+                    raw_part = mlx_arr[:used_bytes // 4].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
+                else:
+                    raw_part = mlx_arr.view(mx.uint8)[:used_bytes].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
                 parts.append(q2_experts._as_mlx(raw_part, st_dtype))
             copied[p] = parts
         host = self._host()
@@ -503,11 +545,11 @@ class Demand:
                     if entry is None or entry[0] is None or entry[0].shape[0] < pages_cap:
                         if entry is not None and entry[2]:
                             cuda_ple.advise_host_staging(entry[1], enable=False)
-                        stage_u8 = mx.zeros((pages_cap, _PREFILL_PAGE), mx.uint8, stream=mx.cpu)
-                        mx.eval(stage_u8)
-                        stage_np_u8 = np.asarray(stage_u8)
+                        stage_u32 = mx.zeros((pages_cap, _PREFILL_WORDS), mx.uint32, stream=mx.cpu)
+                        mx.eval(stage_u32)
+                        stage_np_u8 = np.asarray(stage_u32).view(np.uint8)
                         adv = cuda_ple.advise_host_staging(stage_np_u8, enable=True)
-                        entry = (stage_u8, stage_np_u8, adv)
+                        entry = (stage_u32, stage_np_u8, adv)
                         self._prefill_stage[slot_key] = entry
                     np_view = entry[1].reshape(-1)[:used_bytes].view(np_dt).reshape((m,) + tail)
                 else:
@@ -554,19 +596,24 @@ class Demand:
                     parts.append(None)
                     continue
                 st_dtype, tail, np_dt, used_bytes, pages_used, pages_cap, entry, np_view = meta
-                stage_u8 = entry[0]
+                stage_u32 = entry[0]
                 if on_cuda:
-                    dev_u8 = self._prefill_dev.pop(slot_key, None)
-                    if dev_u8 is None or dev_u8.shape[0] < pages_cap:
-                        if dev_u8 is not None:
-                            dev_u8 = None
+                    dev_u32 = self._prefill_dev.pop(slot_key, None)
+                    if dev_u32 is None or dev_u32.shape[0] < pages_cap:
+                        if dev_u32 is not None:
+                            dev_u32 = None
                             mx.clear_cache()
-                        dev_u8 = mx.zeros((pages_cap, _PREFILL_PAGE), mx.uint8)
-                        mx.eval(dev_u8)
+                        dev_u32 = mx.zeros((pages_cap, _PREFILL_WORDS), mx.uint32)
+                        mx.eval(dev_u32)
                     idx = mx.arange(pages_used, dtype=mx.int32)
-                    dev_u8[idx] = stage_u8[:pages_used]
-                    self._prefill_dev[slot_key] = dev_u8
-                    raw_dev = dev_u8.reshape(-1)[:used_bytes].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
+                    dev_u32[idx] = stage_u32[:pages_used]
+                    self._prefill_dev[slot_key] = dev_u32
+                    if np_dt == np.uint32:
+                        raw_dev = dev_u32.reshape(-1)[:used_bytes // 4].reshape((m,) + tail)
+                    elif (used_bytes % 4) == 0:
+                        raw_dev = dev_u32.reshape(-1)[:used_bytes // 4].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
+                    else:
+                        raw_dev = dev_u32.view(mx.uint8).reshape(-1)[:used_bytes].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
                     parts.append(q2_experts._as_mlx(raw_dev, st_dtype))
                 else:
                     parts.append(q2_experts._as_mlx(mx.array(np_view), st_dtype))
@@ -598,8 +645,7 @@ class Demand:
             take_idx = mx.array([last_map[int(e)] for e in new_exps], dtype=mx.int32)
             stacked = {
                 p: [
-                    None if getattr(source_projs[p], part, None) is None
-                    else mx.take(getattr(source_projs[p], part), take_idx, axis=0)
+                    _take_rows(getattr(source_projs[p], part, None), take_idx)
                     for part in NAMES
                 ]
                 for p in PROJECTIONS

@@ -1004,6 +1004,15 @@ print(json.dumps(info))
     assert reexec.stderr.count(banner) == 1, f'expected single allocator banner in stderr:\n{reexec.stderr}'
 
 
+def _assert_gguf_close(got, want, rel=2e-2):
+    """Compare GGUF outputs relative to peak output magnitude, matching `gguf_qmv._checked`."""
+    g = np.asarray(got.astype(mx.float32) if hasattr(got, 'astype') else got, dtype=np.float32)
+    w = np.asarray(want.astype(mx.float32) if hasattr(want, 'astype') else want, dtype=np.float32)
+    assert g.shape == w.shape
+    scale = max(float(np.abs(w).max()), 1.0)
+    np.testing.assert_allclose(g, w, rtol=rel, atol=rel * scale)
+
+
 def _random_ggml_blocks(rng, kind, n_blocks):
     """Synthesize finite `uint8 [n_blocks, BLOCK[kind]]` ggml blocks for any supported type."""
     from quanteeze import iq_experts
@@ -1293,16 +1302,8 @@ def test_gguf_experts_dynamic_split_shards_in_memory_and_demand(tmp_path):
                 y_mem = m_mem.layers[l_idx].mlp.switch_mlp(x_in, idx_in)
                 y_ssd = m_ssd.layers[l_idx].mlp.switch_mlp(x_in, idx_in)
                 mx.eval(y_ref, y_mem, y_ssd)
-                np.testing.assert_allclose(
-                    np.array(y_mem.astype(mx.float32)),
-                    np.array(y_ref.astype(mx.float32)),
-                    rtol=2e-2, atol=2e-2,
-                )
-                np.testing.assert_allclose(
-                    np.array(y_ssd.astype(mx.float32)),
-                    np.array(y_ref.astype(mx.float32)),
-                    rtol=2e-2, atol=2e-2,
-                )
+                _assert_gguf_close(y_mem, y_ref, rel=2e-2)
+                _assert_gguf_close(y_ssd, y_ref, rel=2e-2)
         assert dem.misses >= 4
         assert dem.prefill_layers == 2
     finally:
@@ -2231,7 +2232,7 @@ extern "C" void check_load_bytes(int bb, const uint8_t* src, int nbytes, uint8_t
     want_one = mx.gather_mm(x_one, w_dec.astype(mx.bfloat16).swapaxes(-1, -2), rhs_indices=idx_one)
     mx.eval(y_one, want_one)
     assert y_one.shape == want_one.shape == (1, 1, 1, 20)
-    np.testing.assert_allclose(np.array(y_one.astype(mx.float32)), np.array(want_one.astype(mx.float32)), rtol=1e-2, atol=1e-2)
+    _assert_gguf_close(y_one, want_one, rel=1e-2)
     assert captured['qmv']['inputs'][3].shape == (4,)
     assert captured['qmv']['template']['WARPS'] == gguf_qmv.WARPS
     assert captured['qmv']['template']['X_DIV'] == 1
@@ -2486,6 +2487,8 @@ def test_gguf_experts_host_copy_and_mixed_precision_prefill(tmp_path, monkeypatc
             res = orig_load_pre(layer, switch, expert_ids, cap_rows)
             seen_stage_keys.append(set(dem._prefill_stage.keys()))
             seen_dev_keys.append(set(dem._prefill_dev.keys()))
+            assert all(v[0].dtype == mx.uint32 for v in dem._prefill_stage.values())
+            assert all(v.dtype == mx.uint32 for v in dem._prefill_dev.values())
             return res
 
         dem._load_prefill_projs = _spy_load_pre
@@ -2496,11 +2499,7 @@ def test_gguf_experts_host_copy_and_mixed_precision_prefill(tmp_path, monkeypatc
             h_mem = m_mem.layers[l_idx](h_mem, idx_pre, cache=c_mem[l_idx])
             h_ssd = m_ssd.layers[l_idx](h_ssd, idx_pre, cache=c_ssd[l_idx])
         mx.eval(h_mem, h_ssd)
-        np.testing.assert_allclose(
-            np.array(h_ssd.astype(mx.float32)),
-            np.array(h_mem.astype(mx.float32)),
-            rtol=2e-2, atol=2e-2,
-        )
+        _assert_gguf_close(h_ssd, h_mem, rel=2e-2)
         expected_slot_keys = {('gate_proj', 'weight'), ('up_proj', 'weight'), ('down_proj', 'weight')}
         assert len(seen_stage_keys) == 2 and all(k == expected_slot_keys for k in seen_stage_keys)
         assert len(seen_dev_keys) == 2 and all(k == expected_slot_keys for k in seen_dev_keys)
@@ -2524,14 +2523,40 @@ def test_gguf_experts_host_copy_and_mixed_precision_prefill(tmp_path, monkeypatc
                 ))
         for y_mem, y_ssd in lazy_pairs:
             mx.eval(y_mem, y_ssd)
-            np.testing.assert_allclose(
-                np.array(y_ssd.astype(mx.float32)),
-                np.array(y_mem.astype(mx.float32)),
-                rtol=2e-2, atol=2e-2,
-            )
+            _assert_gguf_close(y_ssd, y_mem, rel=2e-2)
         assert all(set(ring_map.keys()) <= expected_slot_keys for ring_map in dem._stage_ring)
+        assert all(v[0].dtype == mx.uint32 for ring_map in dem._stage_ring for v in ring_map.values())
         assert dem.misses > 0
         assert dem.host_served == dem.misses
+
+        # Direct in-place donation & byte-exactness check on `DemandSwitchGLU.place_many` with Q6_K uint8 bank
+        bank_np = rng.integers(0, 256, size=(16, 64, 2, 210), dtype=np.uint8)
+        upd_np = rng.integers(0, 256, size=(3, 64, 2, 210), dtype=np.uint8)
+        sw_bank = demand.DemandSwitchGLU(
+            0,
+            demand.Projection(mx.array(bank_np), None, None, 256, 6, mode='gguf:q6_k'),
+            demand.Projection(mx.array(bank_np), None, None, 256, 6, mode='gguf:q6_k'),
+            demand.Projection(mx.array(bank_np), None, None, 256, 6, mode='gguf:q6_k'),
+            np.arange(16, dtype=np.int64),
+            32,
+            nn.silu,
+            None,
+        )
+        upd_mx = {
+            p: [mx.array(upd_np), None, None]
+            for p in ('gate_proj', 'up_proj', 'down_proj')
+        }
+        mx.eval(sw_bank.parameters(), [v[0] for v in upd_mx.values()])
+        mem_before = mx.get_active_memory()
+        written = sw_bank.place_many([1, 5, 9], [20, 21, 22], upd_mx)
+        mx.eval(written)
+        del written, upd_mx
+        mem_after = mx.get_active_memory()
+        assert mem_after <= mem_before + 3 * upd_np.nbytes
+        expected_bank = bank_np.copy()
+        expected_bank[[1, 5, 9]] = upd_np
+        for p in ('gate_proj', 'up_proj', 'down_proj'):
+            np.testing.assert_array_equal(np.array(getattr(sw_bank, p).weight), expected_bank)
     finally:
         prefill.release()
         if dem is not None:
@@ -3213,7 +3238,7 @@ extern "C" void deq_mxfp4_words(const uint32_t* w, const uint8_t* scales, int n_
             ym = m_mem.layers[l_idx].mlp.switch_mlp(x_dec, idx_dec)
             yd = m_dem.layers[l_idx].mlp.switch_mlp(x_dec, idx_dec)
             mx.eval(ym, yd)
-            np.testing.assert_allclose(np.array(yd.astype(mx.float32)), np.array(ym.astype(mx.float32)), rtol=1e-2, atol=1e-2)
+            _assert_gguf_close(yd, ym, rel=1e-2)
         assert dem_gguf.host_served == 8
     finally:
         if dem_gguf is not None:
