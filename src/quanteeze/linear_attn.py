@@ -28,6 +28,46 @@ CHOICE = {}                     # (part, shape, dtype): whether it matched the o
 CHECKED = {}
 SAID = []
 
+SHARED = dict(fused=0)          # share_fused_linears(): projections now slices of their fused copy
+
+
+def share_fused_linears(ops=None):
+    """mlx-vlm fuses a gated delta layer's four input projections (in_proj_qkv, _z, _b, _a) for a
+    decode token (speculative.ops.linear._decode_quantized_linears_fused): their weights, scales
+    and biases concatenated once and kept on the first, the four kept besides for a prompt.  Both
+    stayed in memory: Flash-Next's 36 such layers held 1.6 GB twice, taken on the first request
+    from the room the experts' prompt pass had (on demand on a 16 GB GPU, a long prompt after any
+    request ran out of memory).  Here, once fused, each projection's arrays become its rows of the
+    fused ones (a slice on the first axis, a view of the same buffer): one copy, the same values,
+    and the fused copy kept, keyed to the slices, as mlx-vlm's check of it asks."""
+    if ops is None:
+        from mlx_vlm.speculative.ops import linear as ops
+    own = ops._decode_quantized_linears_fused
+    if getattr(own, '_quanteeze_shared', False):
+        return
+
+    def fused(linears, x):
+        first = linears[0] if linears else None
+        before = getattr(first, '_fused_decode_linears', None)
+        out = own(linears, x)
+        cached = getattr(first, '_fused_decode_linears', None)
+        if out is None or cached is None or cached is before:
+            return out
+        _, weights, scales, biases, splits = cached
+        bounds = [0, *splits, weights.shape[0]]
+        views = [(weights[a:b], scales[a:b], biases[a:b]) for a, b in zip(bounds, bounds[1:])]
+        mx.eval(*(v for row in views for v in row))
+        for linear, (w, s, b) in zip(linears, views):
+            linear.weight, linear.scales, linear.biases = w, s, b
+        key = tuple((id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears)
+        first._fused_decode_linears = (key, weights, scales, biases, splits)
+        SHARED['fused'] += 1
+        return out
+
+    fused._quanteeze_shared = True
+    ops._decode_quantized_linears_fused = fused
+
+
 _SIGMOID = """
 template <typename X>
 inline X mlx_sigmoid(X x) {

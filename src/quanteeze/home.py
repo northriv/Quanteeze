@@ -298,16 +298,27 @@ _PLE = {'state': 'idle', 'path': None, 'view': None, 'error': None}
 
 
 def _ple_targets(path):
-    """Where a checkpoint's view (`quanteeze.ple_store.prepare`) goes: under PLE_VIEWS, else beside it."""
+    """Where a checkpoint's view (`quanteeze.ple_store.prepare`) goes: under PLE_VIEWS, else beside it
+    (`<name>.ple-view`, or `<name>.quanteeze.ple-view` where another tool's view has that name)."""
     path = Path(path).resolve()
     name = f'{path.name}-{hashlib.sha256(str(path).encode()).hexdigest()[:8]}'
-    return [PLE_VIEWS / name, path.with_name(f'{path.name}.ple-view')]
+    return [PLE_VIEWS / name, path.with_name(f'{path.name}.ple-view'),
+            path.with_name(f'{path.name}.quanteeze.ple-view')]
+
+
+def _is_view(target):
+    """Whether `target` is a view made whole whose manifest this server reads (ple_store.readable)."""
+    from . import ple_store
+    return ((target / 'EXTERNAL_PLE.json').is_file() and (target / 'config.json').is_file()
+            and ple_store.readable(target))
 
 
 def ple_view(path):
-    """The checkpoint's view whose table is read from the SSD, when one was made whole; else None."""
+    """The checkpoint's view whose table is read from the SSD, when one was made whole; else None.
+    A directory in its place that is not such a view (another tool's, its manifest in a format of
+    its own) is passed over."""
     for target in _ple_targets(path):
-        if (target / 'EXTERNAL_PLE.json').is_file() and (target / 'config.json').is_file():
+        if _is_view(target):
             return target
     return None
 
@@ -319,6 +330,9 @@ def _make_view(path, prepare=None):
     prepare = prepare or ple_store.prepare
     errors = []
     for target in _ple_targets(path):
+        if target.exists() and not _is_view(target):
+            errors.append(f'{target}: there already, not a view this server reads')
+            continue
         part = target.with_name(f'{target.name}.part-{os.getpid()}')
         try:
             shutil.rmtree(part, ignore_errors=True)
@@ -346,6 +360,9 @@ def ngram_source(path, prepare=None):
     named = (path / 'EXTERNAL_PLE.json').is_file()
     if named:
         source = Path(json.loads((path / 'EXTERNAL_PLE.json').read_text()).get('source_model') or path)
+        if not _is_view(path) and source != path and (source / 'config.json').is_file():
+            # another tool's view, its manifest in a format of its own: its checkpoint served instead
+            path, named = source, False
     try:
         table = ple_info(source)
     except (ValueError, OSError, KeyError):

@@ -158,6 +158,35 @@ def write_rows(view, chunk_rows=131_072, data_file='ple.rows'):
     return m
 
 
+MLX_VLM_VERSION = 2      # mlx-vlm's QuantizedMMapNGramEmbedding.MANIFEST_VERSION, where it cannot be imported
+MLX_VLM_FIELDS = ('version', 'source_root', 'row_width', 'quantization')
+
+
+def readable(view):
+    """Whether the view at `view` names a manifest the model's table can be read from: this module's
+    (`format: quanteeze_ple_v1`), or mlx-vlm's own at the version it reads.  A view another tool made,
+    in a format of its own, is not: a load of it would fail on its manifest."""
+    view = Path(view)
+    try:
+        config = json.loads((view / 'config.json').read_text())
+        name = ((config.get('text_config') or config).get('ple_storage') or {}).get('manifest')
+        m = json.loads((view / name).read_text()) if name else None
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+    if not isinstance(m, dict):
+        return False
+    if m.get('format') == FORMAT:
+        return True
+    if 'format' in m or any(k not in m for k in MLX_VLM_FIELDS):
+        return False
+    try:
+        from mlx_vlm.models.qwen4_exp.ple_storage import QuantizedMMapNGramEmbedding
+        version = QuantizedMMapNGramEmbedding.MANIFEST_VERSION
+    except Exception:
+        version = MLX_VLM_VERSION
+    return m['version'] == version
+
+
 def prepare(source, target, rows=False, cache_rows=0):
     """A view of the checkpoint at `source`, at `target` (empty or new, on the same volume): every
     file but the n-gram table's arrays, hard-linked or copied, and the table read from the SSD as

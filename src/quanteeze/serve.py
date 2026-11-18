@@ -1269,6 +1269,11 @@ def main():
     qwen4_exp.COMPILE[0] = not variables.off('QUANTEEZE_COMPILE_DECODE')
     qwen4_exp.EVAL_LAYERS[0] = variables.integer('QUANTEEZE_EVAL_LAYERS')
     linear_attn.ON[0] = not variables.off('QUANTEEZE_LINEAR_ATTN_KERNELS')
+    try:
+        linear_attn.share_fused_linears()
+    except (ImportError, AttributeError) as error:
+        print(f'quanteeze: gated delta projections kept apart from their fused copy ({error})',
+              file=sys.stderr, flush=True)
     sigmoid_router.ON[0] = not variables.off('QUANTEEZE_SIGMOID_ROUTER_KERNELS')
     glm_indexer.ON[0] = not variables.off('QUANTEEZE_INDEXER_KERNEL')
     linear_attn.DELTA[0] = not variables.off('QUANTEEZE_CUDA_DELTA')

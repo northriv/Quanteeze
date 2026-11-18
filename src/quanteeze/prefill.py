@@ -398,8 +398,11 @@ def widen(batch_cls, tokens):
 
     def prompt_step(self):
         own = self.prefill_step_size
+        # A prompt the prompt cache (APC) took part of comes right-padded, [0] for its one row: no
+        # padding, stepped as any other (else every warm prompt went through the model 512 tokens a
+        # step, each layer reading the experts its tokens meet, past the GPU's room on demand).
         if (not own or tokens <= own or len(self.uids) != 1
-                or getattr(self, '_right_pad_per_row', None) is not None or not SETTINGS.enabled()):
+                or any(getattr(self, '_right_pad_per_row', None) or ()) or not SETTINGS.enabled()):
             return step(self)
         SETTINGS.chunk, self.prefill_step_size = own, tokens
         try:
