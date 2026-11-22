@@ -248,16 +248,44 @@ def _init(self, path, cache_rows=None):
             raise ValueError(f'{data}: {data.stat().st_size} bytes, not {self.row_count} rows of {stride}')
         self._interleaved = _random(np.memmap(data, dtype=np.uint8, mode='r', shape=(self.row_count, stride)))
     else:
+        files = {}
         for shard in m['shards']:
             start, count = int(shard['row_start']), int(shard['row_count'])
-            arrays = {p: _random(np.memmap(source / shard[p]['file'], dtype=DTYPES[d], mode='r',
-                                           offset=int(shard[p]['offset']), shape=tuple(shard[p]['shape'])))
-                      for p, d, _ in self._tensors}
+            arrays = {
+                p: _within(files, source / shard[p]['file'], DTYPES[d], int(shard[p]['offset']),
+                           tuple(shard[p]['shape']))
+                for p, d, _ in self._tensors
+            }
             self._shards.append((start, start + count, arrays))
     self.cache_rows = int(m.get('cache_rows', 0) if cache_rows is None else cache_rows)
     self._cache = OrderedDict()
     self._lookups = self._rows = self._hits = self._misses = self._bytes = 0
     self._elapsed = 0.0
+
+
+def _within(files, file, dtype, offset, shape, advise=True):
+    """Map `file` once per file via `quanteeze.mapped.view` and return a typed view at `offset`."""
+    from . import mapped
+    first = Path(file) not in files
+    out = mapped.view(files, file, dtype, offset, shape)
+    if first and advise:
+        _random(files[Path(file)])
+    return out
+
+
+def _shared(self):
+    """Collapse per-shard/tensor memmaps from mlx-vlm's loader into views of one mapping per file."""
+    files = {}
+    for k, (start, end, arrays) in enumerate(getattr(self, '_shards', None) or []):
+        if all(isinstance(a, np.memmap) and a.filename for a in arrays.values()):
+            self._shards[k] = (
+                start,
+                end,
+                {
+                    name: _within(files, Path(a.filename), a.dtype, int(a.offset), a.shape, advise=False)
+                    for name, a in arrays.items()
+                },
+            )
 
 
 def _random(table):
@@ -367,7 +395,8 @@ def install(cls=None):
         if json.loads(Path(manifest_path).read_text()).get('format') == FORMAT:
             return _init(self, manifest_path, cache_rows)
         self._generic = None
-        return own_init(self, manifest_path, cache_rows=cache_rows)
+        own_init(self, manifest_path, cache_rows=cache_rows)
+        _shared(self)
 
     def read(self, row_ids):
         return (_read_rows if getattr(self, '_generic', None) else own_read)(self, row_ids)

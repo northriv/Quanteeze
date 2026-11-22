@@ -618,8 +618,9 @@ def fused(switch, x, indices):
 
 
 def eligible(switch, x, indices):
-    if not (x.ndim == 3 and x.shape[0] == 1 and 1 <= x.shape[1] <= verify_qmv.MAX_TOKENS
-            and x.dtype in (mx.bfloat16, mx.float16)):
+    if not (x.ndim == 3 and x.dtype in (mx.bfloat16, mx.float16)
+            and ((x.shape[0] == 1 and 1 <= x.shape[1] <= verify_qmv.MAX_TOKENS)
+                 or (x.shape[1] == 1 and 1 <= x.shape[0] <= verify_qmv.MAX_TOKENS))):
         return False
     gp = switch.gate_proj
     bits = getattr(gp, 'bits', None)
@@ -629,11 +630,11 @@ def eligible(switch, x, indices):
     kept = switch.__dict__.get('_expert_qmv')
     if kept is None or kept[0] != stamp:
         d = x.shape[-1]
-        ok = bits in (1, 2, 4, 8) and gp.weight.shape[-1] * 32 // bits == d
+        ok = bits in (1, 2, 4, 8) and gp.weight.ndim == 3 and gp.weight.shape[-1] * 32 // bits == d
         if ok:
             for p in (switch.gate_proj, switch.up_proj, switch.down_proj):
                 p_mode = getattr(p, 'mode', 'affine')
-                if not applies(p, p.weight.shape[-1] * 32 // p.bits) or (p_mode == 'affine' and p.scales.dtype != x.dtype):
+                if p.weight.ndim != 3 or not applies(p, p.weight.shape[-1] * 32 // p.bits) or (p_mode == 'affine' and p.scales.dtype != x.dtype):
                     ok = False
                     break
         kept = (stamp, ok, (int(bits or 0), int(gs or 0), mode))
@@ -646,13 +647,15 @@ def key(switch, x, indices, weighed=False):
     info = kept[2] if kept else (int(getattr(switch.gate_proj, 'bits', 0)),
                                  int(getattr(switch.gate_proj, 'group_size', 0)),
                                  getattr(switch.gate_proj, 'mode', 'affine'))
-    return (x.shape[1], indices.shape[-1], x.shape[-1], x.dtype, info, weighed)
+    t_key = x.shape[1] if x.shape[0] == 1 else (x.shape[0], x.shape[1])
+    return (t_key, indices.shape[-1], x.shape[-1], x.dtype, info, weighed)
 
 
 def own(switch, x, indices, weights=None):
-    """A `SwitchGLU`'s experts for `x [1, T, D]` on `indices [1, T, k]`: `[1, T, k, D]`, with
-    each expert's weights read once across the `T` tokens routed to it."""
-    t, k, d = x.shape[1], indices.shape[-1], x.shape[-1]
+    """A `SwitchGLU`'s experts for `x [B, T, D]` on `indices [B, T, k]`: `[B, T, k, D]`, with
+    each expert's weights read once across the `B * T` tokens routed to it."""
+    b0, t0, k, d = x.shape[0], x.shape[1], indices.shape[-1], x.shape[-1]
+    t = b0 * t0
     rows = mx.broadcast_to(x.reshape(t, 1, d), (t, k, d)).reshape(t * k, d)
     idx = indices.astype(mx.int32).reshape(-1)
     per = t if ROWS[0] is None else max(1, min(t, ROWS[0]))
@@ -662,7 +665,7 @@ def own(switch, x, indices, weights=None):
         gate, up = run(switch.gate_proj, rows, idx, per), run(switch.up_proj, rows, idx, per)
     hidden = switch.activation(up, gate) if weights is None else \
         switch.activation(up, gate, weights.reshape(t * k, 1))
-    return run(switch.down_proj, hidden, idx, per).reshape(1, t, k, d)
+    return run(switch.down_proj, hidden, idx, per).reshape(b0, t0, k, d)
 
 
 def _proj_call(proj, x, indices, sorted_indices=False, rows_plan=None):
@@ -804,11 +807,12 @@ def install_switch(switch):
         def __call__(self, x, indices, *args, **kwargs):
             w = args[0] if (args and has_weights) else kwargs.get('weights')
             if x.ndim == 3 and ((x.shape[0] == 1 and 1 <= x.shape[1] <= verify_qmv.MAX_TOKENS)
-                                or (x.shape[1] == 1 and not mx.metal.is_available())):
+                                or (x.shape[1] == 1 and 1 <= x.shape[0] <= verify_qmv.MAX_TOKENS)):
                 return decode(self, x, indices, w if has_weights else None)
-            bits = getattr(self.gate_proj, 'bits', None)
-            mode = getattr(self.gate_proj, 'mode', 'affine')
-            if bits is not None and not requant.native(bits, mode):
+            if any(
+                getattr(p, 'bits', None) is not None and not requant.native(p.bits, getattr(p, 'mode', 'affine'))
+                for p in (self.gate_proj, self.up_proj, self.down_proj)
+            ):
                 return stock(self, x, indices, w if has_weights else None)
             return orig_call(self, x, indices, *args, **kwargs)
 

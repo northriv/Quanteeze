@@ -9,6 +9,8 @@ import mmap
 import os
 import re
 import struct
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -254,6 +256,8 @@ class Checkpoint:
     def experts(self, layer, projection, experts):
         """Some experts' quantized arrays of one layer and projection: [weight, scales, biases],
         biases None in a format without them (mxfp4), read past the file cache (read_rows)."""
+        from . import parallel
+        parallel.require(layer, 'expert read')
         names = [self.name(layer, projection, name) if self.has(layer, projection, name) else None for name in NAMES]
         return [None if name is None else self._array(name, experts) for name in names]
 
@@ -274,6 +278,8 @@ class Checkpoint:
 
     def expert(self, layer, projection, expert, out, cache=True):
         """One expert's arrays of a layer's projection read into `out` (buffers())."""
+        from . import parallel
+        parallel.require(layer, 'expert read')
         keys = [None if array is None else self.name(layer, projection, name) for name, array in zip(NAMES, out)]
         got = []
         for key, array in zip(keys, out):
@@ -284,6 +290,42 @@ class Checkpoint:
             got.append(_as_mlx(array, self.tensors[key][1]))
         mx.eval([a for a in got if a is not None])
         return got
+
+    def segments(self, layer, projection, expert, out):
+        """Return `[(file, byte_offset, nbytes, ptr, u8_view, key)]` for direct C++ `pread` into `out`,
+        or `None` if already ready in `HostCopy` or non-contiguous."""
+        from . import parallel
+        parallel.require(layer, 'expert read')
+        held = self.held()
+        segs = []
+        for name, array in zip(NAMES, out):
+            if array is None:
+                continue
+            key = self.name(layer, projection, name)
+            if held is not None and held.holds_expert(layer, key, expert):
+                return None
+            entry = self.tensors.get(key)
+            if entry is None:
+                return None
+            file, dtype, shape, offset = entry
+            row_bytes = int(np.prod(shape[1:], dtype=np.int64)) * np.dtype(_SAFETENSORS[dtype]).itemsize
+            arr_np = np.asarray(array)
+            if not arr_np.flags.c_contiguous or not arr_np.flags.writeable or arr_np.nbytes != row_bytes:
+                return None
+            if file is not None:
+                target_file, byte_off = file, int(offset) + int(expert) * row_bytes
+            else:
+                target_file, byte_off = offset[int(expert)][0], int(offset[int(expert)][1])
+            u8 = arr_np.view(np.uint8).reshape(-1)
+            segs.append((str(target_file), byte_off, row_bytes, int(u8.ctypes.data), u8, key))
+        return segs
+
+    def made(self, layer, projection, out):
+        """Wrap buffers `out` (populated by `segments()` read) as MLX arrays of each tensor's dtype."""
+        return [
+            None if array is None else _as_mlx(array, self.tensors[self.name(layer, projection, name)][1])
+            for name, array in zip(NAMES, out)
+        ]
 
 
 _HELD = {}                       # a checkpoint's path -> its HostCopy (hold())
@@ -392,16 +434,35 @@ class HostCopy:
             return np.take(held, slots, axis=0, out=out, mode='clip')
 
     def has(self, layer, expert):
-        slot_of = self.slot_of.get(layer)
-        return slot_of is not None and slot_of[expert] >= 0
+        with self.lock:
+            slot_of = self.slot_of.get(layer)
+            return bool(self.arrays) and slot_of is not None and slot_of[expert] >= 0
 
     def held_in(self, layer, experts):
         """Of `experts`, those this copy holds and has finished reading in `layer` (by row)."""
-        slot_of = self.slot_of.get(layer)
         experts = np.asarray(experts, np.int64).reshape(-1)
-        if slot_of is None or not all(self._ready(n) for n in self._layer_names.get(layer, ())):
-            return experts[:0]
-        return experts[slot_of[experts] >= 0]
+        with self.lock:
+            slot_of = self.slot_of.get(layer)
+            names = self._layer_names.get(layer, ())
+            if slot_of is None or not names or not all(self._ready(n) for n in names):
+                return experts[:0]
+            return experts[slot_of[experts] >= 0]
+
+    def holds_expert(self, layer, tensor_name, expert):
+        """Whether `(layer, tensor_name, expert)` is already resident and ready in this `HostCopy`."""
+        with self.lock:
+            if self.by_rows:
+                slot_of = self.slot_of.get(layer)
+                names = self._layer_names.get(layer, ())
+                exp_id = int(expert)
+                return bool(
+                    slot_of is not None
+                    and names
+                    and 0 <= exp_id < slot_of.size
+                    and slot_of[exp_id] >= 0
+                    and all(self._ready(n) for n in names)
+                )
+            return self._ready(tensor_name)
 
     def holds_layer(self, layer):
         """Whether this `by_rows` copy holds every expert of `layer` and has finished reading it."""
@@ -467,17 +528,22 @@ class HostCopy:
 
     def reading(self):
         """Whether any background read into `self.arrays` is still in flight."""
-        if self._reading_done:
-            return False
-        busy = any(not p.done() for p in list(self.pending.values()))
-        if not busy:
-            self._reading_done = True
-        return busy
+        with self.lock:
+            if self._reading_done:
+                return False
+            busy = any(not p.done() for p in list(self.pending.values()))
+            if not busy:
+                self._reading_done = True
+            return busy
 
     def read(self):
         """Bytes held and read so far."""
-        return sum(self.arrays[n].nbytes for n, p in self.pending.items() if p.done() and not p.cancelled()
-                   and p.exception() is None)
+        with self.lock:
+            return sum(
+                self.arrays[n].nbytes
+                for n, p in self.pending.items()
+                if n in self.arrays and p.done() and not p.cancelled() and p.exception() is None
+            )
 
     def wait(self):
         """Wait for every held tensor to be read; raises what a read raised."""
@@ -529,19 +595,36 @@ def let_go(path=None):
             held.close()
 
 
+def _mounts(mounts='/proc/mounts'):
+    """Return `[(mount_point, fs_type)]` from Linux `/proc/mounts` or macOS `/sbin/mount`."""
+    try:
+        lines = Path(mounts).read_text().splitlines()
+        return [(f[1].replace('\\040', ' '), f[2]) for f in (line.split() for line in lines) if len(f) >= 3]
+    except OSError:
+        pass
+    if sys.platform != 'darwin' or mounts != '/proc/mounts':
+        return []
+    try:
+        text = subprocess.run(['/sbin/mount'], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out = []
+    for line in text.splitlines():
+        head, sep, tail = line.rpartition(' (')
+        point = head.partition(' on ')[2]
+        if sep and point:
+            kind = tail.rstrip(')').split(',', 1)[0].strip()
+            if kind:
+                out.append((point, kind))
+    return out
+
+
 def file_system(path, mounts='/proc/mounts'):
     """The type of the file system `path` lies on (`mounts`; '' where it cannot be read)."""
     path, best = str(Path(path).expanduser().resolve()), ('', '')
-    try:
-        mounts = Path(mounts).read_text().splitlines()
-    except OSError:
-        return ''
-    for line in mounts:
-        fields = line.split()
-        if len(fields) >= 3:
-            point = fields[1].replace('\\040', ' ')
-            if (path == point or path.startswith(point.rstrip('/') + '/')) and len(point) > len(best[0]):
-                best = (point, fields[2])
+    for point, kind in _mounts(mounts):
+        if (path == point or path.startswith(point.rstrip('/') + '/')) and len(point) > len(best[0]):
+            best = (point, kind)
     return best[1]
 
 
@@ -550,7 +633,10 @@ def in_memory(path, mounts='/proc/mounts'):
     return file_system(path, mounts) in ('tmpfs', 'ramfs')
 
 
-NETWORK = ('lustre', 'nfs', 'nfs4', 'cifs', 'smb3', 'smbfs', 'beegfs', 'gpfs', 'ceph', 'fuse.sshfs', '9p')
+NETWORK = (
+    'lustre', 'nfs', 'nfs4', 'cifs', 'smb3', 'smbfs', 'afpfs', 'webdav',
+    'beegfs', 'gpfs', 'ceph', 'fuse.sshfs', '9p',
+)
 LOCAL_READ_THREADS = 4
 NETWORK_READ_THREADS = 16
 

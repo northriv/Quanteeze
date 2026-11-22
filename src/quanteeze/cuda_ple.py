@@ -18,14 +18,14 @@ from functools import lru_cache
 import mlx.core as mx
 import numpy as np
 
-from . import cuda_kernels
+from . import cuda_kernels, per_thread
 
 CHECKS = 3
 MAX_ROWS = 256
 ON = [True]                     # QUANTEEZE_CUDA_PLE
 HOST = [True]                   # QUANTEEZE_HOST_NGRAM
-TOKENS = [None]
-PENDING = [None]
+TOKENS = per_thread.Field('ple_tokens')
+PENDING = per_thread.Field('ple_pending')
 STATS = dict(ngram=0, served=0, checked=0, mismatched=0, pinned_bytes=0)
 HOST_STATS = dict(served=0, checked=0, mismatched=0, context_read=0, verified=0, wrong=0)
 CHOICE = {}                     # (shards, row width, group size, rows): whether it matched the host's
@@ -329,16 +329,59 @@ class _Pinned:
     def __del__(self):
         if _EXITING:
             return
-        cuda, context = _DRIVER[0]
-        cuda.cuCtxPushCurrent_v2(context)
-        cuda.cuCtxSynchronize()
-        cuda.cuMemFreeHost(self.host)
-        cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
-        STATS['pinned_bytes'] -= int(np.prod(self.__array_interface__['shape'])) * np.dtype(
-            self.__array_interface__['typestr']).itemsize
+        _LATER.append((self.host, int(np.prod(self.__array_interface__['shape'])) * np.dtype(
+            self.__array_interface__['typestr']).itemsize))
+        free_later()
 
 
 atexit.register(lambda: _EXITING.append(True))
+_LATER = []                     # [(host, bytes)]: pinned blocks let go of, not yet freed (free_later)
+_LATER_SAID = []
+
+
+def others_serving():
+    """Whether a thread other than the calling one serves a request now (quanteeze.request_threads)."""
+    threads = sys.modules.get(__package__ + '.request_threads')
+    return threads is not None and threads.others_serving()
+
+
+def _while_alone(fn):
+    """fn() where no thread but this one serves a request now (quanteeze.request_threads.while_alone, none
+    starting meanwhile); whether it ran."""
+    threads = sys.modules.get(__package__ + '.request_threads')
+    if threads is None:
+        fn()
+        return True
+    return threads.while_alone(fn)
+
+
+def free_later():
+    """The pinned blocks let go of, freed, the GPU's work done first (cuCtxSynchronize) -- where no other thread
+    serves a request now.  Where one does, they wait: its passes may be capturing a CUDA graph meanwhile (MLX,
+    cudaStreamCaptureModeThreadLocal), which a context's synchronize breaks.  A request's thread calls this as
+    it ends (quanteeze.request_threads)."""
+    if not _LATER or _EXITING:
+        return
+
+    def free():
+        cuda, context = _DRIVER[0]
+        cuda.cuCtxPushCurrent_v2(context)
+        try:
+            cuda.cuCtxSynchronize()
+            while _LATER:
+                host, size = _LATER.pop()
+                cuda.cuMemFreeHost(host)
+                STATS['pinned_bytes'] -= size
+        finally:
+            cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
+
+    if not _while_alone(free):
+        later = sum(size for _, size in list(_LATER))
+        STATS['pinned_later_most'] = max(STATS.get('pinned_later_most', 0), later)
+        if not _LATER_SAID:
+            _LATER_SAID.append(True)
+            print('quanteeze: pinned memory let go of while other requests\' threads serve: freed once one serves '
+                  'alone (a cuCtxSynchronize now would break their CUDA graph captures)', file=sys.stderr, flush=True)
 
 
 def empty(shape, dtype):
@@ -351,6 +394,7 @@ def pinned(shape, dtype, what='a copy', otherwise='read as before'):
     """np.empty(shape, dtype) pinned and mapped for the GPU (cuMemHostAlloc), whatever ON says;
     np.empty's own where it cannot be (no CUDA, the driver refused: said once, as `what` and
     `otherwise`).  Used for quanteeze.cuda_ple's n-gram tables."""
+    free_later()
     dtype = np.dtype(dtype)
     size = int(np.prod(shape)) * dtype.itemsize
     driver = _driver() if size and cuda_kernels.available() else None

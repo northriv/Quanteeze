@@ -44,9 +44,10 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
 
+import mlx.core as mx
 import numpy as np
 
-from . import cuda_ple, variables
+from . import cuda_engram, cuda_ple, native_ext, per_thread, variables
 
 _USED = {}
 _HELD = []
@@ -56,12 +57,65 @@ MIN_ROWS = 64
 PART_ROWS = 512          # rows a thread takes at least
 PART_BYTES = 64 << 20    # a read of the host's copy at most
 ADVISE = [None]          # QUANTEEZE_NGRAM_ADVISE
+_TOUCH = {}
 
 
 def _touch(job):
+    """Read each row's first and last element in C++ with the GIL released when supported, else numpy."""
+    got = _touch_native(job)
+    return _touch_python(job) if got is None else got
+
+
+def _touch_python(job):
     """Read each row's first and last element, so every page the rows lie on."""
     array, rows = job
     return int(array[rows, 0].sum()) + int(array[rows, -1].sum())
+
+
+def _touch_ext():
+    """Return the compiled `_touch` nanobind extension, or None when disabled/unavailable."""
+    if 'ext' not in _TOUCH:
+        ext = None
+        if not variables.off('QUANTEEZE_NGRAM_TOUCH_NATIVE'):
+            ext = native_ext.extension('touch', with_mlx=False, with_stm=False, quiet=True)
+        _TOUCH['ext'] = ext
+    return _TOUCH['ext']
+
+
+def _addressed(array):
+    """Return `(base, row_stride, last_elem_offset, itemsize, nrows)` for `touch.cpp`, or None."""
+    if (not isinstance(array, np.ndarray) or array.ndim != 2 or array.shape[1] < 1
+            or array.strides[0] <= 0 or array.strides[1] <= 0 or array.dtype.hasobject):
+        return None
+    return (
+        int(array.ctypes.data),
+        int(array.strides[0]),
+        int((array.shape[1] - 1) * array.strides[1]),
+        int(array.itemsize),
+        int(array.shape[0]),
+    )
+
+
+def _touch_native(job, out=None):
+    """Execute `_touch` via C++ `_touch` extension, returning row count or None to fall back."""
+    ext = _touch_ext()
+    if ext is None:
+        return None
+    array, rows = job
+    where = _addressed(array)
+    if where is None:
+        return None
+    rows_arr = np.ascontiguousarray(np.asarray(rows).reshape(-1), np.int64)
+    base, stride, last, elem, count = where
+    if out is not None:
+        if (not isinstance(out, np.ndarray) or not out.flags.c_contiguous or not out.flags.writeable
+                or out.nbytes < 2 * rows_arr.size * elem):
+            return None
+        out_addr = int(out.ctypes.data)
+    else:
+        out_addr = 0
+    got = ext.touch(base, stride, last, elem, count, int(rows_arr.ctypes.data), int(rows_arr.size), out_addr)
+    return None if got < 0 else int(got)
 
 
 def _advising():
@@ -196,8 +250,10 @@ def located(embedding, row_ids):
 def _memmaps(embedding):
     """(where, key, memmap) of each memmap an embedding reads its rows from, where[key] being it:
     the arrays of an OffloadedEngramEmbedding, or of a QuantizedMMapNGramEmbedding's shards, or its
-    interleaved store (the object's own attribute)."""
-    if getattr(embedding, '_arrays', None) is not None and not hasattr(embedding, '_interleaved'):
+    interleaved store (the object's own attribute), or an SSDEmbedding's rows (its own attribute too)."""
+    if hasattr(embedding, '__dict__') and isinstance(vars(embedding).get('_rows'), np.ndarray):
+        found = [(vars(embedding), '_rows', embedding._rows)]
+    elif getattr(embedding, '_arrays', None) is not None and not hasattr(embedding, '_interleaved'):
         found = [(embedding._arrays, k, a) for k, a in embedding._arrays.items()]
     elif embedding._interleaved is not None:
         found = [(vars(embedding), '_interleaved', embedding._interleaved)]
@@ -208,15 +264,21 @@ def _memmaps(embedding):
 
 def tables(model):
     """The n-gram tables `model` holds, each once: mlx-vlm's QuantizedMMapNGramEmbedding (an
-    attribute of a module) and OffloadedEngramEmbedding (a module)."""
+    attribute of a module) and OffloadedEngramEmbedding (a module); and DeepSeek V4.1's token
+    embedding read from the checkpoint (`quanteeze.arch.deepseek_v41.SSDEmbedding`, 1.3 GB), first:
+    held as the Engram's are, the GPU reads a decode step's row there too (`quanteeze.cuda_engram`)."""
     from mlx_vlm.models.deepseek_v41.engram import OffloadedEngramEmbedding
     from mlx_vlm.models.qwen4_exp.ple_storage import QuantizedMMapNGramEmbedding
-    found = {}
+
+    from .arch.deepseek_v41 import SSDEmbedding
+    found, first = {}, {}
     for module in model.modules():
         for value in (module, *vars(module).values()):
-            if isinstance(value, (QuantizedMMapNGramEmbedding, OffloadedEngramEmbedding)):
+            if isinstance(value, SSDEmbedding):
+                first[id(value)] = value
+            elif isinstance(value, (QuantizedMMapNGramEmbedding, OffloadedEngramEmbedding)):
                 found[id(value)] = value
-    return list(found.values())
+    return list(first.values()) + list(found.values())
 
 
 def _read(file, offset, out):
@@ -251,7 +313,8 @@ class HostCopy:
         self._entries = []
         self._pool = ThreadPoolExecutor(max(1, workers), thread_name_prefix='ngram-copy')
         for embedding in embeddings:
-            empty = cuda_ple.empty if cuda_ple.reads(embedding) else np.empty     # pinned: the GPU reads it there
+            pinned = cuda_ple.reads(embedding) or cuda_engram.reads(embedding)
+            empty = cuda_ple.empty if pinned else np.empty                      # pinned: the GPU reads it there
             for where, key, array in _memmaps(embedding):
                 self.total += array.nbytes
                 if self.bytes + array.nbytes > budget or skip(array.filename):
@@ -329,10 +392,18 @@ def close_all():
 
 
 def _kept(rows):
+    arrays = []
     for a in (rows.values() if isinstance(rows, dict) else rows if isinstance(rows, (tuple, list)) else (rows,)):
         if isinstance(a, np.ndarray):
             a.flags.writeable = False
+        elif isinstance(a, mx.array):
+            arrays.append(a)
+    if arrays:
+        mx.eval(arrays)
     return dict(rows) if isinstance(rows, dict) else rows
+
+
+_CACHED_ROWS = threading.RLock()
 
 
 def install(embedding_cls, prefetcher=None):
@@ -342,9 +413,16 @@ def install(embedding_cls, prefetcher=None):
     read_rows = embedding_cls._read_rows
 
     def _read_rows(self, row_ids):
+        if getattr(self, 'cache_rows', False):
+            with _CACHED_ROWS:
+                return _looked_up(self, row_ids)
+        return _looked_up(self, row_ids)
+
+    def _looked_up(self, row_ids):
         small = isinstance(row_ids, np.ndarray) and row_ids.size < prefetcher.min_rows
         key = (row_ids.dtype.str, row_ids.shape, row_ids.tobytes()) if small else None
-        last = self.__dict__.get('_quanteeze_last')
+        slots = per_thread.slots(self)
+        last = slots.get('_quanteeze_last')
         if key is not None and last is not None and last[0] == key:
             STATS['again'] += 1
             return dict(last[1]) if isinstance(last[1], dict) else last[1]
@@ -354,7 +432,7 @@ def install(embedding_cls, prefetcher=None):
         prefetcher.fetch(located(self, ids))
         rows = read_rows(self, row_ids)
         if key is not None:
-            object.__setattr__(self, '_quanteeze_last', (key, _kept(rows)))
+            slots['_quanteeze_last'] = (key, _kept(rows))
         return rows
 
     embedding_cls._read_rows = _read_rows

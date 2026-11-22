@@ -55,6 +55,22 @@ def roomy(n, dtype):
     return max(int(n), -(-16 // dtype.size))
 
 
+QMM_TILE_ROWS = 16
+
+
+def qmm_room(x):
+    """Give `x` at least `QMM_TILE_ROWS - 1` trailing zero rows in its backing buffer on non-Metal
+    backends when `x` has fewer than `QMM_TILE_ROWS` rows, preventing MLX 0.32.4's `qmm_sm80_kernel`
+    from reading unmapped memory past the end of small `x` tiles while preserving shape and values."""
+    if mx.metal.is_available() or x.ndim < 1 or x.shape[-1] == 0:
+        return x
+    rows = x.size // x.shape[-1]
+    if rows >= QMM_TILE_ROWS:
+        return x
+    flat = mx.concatenate([x.reshape(-1), mx.zeros(((QMM_TILE_ROWS - 1) * x.shape[-1],), x.dtype)])
+    return flat[:x.size].reshape(x.shape)
+
+
 def kernel(name, input_names, output_names, source, header='', shared_memory=0):
     """mx.fast.cuda_kernel with HEADER before `header` (and `shared_memory` bytes of dynamic shared memory,
     extern __shared__ in the source)."""

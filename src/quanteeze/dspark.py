@@ -38,11 +38,14 @@ MXFP4 byte for byte, its FP8 projections as MXFP8 (mlx-vlm's _pack_source_weight
 lowers the experts (quanteeze.mtp.lower).
 """
 import json
+import sys
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
+from . import per_thread
 
 BLOCK = 5                       # positions a block drafts (dspark_block_size)
 NOISE = 128799                  # the token the positions after the anchor are (dspark_noise_token_id)
@@ -245,6 +248,37 @@ class Drafter(nn.Module):
         x = DeepseekV41Block.hc_pre(h, pre_mix)
         head = self.head if self.head is not None else lm.head
         logits = head(self.norm(x)).astype(mx.float32)                       # [B, BLOCK, V]
+        drafts, q, embeds = self.markov(logits, anchor, sampling, base)
+        conf = self.confidence(mx.concatenate([x.astype(mx.float32), embeds.astype(mx.float32)], axis=-1))[..., 0]
+        return drafts, q, conf
+
+    def markov(self, logits, anchor, sampling=None, base=0):
+        """Generate `BLOCK` speculative drafts, optional log-probs, and Markov embeddings via C++ when active."""
+        native = _native()
+        if native is not None:
+            got = native_markov(self, native, logits, anchor, sampling, base)
+            if NATIVE[1] >= NATIVE_CHECKS:
+                return got
+            ref = self.python_markov(logits, anchor, sampling, base)
+            NATIVE[1] += 1
+            same = all(
+                (a is None and b is None)
+                or (a is not None and b is not None and a.dtype == b.dtype and mx.array_equal(a, b).item())
+                for a, b in zip(got, ref)
+            )
+            if not same:
+                NATIVE[0] = False
+                print(
+                    'quanteeze: QUANTEEZE_DSPARK_NATIVE: C++ drafts parted from Python; using Python from now on',
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return ref
+        return self.python_markov(logits, anchor, sampling, base)
+
+    def python_markov(self, logits, anchor, sampling=None, base=0):
+        """Reference Python implementation of the sequential Markov head loop."""
+        batch = logits.shape[0]
         token = mx.array([anchor] * batch, dtype=mx.int32)
         out, qs, embeds = [], [], []
         for i in range(BLOCK):
@@ -258,12 +292,60 @@ class Drafter(nn.Module):
                 token = mx.random.categorical(q, key=sampling.key(PROPOSE, base + i)).astype(mx.int32)
                 qs.append(q)
             out.append(token)
-        conf = self.confidence(mx.concatenate([x.astype(mx.float32), mx.stack(embeds, axis=1).astype(mx.float32)],
-                                              axis=-1))[..., 0]
-        return mx.stack(out, axis=1), (mx.stack(qs, axis=1) if qs else None), conf
+        return mx.stack(out, axis=1), (mx.stack(qs, axis=1) if qs else None), mx.stack(embeds, axis=1)
 
 
-PENDING = [None]                # the round being verified: Pending
+NATIVE = [None, 0, 0]
+NATIVE_CHECKS = 3
+
+
+def _native():
+    """Return the compiled `_dspark` C++20 extension when QUANTEEZE_DSPARK_NATIVE enables it."""
+    if NATIVE[0] is None:
+        from . import native_ext, variables
+        m = (variables.get('QUANTEEZE_DSPARK_NATIVE') or 'auto').strip().lower()
+        use = m == 'on' or (m == 'auto' and mx.metal.is_available())
+        ext = native_ext.extension('dspark', with_mlx=True, with_stm=False, quiet=(m == 'auto')) if use else None
+        NATIVE[0] = ext or False
+    return NATIVE[0] or None
+
+
+def _spec(native, module):
+    """Describe a linear or embedding layer (plain or quantized) for `_dspark.proj`."""
+    params = module.parameters() if hasattr(module, 'parameters') else {}
+    quantized = 'scales' in params
+    return native.proj(
+        1 if quantized else 0,
+        module['weight'],
+        params.get('scales'),
+        params.get('biases'),
+        int(getattr(module, 'group_size', 0) or 0),
+        int(getattr(module, 'bits', 0) or 0),
+        str(getattr(module, 'mode', 'affine') or 'affine'),
+        params.get('bias'),
+    )
+
+
+def native_markov(drafter, native, logits, anchor, sampling, base):
+    """Run `Drafter.markov()` via the compiled `_dspark` extension."""
+    specs = getattr(drafter, '_quanteeze_dspark_specs', None)
+    if specs is None or specs[0] is not drafter.markov_embed or specs[1] is not drafter.markov_head:
+        specs = (
+            drafter.markov_embed,
+            drafter.markov_head,
+            _spec(native, drafter.markov_embed),
+            _spec(native, drafter.markov_head),
+        )
+        try:
+            object.__setattr__(drafter, '_quanteeze_dspark_specs', specs)
+        except Exception:
+            pass
+    rule = None if sampling is None else (sampling.temperature, sampling.top_p, sampling.top_k)
+    keys = [] if sampling is None else [sampling.key(PROPOSE, base + i) for i in range(logits.shape[1])]
+    return native.markov(logits, int(anchor), specs[2], specs[3], rule, keys)
+
+
+PENDING = per_thread.Field('round')     # the round being verified: Pending
 GATE = [None]                   # QUANTEEZE_DSPARK_GATE as read (gated()), and the log (QUANTEEZE_DSPARK_LOG)
 LOG = [None, None]              # its file, and when the last round was walked (perf_counter)
 
@@ -307,10 +389,30 @@ def gate_threshold():
 
 
 def gated(conf, k):
-    """How many of the first k drafts the gate keeps (k with no gate): it waits on the drafter."""
+    """How many of the first k drafts the gate keeps (k with no gate): waits on confidence logits in C++ when active."""
     threshold = gate_threshold()
     if not threshold or not k:
         return k
+    native = _native()
+    if native is not None and conf.shape[0] == 1 and conf.dtype == mx.float32:
+        got = native.gated(conf, int(k), float(threshold))
+        if NATIVE[2] >= NATIVE_CHECKS:
+            return got
+        NATIVE[2] += 1
+        ref = python_gated(conf, k, threshold)
+        if got != ref:
+            NATIVE[0] = False
+            print(
+                f'quanteeze: QUANTEEZE_DSPARK_NATIVE: C++ gate kept {got}, Python kept {ref}; using Python from now on',
+                file=sys.stderr,
+                flush=True,
+            )
+        return ref
+    return python_gated(conf, k, threshold)
+
+
+def python_gated(conf, k, threshold):
+    """Reference Python implementation of `gated()`."""
     kept = mx.cumprod(mx.sigmoid(conf[0, :k])) >= threshold
     return int(mx.sum(mx.cumprod(kept.astype(mx.int32))).item())
 
@@ -458,8 +560,8 @@ def _together(original):
 
 
 _WALK, _GREEDY_WALK, _RECORD = [None], [None], [None]
-ROWS = []                       # the gate's count of each row a batched round drafted (_together)
-DRAFTED = [None]                # the drafts the round just walked had: the gate may have kept fewer
+ROWS = per_thread.Rows('rows')          # the gate's count of each row a batched round drafted (_together)
+DRAFTED = per_thread.Field('drafted')   # the drafts the round just walked had: the gate may have kept fewer
 
 
 def _record(draft_model, accepted, draft_count):

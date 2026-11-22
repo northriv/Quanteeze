@@ -97,7 +97,8 @@ def host_room(readings=None):
         free = min(free, limited[0] - limited[1]) if free is not None else limited[0] - limited[1]
     if not total or free is None:
         return None
-    return max(0, int(free - HOST_RESERVE * total))
+    from . import parallel
+    return max(0, int(free - HOST_RESERVE * total)) // parallel.on_this_host()
 
 
 def room(resident, working_set=None):

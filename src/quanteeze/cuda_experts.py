@@ -48,14 +48,109 @@ __device__ __forceinline__ void qz_mma(float (&c)[4], unsigned a0, unsigned a1, 
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// qz_expert_rows of 2-bit weights (MLX's qmm_naive for them: the same mma.sync m16n8k16 over the 16-wide chunks
+// in order, each weight w * scale, then + bias, each rounded to bfloat16): a chunk is one word, input i at bits
+// 2i; lane t's pairs are inputs 2t, 2t+1 (bits 4t, 4t+2) and 2t+8, 2t+9 (bits 16+4t, 16+4t+2), rounded to
+// bfloat16 under 128's bits as the 4-bit pairs are.
+template <int N, int K, int GS, bool PAIR>
+__device__ __forceinline__ void qz_expert_rows2(float (&c)[PAIR ? 2 : 1][4], const __nv_bfloat16* xr,
+                                                const uint32_t* w, const __nv_bfloat16* scales,
+                                                const __nv_bfloat16* biases, const uint32_t* w2,
+                                                const __nv_bfloat16* scales2, const __nv_bfloat16* biases2,
+                                                int e, int n0) {
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int n = n0 + g;
+  constexpr int NW = PAIR ? 2 : 1;
+  const uint32_t* wr[NW];
+  const __nv_bfloat16* sr[NW];
+  const __nv_bfloat16* br[NW];
+  wr[0] = w + (static_cast<size_t>(e) * N + n) * (K / 16);
+  sr[0] = scales + (static_cast<size_t>(e) * N + n) * (K / GS);
+  br[0] = biases + (static_cast<size_t>(e) * N + n) * (K / GS);
+  if constexpr (PAIR) {
+    wr[NW - 1] = w2 + (static_cast<size_t>(e) * N + n) * (K / 16);
+    sr[NW - 1] = scales2 + (static_cast<size_t>(e) * N + n) * (K / GS);
+    br[NW - 1] = biases2 + (static_cast<size_t>(e) * N + n) * (K / GS);
+  }
+  const uint32_t magic_bits = 0x43004300u;
+  const __nv_bfloat162 magic = *reinterpret_cast<const __nv_bfloat162*>(&magic_bits);
+  for (int p = 0; p < NW; ++p) {
+    for (int i = 0; i < 4; ++i) {
+      c[p][i] = 0.0f;
+    }
+  }
+  constexpr int CH = K / 16;
+  constexpr int GR = 8;
+  static_assert(CH % GR == 0, "the chunks a multiple of a group");
+  uint4 cur[NW][GR / 4], nxt[NW][GR / 4];
+  auto load = [&](uint4 (&dst)[NW][GR / 4], int g0) {
+#pragma unroll
+    for (int p = 0; p < NW; ++p) {
+#pragma unroll
+      for (int q = 0; q < GR / 4; ++q) {
+        dst[p][q] = *reinterpret_cast<const uint4*>(wr[p] + g0 + 4 * q);
+      }
+    }
+  };
+  load(cur, 0);
+  for (int g0 = 0; g0 < CH; g0 += GR) {
+    if (g0 + GR < CH) {
+      load(nxt, g0 + GR);
+    }
+#pragma unroll
+    for (int cc = 0; cc < GR; ++cc) {
+      const int kc = g0 + cc;
+      unsigned a0 = 0u, a2 = 0u;
+      if (g == 0) {
+        a0 = *reinterpret_cast<const unsigned*>(xr + kc * 16 + 2 * t);
+        a2 = *reinterpret_cast<const unsigned*>(xr + kc * 16 + 2 * t + 8);
+      }
+#pragma unroll
+      for (int p = 0; p < NW; ++p) {
+        const uint4 q4 = cur[p][cc / 4];
+        const uint32_t v = (cc & 3) == 0 ? q4.x : (cc & 3) == 1 ? q4.y : (cc & 3) == 2 ? q4.z : q4.w;
+        const __nv_bfloat162 s2 = __bfloat162bfloat162(sr[p][(kc * 16) / GS]);
+        const __nv_bfloat162 b2 = __bfloat162bfloat162(br[p][(kc * 16) / GS]);
+        unsigned bq[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int at = 16 * h + 4 * t;
+          uint32_t bits = ((v >> at) & 0x3u) | (((v >> (at + 2)) & 0x3u) << 16) | magic_bits;
+          __nv_bfloat162 q = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&bits), magic);
+          bq[h] = qz_bits(__hadd2(__hmul2(q, s2), b2));
+        }
+        qz_mma(c[p], a0, 0u, a2, 0u, bq[0], bq[1]);
+      }
+    }
+#pragma unroll
+    for (int p = 0; p < NW; ++p) {
+#pragma unroll
+      for (int q = 0; q < GR / 4; ++q) {
+        cur[p][q] = nxt[p][q];
+      }
+    }
+  }
+}
+
 // A warp's 8 rows n0..n0+7 of expert e on the input xr [K] (PAIR: of two projections, two chains):
 // lane (g, t) holds B's column n0 + g; c[p] its C fragment, row 0's columns 2t and 2t+1 in lanes 0..3.
-template <int N, int K, int GS, bool PAIR, bool MXFP4 = false, typename ScaleT = __nv_bfloat16>
+// BITS: 4 (MLX's qmm_sm80 / MXFP4), or 2 (MLX's qmm_naive: qz_expert_rows2).
+template <int N, int K, int GS, bool PAIR, bool MXFP4 = false, int BITS = 4, typename ScaleT = __nv_bfloat16>
 __device__ __forceinline__ void qz_expert_rows(float (&c)[PAIR ? 2 : 1][4], const __nv_bfloat16* xr,
                                                const uint32_t* w, const ScaleT* scales,
                                                const ScaleT* biases, const uint32_t* w2,
                                                const ScaleT* scales2, const ScaleT* biases2,
                                                int e, int n0) {
+  if constexpr (!MXFP4 && BITS == 2) {
+    qz_expert_rows2<N, K, GS, PAIR>(
+        c, xr, w, reinterpret_cast<const __nv_bfloat16*>(scales),
+        reinterpret_cast<const __nv_bfloat16*>(biases), w2,
+        reinterpret_cast<const __nv_bfloat16*>(scales2),
+        reinterpret_cast<const __nv_bfloat16*>(biases2), e, n0);
+    return;
+  }
   const int lane = threadIdx.x & 31;
   const int g = lane >> 2;
   const int t = lane & 3;
@@ -226,8 +321,8 @@ SOURCE = r"""
     const int lane = warp.thread_rank();
     const int t = lane & 3;
     float c[PAIR ? 2 : 1][4];
-    qz_expert_rows<N, K, GS, PAIR, MXFP4>(c, x + static_cast<size_t>(X_DIV ? j / X_DIV : 0) * K, w, scales, biases, w2,
-                                          scales2, biases2, static_cast<int>(idx[j]), n0);
+    qz_expert_rows<N, K, GS, PAIR, MXFP4, BITS>(c, x + static_cast<size_t>(X_DIV ? j / X_DIV : 0) * K, w, scales,
+                                                biases, w2, scales2, biases2, static_cast<int>(idx[j]), n0);
     if (lane < 4) {
       for (int i = 0; i < 2; ++i) {
         __nv_bfloat16 gate = __float2bfloat16_rn(c[0][i]);
@@ -375,6 +470,10 @@ def _staged_kernel(k, group_size, mxfp4=False):
                                STAGED_SOURCE, HEADER, shared_memory=_staged_smem(k, group_size, mxfp4))
 
 
+def _staged_rows_kernel(k, group_size, mxfp4=False):
+    return _staged_kernel(k, group_size, mxfp4)
+
+
 @lru_cache(maxsize=None)
 def _kernel():
     return cuda_kernels.kernel('quanteeze_experts', ['x', 'w', 'scales', 'biases', 'idx', 'w2', 'scales2', 'biases2'],
@@ -384,26 +483,27 @@ def _kernel():
 def _run(x, proj, idx, x_div, pair=None):
     slots, n, k = idx.size, proj.weight.shape[1], x.shape[-1]
     mxfp4 = getattr(proj, 'mode', None) == 'mxfp4'
+    bits = 4 if mxfp4 else int(getattr(proj, 'bits', 4))
     second = pair or proj
     b1 = proj.scales if mxfp4 else proj.biases
     b2 = second.scales if mxfp4 else second.biases
     return _kernel()(
         inputs=[mx.contiguous(x), proj.weight, proj.scales, b1, idx, second.weight, second.scales, b2],
         template=[('N', n), ('K', k), ('GS', int(proj.group_size)), ('SLOTS', slots), ('X_DIV', int(x_div)),
-                  ('PAIR', pair is not None), ('MXFP4', mxfp4)],
+                  ('PAIR', pair is not None), ('MXFP4', mxfp4), ('BITS', bits)],
         grid=(32 * slots * (n // 8), 1, 1), threadgroup=(256, 1, 1), output_shapes=[(slots, n)],
         output_dtypes=[x.dtype])[0]
 
 
-def gate_up(switch, x, idx):
+def gate_up(switch, x, idx, per=None):
     """swiglu(gate_proj(x), up_proj(x)) of each slot's expert for token rows `x`: `[slots, inner]`."""
     gate, up = switch.gate_proj, switch.up_proj
     slots, n, k, gs = idx.size, gate.weight.shape[1], x.shape[-1], int(gate.group_size)
     mxfp4 = getattr(gate, 'mode', None) == 'mxfp4'
     rows = max(1, x.size // k)
-    top_k = max(1, slots // rows)
-    if not staged(n, k, gs, mxfp4):
-        return _run(x, gate, idx, 0 if rows == 1 else top_k, pair=up)
+    top_k = int(per) if per is not None else max(1, slots // rows)
+    if int(getattr(gate, 'bits', 4)) != 4 or not staged(n, k, gs, mxfp4):
+        return _run(x, gate, idx, 0 if rows == 1 and per is None else top_k, pair=up)
     b1 = gate.scales if mxfp4 else gate.biases
     b2 = up.scales if mxfp4 else up.biases
     return _staged_kernel(k, gs, mxfp4)(
@@ -419,25 +519,28 @@ def down(switch, h, idx):
 
 
 def _projection(p, k, dtype):
-    if type(p).__name__ not in ('QuantizedSwitchLinear', 'Projection') or p.bits != 4 or 'bias' in p:
+    if type(p).__name__ not in ('QuantizedSwitchLinear', 'Projection') or 'bias' in p:
         return False
     mode = getattr(p, 'mode', None)
     if mode == 'mxfp4':
-        return (p.group_size == 32 and p.get('biases') is None
+        return (p.bits == 4 and p.group_size == 32 and p.get('biases') is None
                 and p.weight.dtype == mx.uint32 and p.scales.dtype == mx.uint8
                 and p.weight.shape[-1] * 8 == k and p.scales.shape[-1] * 32 == k
                 and p.weight.shape[1] % 8 == 0 and k % 128 == 0)
-    return (mode == 'affine'
+    return (mode == 'affine' and p.bits in (2, 4)
             and p.group_size in (32, 64, 128) and p.get('biases') is not None
             and p.weight.dtype == mx.uint32 and p.scales.dtype == dtype and p.biases.dtype == dtype
-            and p.weight.shape[-1] * 8 == k and p.weight.shape[1] % 8 == 0 and k % 128 == 0)
+            and p.weight.shape[-1] * (32 // p.bits) == k and p.weight.shape[1] % 8 == 0 and k % 128 == 0)
 
 
 def takes(switch, x, indices):
-    """Whether switch_glu() computes this step's experts as MLX's qmm_sm80 does: on CUDA, bfloat16
-    single-token steps (B=1..8, T=1), 8 to 64 total slots (fewer go to gather_qmv), 4-bit affine or
-    mxfp4 projections, a SwiGLU between them."""
-    if not cuda_kernels.available() or x.dtype != mx.bfloat16 or x.ndim != 3 or x.shape[1] != 1 or not 1 <= x.shape[0] <= 8:
+    """Whether switch_glu() computes this step's experts as MLX's qmm_sm80 / qmm_naive do: on CUDA, bfloat16
+    batch decode (`B=1..8, T=1`) or single-request MTP verify (`B=1, T=1..8`), 8 to 64 total slots, 4-bit or
+    2-bit affine or mxfp4 projections, a SwiGLU between them."""
+    if not cuda_kernels.available() or x.dtype != mx.bfloat16 or x.ndim != 3:
+        return False
+    b, t = x.shape[0], x.shape[1]
+    if not ((t == 1 and 1 <= b <= 8) or (b == 1 and 1 <= t <= 8)):
         return False
     if indices.ndim != 3 or indices.shape[:2] != x.shape[:2] or indices.shape[-1] <= 0:
         return False
@@ -449,26 +552,31 @@ def takes(switch, x, indices):
     gate, up, dn = switch.gate_proj, switch.up_proj, switch.down_proj
     return (_projection(gate, hidden, x.dtype) and _projection(up, hidden, x.dtype)
             and gate.weight.shape == up.weight.shape and gate.group_size == up.group_size
+            and gate.bits == up.bits
             and getattr(gate, 'mode', None) == getattr(up, 'mode', None)
             and _projection(dn, gate.weight.shape[1], x.dtype) and dn.weight.shape[1] == hidden)
 
 
 def decode(switch, x, indices, fallback):
-    """`fallback()` or custom CUDA `gate_up()` + `down()` for `[B, 1, k, hidden]` once bit-verified."""
+    """`fallback()` or custom CUDA `gate_up()` + `down()` for `[B, T, k, hidden]` once bit-verified."""
     if not ON[0] or not takes(switch, x, indices):
         return fallback()
-    b, top_k = x.shape[0], indices.shape[-1]
+    b, t, top_k = x.shape[0], x.shape[1], indices.shape[-1]
+    rows = b * t
 
     def mine():
         idx = mx.contiguous(indices.reshape(-1).astype(mx.uint32))
-        h = gate_up(switch, x.reshape(b, -1), idx)
-        return down(switch, h, idx).reshape(b, 1, top_k, -1)
+        h = gate_up(switch, x.reshape(rows, -1), idx, per=top_k if rows > 1 else None)
+        return down(switch, h, idx).reshape(b, t, top_k, -1)
 
     gate, dn = switch.gate_proj, switch.down_proj
     base = ((top_k, x.shape[-1], gate.weight.shape[1], int(gate.group_size))
-            if b == 1 else
-            (b, top_k, x.shape[-1], gate.weight.shape[1], int(gate.group_size)))
+            if rows == 1 else
+            (rows, top_k, x.shape[-1], gate.weight.shape[1], int(gate.group_size)))
     key = base if gate.mode == 'affine' and dn.mode == 'affine' else base + (gate.mode, dn.mode)
+    bits_pair = (int(gate.bits), int(dn.bits))
+    if bits_pair != (4, 4):
+        key = key + bits_pair
     choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
     if choice is not None and seen >= CHECKS:
         if choice:

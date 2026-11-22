@@ -8,7 +8,7 @@ import sys
 
 # A Metal command buffer holds this many operations and MB before MLX commits it (where the environment
 # says nothing).  MLX reads them as it is imported, so here, before mlx.core is imported.
-MLX_BUFFERS = {'MLX_MAX_OPS_PER_BUFFER': '2000', 'MLX_MAX_MB_PER_BUFFER': '4000'}
+MLX_BUFFERS = {'MLX_MAX_OPS_PER_BUFFER': '300', 'MLX_MAX_MB_PER_BUFFER': '4000'}
 if sys.platform == 'darwin':
     for _name, _value in MLX_BUFFERS.items():
         os.environ.setdefault(_name, _value)
@@ -27,6 +27,7 @@ def _gpu_model(pattern='/proc/driver/nvidia/gpus/*/information'):
 
 if sys.platform != 'darwin' and _gpu_model():
     os.environ.setdefault('MLX_MAX_OPS_PER_BUFFER', '200')
+    os.environ.setdefault('MLX_MAX_MB_PER_BUFFER', '100000')
     os.environ.setdefault('MLX_CUDA_GRAPH_CACHE_SIZE', '100')
     os.environ.setdefault('CUDA_CACHE_MAXSIZE', str(4 << 30))
     try:

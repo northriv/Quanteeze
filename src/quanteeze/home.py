@@ -61,6 +61,21 @@ PRESETS = {
             'values': {'QUANTEEZE_MEMORY_RESERVE': '0.15'},
         },
     },
+    'wired': {
+        'off': {
+            'label': 'Off',
+            'about': "the default: MLX's memory wired only while it generates, as mlx-vlm wires it",
+            'values': {'QUANTEEZE_WIRED_GB': ''},
+        },
+        'auto': {
+            'label': 'Auto',
+            'about': 'wired from the load on, up to the working set Metal recommends (what mlx-vlm wires while it '
+                     'generates): less of the model compressed before the first request. macOS still lets it go '
+                     'within 30 s of the GPU falling idle, so the idle model is not kept from the compressor; while '
+                     'it loads, other apps have less room',
+            'values': {'QUANTEEZE_WIRED_GB': 'auto'},
+        },
+    },
     'ngram': {
         'auto': {
             'label': 'Auto',
@@ -85,6 +100,12 @@ PRESETS = {
             'about': 'drafts tokens ahead with the model\'s own MTP / DSpark head where that pays here, verified '
                      'bit for bit against single-token decode',
             'values': {'QUANTEEZE_MTP': '', 'QUANTEEZE_MTP_EXACT': ''},
+        },
+        'dflash2': {
+            'label': 'DFlash2',
+            'about': 'block-diffusion drafter (DFlash2) predicting a token block in parallel and tracing the '
+                     'coherent path via CandidateSelector',
+            'values': {'QUANTEEZE_MTP': 'dflash2', 'QUANTEEZE_MTP_EXACT': 'bits'},
         },
         'exact': {
             'label': 'On (exact)',
@@ -141,16 +162,27 @@ def hub():
     )
 
 
+VOLUMES = Path('/Volumes')
+
+
 def model_roots():
-    """Directories holding checkpoints as <org>/<name>: LM Studio's, and the two above the model
-    served (or the one the server started with)."""
+    """Directories holding checkpoints as <org>/<name>: LM Studio's, external volumes under
+    `/Volumes/*/lmstudio`, and the two above the model served (or the one the server started with)."""
     roots = [Path.home() / '.lmstudio' / 'models']
+    try:
+        roots += sorted(VOLUMES.glob('*/lmstudio'))
+    except OSError:
+        pass
     served = control.chosen() or control.current() or control.argument(sys.argv[1:], '--model')
     if served and Path(served).expanduser().is_dir():
         roots.append(Path(served).expanduser().resolve().parent.parent)
     out = []
     for r in roots:
-        if r.is_dir() and r not in out:
+        try:
+            ok = r.is_dir() and os.access(r, os.R_OK | os.X_OK)
+        except OSError:
+            ok = False
+        if ok and r not in out:
             out.append(r)
     return out
 
@@ -187,11 +219,20 @@ def checkpoints():
 
 
 def _drafter(path):
-    """Whether a checkpoint is an MTP drafter (its model type '..._mtp'), which serves beside a model."""
+    """Whether a checkpoint is a speculative drafter (`..._mtp`, `dflash`, `dflash2`, `dspark`, `eagle3`) rather
+    than a standalone model."""
     try:
-        return str(json.loads((Path(path) / 'config.json').read_text()).get('model_type', '')).endswith('_mtp')
+        cfg = json.loads((Path(path) / 'config.json').read_text())
     except (OSError, ValueError):
         return False
+    mtype = str(cfg.get('model_type', '')).lower()
+    archs = [str(a) for a in (cfg.get('architectures') or ())]
+    return (
+        mtype.endswith('_mtp')
+        or mtype in ('dflash', 'dflash2', 'dspark', 'eagle3')
+        or 'dflash_config' in cfg
+        or any('DraftModel' in a or 'DSparkModel' in a for a in archs)
+    )
 
 
 # ---------------------------------------------------------------- the catalog
@@ -479,17 +520,24 @@ def _working_set_gb():
     return round(w / 1e9, 1) if w else None
 
 
-def experts_bytes(path):
-    """Bytes a checkpoint's routed experts take at the original precision (decoder layers only)."""
+def experts_bytes(path, layers=None):
+    """Bytes a checkpoint's routed experts take at the original precision (decoder layers only; of `layers`
+    alone when given, e.g., a rank's run over several GPUs)."""
+    by = layer_experts_bytes(path)
+    return sum(b for layer, b in by.items() if layers is None or layer in layers)
+
+
+def layer_experts_bytes(path):
+    """`{decoder layer: bytes its routed experts take at the original precision}` of a checkpoint."""
     reader = q2_experts.Checkpoint(path)
-    total = 0
+    out = {}
     for layer in range(_decoder_layers(reader.path) or 0):
         for p in ('gate_proj', 'up_proj', 'down_proj'):
             for part in ('weight', 'scales', 'biases'):
                 if reader.has(layer, p, part):
                     _, dtype, shape, _ = reader.tensors[reader.name(layer, p, part)]
-                    total += int(np.prod(shape)) * ITEMSIZE.get(dtype, 1)
-    return total
+                    out[layer] = out.get(layer, 0) + int(np.prod(shape)) * ITEMSIZE.get(dtype, 1)
+    return out
 
 
 def uniform_bytes(path):
@@ -549,7 +597,7 @@ def start(path, bits=None, from_ssd_gb=None):
         raise ValueError('; '.join(f'{n}: {why}' for n, why in out['rejected'].items()))
     resolved = ngram_source(path)[0]
     try:
-        return control.switch_model(resolved)
+        return control.switch_model(resolved, undo=previous)
     except ValueError:
         control.change(previous)
         raise
@@ -576,6 +624,12 @@ def presets():
         }
     if sys.platform != 'darwin':
         out['heat']['note'] = 'Only macOS tells quanteeze how hot it runs: here none of these slows it down.'
+    import mlx.core as mx
+    if not mx.metal.is_available():
+        out['wired']['note'] = (
+            "Only Metal wires memory (the Mac's memory, shared with the GPU): a GPU's own "
+            "memory is not compressed or paged by the system, and here neither choice does anything."
+        )
     out['loaded'] = control._LOADED[0] is not None
     out['sampling'] = {key: os.environ.get(name) or None for name, key in control.SAMPLING.items()}
     return out
@@ -741,6 +795,11 @@ def connect():
         'model': control.serving(),
         'local_only': host in ('127.0.0.1', 'localhost', '::1'),
         'claude_code': f'ANTHROPIC_BASE_URL={base} ANTHROPIC_AUTH_TOKEN=local claude',
+        'codex': (
+            'codex -c model_provider="quanteeze" -c model="local" '
+            f'-c \'model_providers.quanteeze={{name="Quanteeze",base_url="{base}/v1",'
+            'wire_api="responses",requires_openai_auth=false,stream_idle_timeout_ms=7200000}\''
+        ),
         'curl': f'curl {base}/v1/chat/completions -H "Content-Type: application/json" '
                 '-d \'{"model": "local", "messages": [{"role": "user", "content": "Hello"}]}\'',
     }

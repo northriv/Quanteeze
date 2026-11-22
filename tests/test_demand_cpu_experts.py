@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0
-"""Tests for `quanteeze.cpu_experts` mailbox servers (`Server`, `PyServer`), CUDA `cpu_ask`/`cpu_wait`
+"""Tests for `quanteeze.cpu_experts` mailbox `Server`, CUDA `cpu_ask`/`cpu_wait`
 handshake, and `quanteeze.demand.Demand` CPU expert offload (`QUANTEEZE_CPU_EXPERTS`)."""
 import time
-from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -106,7 +105,7 @@ def _poll_answer(ans_row, stamp, timeout_s=2.0):
 
 
 @pytest.mark.parametrize('mode', ['affine', 'mxfp4'])
-def test_cpp_server_and_pyserver_answer_identically(mode, monkeypatch):
+def test_cpp_server_answers_match_reference(mode, monkeypatch):
     if mode == 'mxfp4':
         pytest.importorskip('mlx_vlm.models.deepseek_v41.fakequant')
     monkeypatch.setattr(ce, '_STATE', {'checked': ce.CHECKS, 'failed': None})
@@ -116,37 +115,40 @@ def test_cpp_server_and_pyserver_answer_identically(mode, monkeypatch):
     x = rng.normal(0, 1, HIDDEN).astype(np.float32)
     slots = np.array([1, 5, 9], np.int32)
     weights = np.array([0.2, 0.35, 0.45], np.float32)
-    outs = []
-    for cls in (ce.Server, ce.PyServer):
-        pool = ce.Pool(2, priority='normal')
-        server = cls(pool, [3], HIDDEN, pinned=False)
-        try:
-            act_style = 'deepseek_v41' if mode == 'mxfp4' else 'plain'
-            lim = LIMIT if mode == 'mxfp4' else 0.0
-            server.add(3, spec, lim, act_style)
-            server.start()
+    pool = ce.Pool(2, priority='normal')
+    server = ce.Server(pool, [3], HIDDEN, pinned=False)
+    try:
+        act_style = 'deepseek_v41' if mode == 'mxfp4' else 'plain'
+        lim = LIMIT if mode == 'mxfp4' else 0.0
+        server.add(3, spec, lim, act_style)
+        server.start()
 
-            b = server.box[3]
-            b[ce.SERVE_HEAD:ce.SERVE_HEAD + HIDDEN].view(np.float32)[:] = x
-            b[1] = len(slots)
-            b[2:2 + len(slots)] = slots
-            b[2 + ce.SERVE_MMAX:2 + ce.SERVE_MMAX + len(slots)].view(np.float32)[:] = weights
-            stamp = int(b[0]) + 1
-            b[0] = stamp
-            assert _poll_answer(server.ans[3], stamp)
-            assert int(server.ans[3, 1]) == len(slots)
-            assert server.ans[3, 2:2 + len(slots)].tolist() == [1, 1, 1]
-            ans_out = server.ans[3, ce.SERVE_HEAD:].view(np.float32).reshape(ce.SERVE_MMAX, HIDDEN)[:len(slots)].copy()
-            outs.append(ans_out)
-            counts = server.counts()
-            assert counts['requests'] == 1 and counts['experts'] == 3 and counts['failed'] == 0
-            assert server.quiet()
-        finally:
-            server.close()
-            pool.close()
-    a, b = outs
-    assert np.abs(b).max() > 0
-    assert np.abs(a - b).max() <= 1e-2 * np.abs(b).max()
+        b = server.box[3]
+        b[ce.SERVE_HEAD:ce.SERVE_HEAD + HIDDEN].view(np.float32)[:] = x
+        b[1] = len(slots)
+        b[2:2 + len(slots)] = slots
+        b[2 + ce.SERVE_MMAX:2 + ce.SERVE_MMAX + len(slots)].view(np.float32)[:] = weights
+        stamp = int(b[0]) + 1
+        b[0] = stamp
+        assert _poll_answer(server.ans[3], stamp)
+        assert int(server.ans[3, 1]) == len(slots)
+        assert server.ans[3, 2:2 + len(slots)].tolist() == [1, 1, 1]
+        ans_out = server.ans[3, ce.SERVE_HEAD:].view(np.float32).reshape(ce.SERVE_MMAX, HIDDEN)[:len(slots)].copy()
+        want = np.stack([
+            ce.native_reference(
+                ce.layer_expert(spec, int(slot)), x, lim, float(w), act_style,
+                q8=pool.q8 and pool.isa >= 1,
+            )
+            for slot, w in zip(slots, weights)
+        ], axis=0)
+        assert np.abs(want).max() > 0
+        assert np.abs(ans_out - want).max() <= 1e-2 * np.abs(want).max()
+        counts = server.counts()
+        assert counts['requests'] == 1 and counts['experts'] == 3 and counts['failed'] == 0
+        assert server.quiet()
+    finally:
+        server.close()
+        pool.close()
 
 
 @pytest.mark.parametrize('mode', ['affine', 'mxfp4'])
@@ -234,11 +236,11 @@ def test_demand_partial_host_and_ssd_miss_with_mock_cuda_server(tmp_path, monkey
         def call(inputs, template, grid, threadgroup, output_shapes, output_dtypes):
             rows_mx, inv_mx, weights_mx, x_mx, addr_mx = inputs
             tmap = dict(template)
-            m_n, k_n, d_n = tmap['M'], tmap['K'], tmap['D']
+            b_n, m_n, k_n, d_n = tmap.get('B', 1), tmap['M'], tmap['K'], tmap['D']
             head, mmax, weighs = tmap['HEAD'], tmap['MMAX'], tmap['WEIGHS']
             box_ptr = int(np.array(addr_mx)[0])
             raw_box = host_boxes_lookup(box_ptr)
-            box = raw_box[:head + d_n]
+            box = raw_box[:head + b_n * d_n]
             rows_np = np.array(rows_mx, dtype=np.int32).reshape(-1)
             inv_np = np.array(inv_mx, dtype=np.int32).reshape(-1)
             w_np = np.array(weights_mx, dtype=np.float32).reshape(-1)
@@ -246,16 +248,22 @@ def test_demand_partial_host_and_ssd_miss_with_mock_cuda_server(tmp_path, monkey
             if not np.any(rows_np >= 0):
                 return [mx.array([0, 0, 0, 0], dtype=mx.int32)]
             stamp = int(box[0]) + 1
-            box[head:head + d_n].view(np.float32)[:] = x_np
+            box[head:head + b_n * d_n].view(np.float32)[:] = x_np
             box[1] = m_n
+            box[2 + 3 * mmax] = b_n
+            k_per = (k_n // b_n) if b_n > 1 else k_n
             for m in range(m_n):
                 box[2 + m] = int(rows_np[m])
                 wt = 1.0
-                if weighs:
-                    for j in range(k_n):
-                        if int(inv_np[j]) == m:
+                xr = 0
+                for j in range(k_n):
+                    if int(inv_np[j]) == m:
+                        if weighs:
                             wt = float(w_np[j])
+                        xr = j // k_per if k_per > 0 else 0
+                        break
                 box[2 + mmax + m:2 + mmax + m + 1].view(np.float32)[0] = wt
+                box[2 + 2 * mmax + m] = xr
             box[0] = stamp
             return [mx.array([stamp, 0, 0, 0], dtype=mx.int32)]
         return call
@@ -344,24 +352,18 @@ def test_demand_partial_host_and_ssd_miss_with_mock_cuda_server(tmp_path, monkey
         # Also test direct cpu_ask / cpu_wait no-request and timeout cases.
         addr = dem._cpu.server.addr[0]
         y_init = mx.array(rng.normal(0, 1, (1, 1, K, HIDDEN)).astype(np.float32)).astype(mx.bfloat16)
-        got_empty, st_empty = ce.cpu_computed(
-            SimpleNamespace(addr=addr, status=[]),
-            x, y_init,
-            mx.full((3,), -1, dtype=mx.int32),
-            mx.full((K,), -1, dtype=mx.int32),
-        )
+        inv_empty = mx.full((K,), -1, dtype=mx.int32)
+        tok_empty = ce.cpu_ask(addr, x, mx.full((3,), -1, dtype=mx.int32), inv_empty)
+        got_empty, st_empty = ce.cpu_wait(addr, tok_empty, y_init, inv_empty, most=3)
         assert np.array(st_empty).tolist()[:3] == [0, 0, 1]
         assert mx.array_equal(got_empty, y_init).item()
 
         # Timeout test when nobody answers stamp.
         monkeypatch.setattr(ce, 'CPU_TIMEOUT_NS', 10_000_000)
         dem._cpu.server.close()
-        got_late, st_late = ce.cpu_computed(
-            SimpleNamespace(addr=addr, status=[]),
-            x, y_init,
-            mx.array([0, 1], dtype=mx.int32),
-            mx.array([0, 1, -1, -1], dtype=mx.int32),
-        )
+        inv_late = mx.array([0, 1, -1, -1], dtype=mx.int32)
+        tok_late = ce.cpu_ask(addr, x, mx.array([0, 1], dtype=mx.int32), inv_late)
+        got_late, st_late = ce.cpu_wait(addr, tok_late, y_init, inv_late, most=2)
         assert np.array(st_late).tolist()[:2] == [0, 1]
         assert mx.array_equal(got_late, y_init).item()
     finally:

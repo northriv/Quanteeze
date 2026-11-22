@@ -313,6 +313,32 @@ class ExpertGGUF:
         mx.eval(buf)
         return [buf, None, None]
 
+    def segments(self, layer, projection, expert_id, out):
+        """Return `[(file, byte_offset, nbytes, ptr, u8_view, key)]` for direct C++ `pread` into `out`."""
+        buf = out[0]
+        key = self.name(layer, projection, 'weight')
+        held = self.held()
+        if held is not None and held.holds_expert(layer, key, expert_id):
+            return None
+        entry = self.tensors.get(key)
+        if entry is None:
+            return None
+        file, _, shape, offset = entry
+        row_bytes = int(np.prod(shape[1:], dtype=np.int64))
+        arr_np = np.asarray(buf)
+        if not arr_np.flags.c_contiguous or not arr_np.flags.writeable or arr_np.nbytes != row_bytes:
+            return None
+        if file is not None:
+            target_file, byte_off = file, int(offset) + int(expert_id) * row_bytes
+        else:
+            target_file, byte_off = offset[int(expert_id)][0], int(offset[int(expert_id)][1])
+        u8 = arr_np.view(np.uint8).reshape(-1)
+        return [(str(target_file), byte_off, row_bytes, int(u8.ctypes.data), u8, key)]
+
+    def made(self, layer, projection, out):
+        """Wrap buffers `out` (populated by `segments()` read) as MLX arrays."""
+        return [out[0], None, None]
+
     def ahead(self, items):
         """Start reading `[(tensor name, rows or None for all)]` on a background thread."""
         if self._pool is None:

@@ -22,7 +22,7 @@ or an argument whose prompt axis cannot be told, goes through whole, as the mode
 
 enabled() is asked each call: true while the model is served on demand from the SSD.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import threading
 import time
 
@@ -30,6 +30,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 _STATE = threading.local()
+TURNS = None
 JOIN_TOKENS = 2048
 JOIN_CHECKS = 2
 JOINS = {}
@@ -153,6 +154,16 @@ def _tiling(layer):
     return max(1, -(-64 // max(1, int(top_k))))
 
 
+def _turn(layer):
+    t = TURNS
+    return nullcontext() if t is None else t.turn(layer)
+
+
+def _chunk_step():
+    t = TURNS
+    return SETTINGS.chunk if t is None or not t.active() else min(SETTINGS.chunk, t.tokens())
+
+
 def _windows(parts, layer):
     from . import arch, cuda_kernels, variables
     sw = arch.switch_of(layer)
@@ -165,7 +176,10 @@ def _windows(parts, layer):
         target = JOIN_TOKENS if (cuda_kernels.available() or getattr(sw, 'demand', None) is not None) else 0
     else:
         target = int(raw)
-    if target <= SETTINGS.chunk:
+    t = TURNS
+    if target and t is not None and t.active() and t.contended():
+        target = min(target, t.tokens())
+    if target <= _chunk_step():
         return [[p] for p in parts]
     min_len = _tiling(layer)
     out = []
@@ -279,23 +293,25 @@ def _in_two(layer, x, n, parts, cuts, windows, sp):
         staged = []
         for a, b in window:
             cargs, ckwargs = cut_map[(a, b)]
-            got = pre(layer, x[:, a:b], *cargs, **ckwargs)
-            vals = got if isinstance(got, tuple) else (got,)
-            arrays = [v for v in vals if isinstance(v, mx.array)]
-            if arrays:
-                mx.eval(*arrays)
+            with _turn(layer):
+                got = pre(layer, x[:, a:b], *cargs, **ckwargs)
+                vals = got if isinstance(got, tuple) else (got,)
+                arrays = [v for v in vals if isinstance(v, mx.array)]
+                if arrays:
+                    mx.eval(*arrays)
             staged.append(((a, b), vals))
         TIMES['pre'] += time.perf_counter() - t0
         t1 = time.perf_counter()
         w_start, w_end = window[0][0], window[-1][1]
-        if len(window) == 1:
-            out = post(layer, *staged[0][1])
-        else:
-            out = _joined_post(layer, post, staged)
-        if whole is None:
-            whole = _whole(out, n, w_end - w_start)
-        whole = _put(whole, out, w_start, w_end)
-        mx.eval(whole)
+        with _turn(layer):
+            if len(window) == 1:
+                out = post(layer, *staged[0][1])
+            else:
+                out = _joined_post(layer, post, staged)
+            if whole is None:
+                whole = _whole(out, n, w_end - w_start)
+            whole = _put(whole, out, w_start, w_end)
+            mx.eval(whole)
         TIMES['post'] += time.perf_counter() - t1
         del staged, out
     return whole
@@ -304,7 +320,7 @@ def _in_two(layer, x, n, parts, cuts, windows, sp):
 def _chunked(cls):
     def __call__(self, x, *args, **kwargs):
         n = x.shape[1] if isinstance(x, mx.array) and x.ndim >= 2 else 0
-        step = SETTINGS.chunk
+        step = _chunk_step()
         parts = [(a, min(a + step, n)) for a in range(0, n, step)] if n else []
         if (len(parts) <= 1 or x.shape[0] != 1 or getattr(_STATE, 'in_layer', False)
                 or not SETTINGS.enabled()):
@@ -325,12 +341,13 @@ def _chunked(cls):
                 whole = _in_two(self, x, n, parts, cuts, windows, sp)
             else:
                 for (a, b), (cargs, ckwargs) in zip(parts, cuts):
-                    out = cls.__call__(self, x[:, a:b], *cargs, **ckwargs)
-                    if whole is None:
-                        whole = _whole(out, n, b - a)
-                    whole = _put(whole, out, a, b)
-                    mx.eval(whole)
-                    del out
+                    with _turn(self):
+                        out = cls.__call__(self, x[:, a:b], *cargs, **ckwargs)
+                        if whole is None:
+                            whole = _whole(out, n, b - a)
+                        whole = _put(whole, out, a, b)
+                        mx.eval(whole)
+                        del out
             ok = True
         finally:
             _STATE.in_layer = False

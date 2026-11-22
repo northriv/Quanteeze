@@ -15,7 +15,7 @@ import mlx.core as mx
 from . import cuda_experts, cuda_kernels, cuda_qmv, cuda_router
 
 CHECKS = 3
-STATS = dict(served=0, checked=0, mismatched=0)
+STATS = dict(served=0, shared=0, checked=0, mismatched=0)
 CHOICE = {}                     # (slots, experts, hidden, inner, shared inner): whether it matched
 CHECKED = {}
 SAID = []
@@ -331,6 +331,149 @@ def feed_forward(forward, block, x, hyper, weights):
         if not SAID:
             SAID.append(True)
             print(f'quanteeze: the MoE block\'s kernels unavailable ({type(error).__name__}: {error})',
+                  file=sys.stderr, flush=True)
+        same = False
+    STATS['checked'] += 1
+    STATS['mismatched'] += not same
+    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    return want
+
+
+# A decode's shared expert behind its gate in two kernels, at 8 bits (gated_shared()).
+SHARED_IN_SOURCE = r"""
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+    const int wid = warp.meta_group_rank();
+    const int lane = warp.thread_rank();
+    constexpr int SB = (IS + 3) / 4;
+    const int b = blockIdx.x;
+    __shared__ T gu[2][4];
+    if (b < SB) {
+      const int q = wid & 3;
+      const bool up = wid >= 4;
+      const int row = b * 4 + q;
+      if (row < IS) {
+        const float s = qz_qmv8_row<K, SGS, true>(x, up ? uw : gw, up ? usc : gsc, up ? ubi : gbi, row);
+        if (lane == 0) {
+          gu[up][q] = static_cast<T>(s);
+        }
+      }
+      block.sync();
+      const int t = threadIdx.x;
+      if (t < 4 && b * 4 + t < IS) {
+        const T g = gu[0][t];
+        sh[b * 4 + t] = Multiply{}(Multiply{}(g, Sigmoid{}(g)), gu[1][t]);
+      }
+    } else if (wid == 0) {
+      const float s = qz_qmv8_row<K, GGS, true>(x, ew, esc, ebi, 0);
+      if (lane == 0) {
+        sgate[0] = Sigmoid{}(static_cast<T>(s));
+      }
+    }
+"""
+
+SHARED_OUT_SOURCE = r"""
+    auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+    const int row = blockIdx.x * 8 + warp.meta_group_rank();
+    if (row >= D) {
+      return;
+    }
+    const float s = qz_qmv8_row<IS, DGS, true>(sh, dw, dsc, dbi, row);
+    if (warp.thread_rank() == 0) {
+      y[row] = QzMul{}(sgate[0], static_cast<T>(s));
+    }
+"""
+
+
+@lru_cache(maxsize=None)
+def _shared_kernels():
+    return (
+        cuda_kernels.kernel(
+            'quanteeze_shared8_in',
+            ['x', 'gw', 'gsc', 'gbi', 'uw', 'usc', 'ubi', 'ew', 'esc', 'ebi'],
+            ['sh', 'sgate'],
+            SHARED_IN_SOURCE,
+            cuda_qmv.HEADER,
+        ),
+        cuda_kernels.kernel(
+            'quanteeze_shared8_out',
+            ['sh', 'dw', 'dsc', 'dbi', 'sgate'],
+            ['y'],
+            SHARED_OUT_SOURCE,
+            cuda_qmv.HEADER,
+        ),
+    )
+
+
+def shared(block, x):
+    """sigmoid(shared_expert_gate(x)) * shared_expert(x) for one token of an 8-bit shared expert."""
+    se, gate = block.shared_expert, block.shared_expert_gate
+    g, u, dn = se.gate_proj, se.up_proj, se.down_proj
+    inner, k, d = g.weight.shape[0], x.shape[-1], dn.weight.shape[0]
+    first, second = _shared_kernels()
+    sh, sgate = first(
+        inputs=[mx.contiguous(x), g.weight, g.scales, g.biases, u.weight, u.scales, u.biases, gate.weight,
+                gate.scales, gate.biases],
+        template=[('T', x.dtype), ('K', k), ('IS', inner), ('SGS', int(g.group_size)), ('GGS', int(gate.group_size))],
+        grid=(256 * (-(-inner // 4) + 1), 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(1, 1, inner), (cuda_kernels.roomy(1, x.dtype),)], output_dtypes=[x.dtype] * 2)
+    return second(
+        inputs=[sh, dn.weight, dn.scales, dn.biases, sgate],
+        template=[('T', x.dtype), ('IS', inner), ('D', d), ('DGS', int(dn.group_size))],
+        grid=(32 * -(-d // 8), 8, 1), threadgroup=(32, 8, 1),
+        output_shapes=[(*x.shape[:-1], d)], output_dtypes=[x.dtype],
+    )[0]
+
+
+def _row8(p, x):
+    return (type(p).__name__ == 'QuantizedLinear' and isinstance(p.get('scales'), mx.array) and 'bias' not in p
+            and p.bits == 8 and cuda_qmv.one_row(x, p.weight, p.scales, p.get('biases'), True, p.group_size, p.bits,
+                                                 p.mode))
+
+
+def shared_takes(block, x):
+    """Whether shared() computes this block's gated shared expert at 8 bits on CUDA."""
+    if not (cuda_kernels.available() and x.dtype == mx.bfloat16 and x.ndim == 3 and x.shape[:2] == (1, 1)):
+        return False
+    known = getattr(block, '_quanteeze_shared8', None)
+    if known is not None and known[0] == x.shape[-1]:
+        return known[1]
+    se, gate = block.get('shared_expert'), block.get('shared_expert_gate')
+    ok = (se is not None and gate is not None and all(hasattr(se, n) for n in ('gate_proj', 'up_proj', 'down_proj'))
+          and _row8(se.gate_proj, x) and _row8(se.up_proj, x) and _row8(gate, x) and gate.weight.shape[0] == 1
+          and se.gate_proj.weight.shape == se.up_proj.weight.shape
+          and se.gate_proj.group_size == se.up_proj.group_size
+          and _row8(se.down_proj, mx.zeros((1, 1, se.gate_proj.weight.shape[0]), x.dtype)))
+    object.__setattr__(block, '_quanteeze_shared8', (x.shape[-1], ok))
+    return ok
+
+
+def gated_shared(forward, block, x):
+    """Compute sigmoid(shared_expert_gate(x)) * shared_expert(x), using 8-bit fused kernels when bit-verified."""
+    def theirs():
+        out = forward._feed_forward(block.shared_expert, x)
+        return mx.sigmoid(forward._linear(block.shared_expert_gate, x)) * out
+
+    if not cuda_kernels.FUSE[0] or not shared_takes(block, x):
+        return theirs()
+    se = block.shared_expert
+    key = ('shared', x.shape[-1], se.gate_proj.weight.shape[0], int(se.gate_proj.group_size),
+           int(se.down_proj.group_size), int(block.shared_expert_gate.group_size))
+    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    if choice is not None and seen >= CHECKS:
+        if choice:
+            STATS['shared'] = STATS.get('shared', 0) + 1
+            return shared(block, x)
+        return theirs()
+    want = theirs()
+    try:
+        same = mx.array_equal(shared(block, x), want).item()
+    except Exception as error:
+        if 'transformations' in str(error):
+            return want
+        if not SAID:
+            SAID.append(True)
+            print(f'quanteeze: the shared expert\'s kernels unavailable ({type(error).__name__}: {error})',
                   file=sys.stderr, flush=True)
         same = False
     STATS['checked'] += 1

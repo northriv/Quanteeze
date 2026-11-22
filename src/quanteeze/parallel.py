@@ -58,6 +58,9 @@ _OWNED = [None]      # this rank's decoder layer range, once split() made it
 _PEERS = []          # rank 0: a connection to each other rank, in order; the others: the one to rank 0
 _SENT = {}           # rank 0: the variables as last sent
 _LAST = [None]       # the last collective this rank issued (_collective)
+_ON_HOST = [None]    # how many ranks run on this rank's host, once init() asked them all
+_HOSTS = [None]      # every rank's host (its _host_id), once init() asked them all
+_CUT = [None]        # the runs' first layers and the end, once split() made them
 _LAYER = re.compile(r'^(?:language_model\.)?(?:model\.)?layers\.(\d+)\.')
 _STACKED_EXPERT = re.compile(
     r'^(?:language_model\.)?(?:model\.)?layers\.(\d+)\.(.+)\.(gate_proj|up_proj|down_proj)\.(weight|scales?|biases)$'
@@ -77,7 +80,77 @@ def rank():
 
 
 def owned():
+    """This rank's run of the decoder layers (a range), once the model is split; None in one process."""
     return _OWNED[0]
+
+
+# -- the split's rule: a rank's work within its own layers ------------------------------------------
+# Over several GPUs each rank works within its own run of the layers alone (owned()); what crosses
+# between ranks is the state handed on at a run's end and the collectives every rank joins. A layer
+# of another rank asked for is a crossing: refused, counted (crossings()), and logged once -- or
+# raised as Crossing under QUANTEEZE_PARALLEL_CROSSING=raise.
+
+_CROSSED = {}        # what: how many times a layer of another rank was asked for it
+
+
+class Crossing(RuntimeError):
+    """A rank asked to work on a layer of another rank's run."""
+
+
+def own_layer(j):
+    """Whether decoder layer j belongs to this rank (every layer in one process)."""
+    own = _OWNED[0]
+    return own is None or int(j) in own
+
+
+def keep(j, what):
+    """Whether this rank may do `what` with layer j: its own, or one process; a layer of another rank refused
+    (False), counted and logged the first time -- or raises Crossing under QUANTEEZE_PARALLEL_CROSSING=raise."""
+    if own_layer(j):
+        return True
+    refuse(what, f"layer {j} is not this rank's (layers {_OWNED[0].start}-{_OWNED[0].stop - 1})")
+    return False
+
+
+def require(j, what):
+    """As keep(), for work that cannot be skipped (e.g., reading an expert's arrays): a layer of another rank raises
+    regardless of QUANTEEZE_PARALLEL_CROSSING."""
+    if not keep(j, what):
+        raise Crossing(f"quanteeze: rank {rank()} asked for layer {j}'s {what}, another rank's")
+
+
+def refuse(what, why):
+    """Record a split crossing in crossings(), log once, or raise Crossing under QUANTEEZE_PARALLEL_CROSSING=raise."""
+    n = _CROSSED[what] = _CROSSED.get(what, 0) + 1
+    if (variables.get('QUANTEEZE_PARALLEL_CROSSING') or 'refuse').lower() == 'raise':
+        raise Crossing(f'quanteeze: rank {rank()}: {what} crosses the split: {why}')
+    if n == 1:
+        print(f'quanteeze: rank {rank()}: {what} refused, it crosses the split: {why} (counted; '
+              f'QUANTEEZE_PARALLEL_CROSSING=raise stops at it)', file=sys.stderr, flush=True)
+
+
+def crossings():
+    """`{what: times refused}` in this process (empty when nothing crossed)."""
+    return dict(_CROSSED)
+
+
+def runs_here():
+    """Layer ranges (runs) for ranks sharing this host, including this rank's, once split(); None in one process."""
+    cut, hosts = _CUT[0], _HOSTS[0]
+    if cut is None or _OWNED[0] is None:
+        return None
+    mine = hosts[rank()] if hosts else None
+    return [range(cut[r], cut[r + 1]) for r in range(len(cut) - 1) if hosts is None or hosts[r] == mine]
+
+
+def on_this_host():
+    """How many ranks share this host's memory (populated in init(); defaults to size() before init)."""
+    return _ON_HOST[0] or size()
+
+
+def _host_id(name=None):
+    import zlib
+    return zlib.crc32((name or socket.gethostname()).encode()) & 0x7fffffff
 
 
 # -- the launch ------------------------------------------------------------------------------------
@@ -180,7 +253,7 @@ def _tensor_elements(dtype, shape, scales_shape, q_bits, q_group):
     return lead * cols
 
 
-def sizes(path, experts_gguf=None):
+def sizes(path, experts_gguf=None, include_vision=False):
     """({decoder layer: bytes}, bytes of the rest) of the language model in the checkpoint at
     `path`, from its safetensors headers, accounting for off-GPU tables, `QUANTEEZE_BITS`, and
     `--experts-gguf` / `QUANTEEZE_EXPERTS_GGUF`."""
@@ -195,10 +268,14 @@ def sizes(path, experts_gguf=None):
     q_group = quant_cfg.get('group_size')
     v41_img = (variables.get('QUANTEEZE_V41_READS_IMAGES') or 'on').strip().lower()
     skip_embed = model_type == 'deepseek_v41' or (variables.get('QUANTEEZE_EMBED_SSD') or '').strip().lower() == 'on'
-    skip_vision = (
-        (model_type == 'deepseek_v41' and v41_img in ('off', 'ssd'))
-        or (variables.get('QUANTEEZE_VISION_SSD') or '').strip().lower() == 'on'
-    )
+    if include_vision:
+        skip_vision = model_type == 'deepseek_v41' and v41_img == 'off'
+    else:
+        from . import vision_ssd
+        skip_vision = (
+            (model_type == 'deepseek_v41' and v41_img in ('off', 'ssd'))
+            or vision_ssd.enabled(path)
+        )
     gguf_path = Path(experts_gguf).expanduser() if experts_gguf is not None else _experts_gguf_path()
     target_bits = None if gguf_path is not None else _bits_target()
 
@@ -461,6 +538,13 @@ def init(backend='nccl'):
         conn.send(group.rank())
         _PEERS[:] = [conn]
     GROUP[0] = group
+    mine = _host_id()
+    hosts = mx.zeros((group.size(),), mx.int32).at[group.rank()].add(mine)
+    hosts = _collective(hosts, lambda x: mx.distributed.all_sum(x, group=group)).tolist()
+    _ON_HOST[0] = hosts.count(mine)
+    _HOSTS[0] = hosts
+    print(f'quanteeze: rank {group.rank()} of {group.size()} on {socket.gethostname()}, {_ON_HOST[0]} rank(s) '
+          f'on this host, {len(set(hosts))} host(s)', file=sys.stderr, flush=True)
     return group
 
 
@@ -738,6 +822,8 @@ def split(model):
     lm.make_cache = own_caches
     print(f'quanteeze: rank {rank()} of {size()}: layers {own.start}-{own.stop - 1} of {len(layers)} '
           f'(runs from {cut[:-1]})', file=sys.stderr, flush=True)
+    _CROSSED.clear()
+    _CUT[0] = cut
     _OWNED[0] = own
     return own
 

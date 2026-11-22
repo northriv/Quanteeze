@@ -51,6 +51,7 @@ PRIORITIES = ('idle', 'nice', 'normal', 'wake')
 CPU_EXPERTS = ('off', 'on', 'auto')
 
 SERVE_MMAX = 16
+SERVE_BMAX = 8
 SERVE_HEAD = 64
 SERVE_SPIN_US = 100
 QUIET_S = 1.0
@@ -274,11 +275,12 @@ def lib():
             loaded.qz_pool_busy.argtypes = [ctypes.c_void_p]
             loaded.qz_pool_stats.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             loaded.qz_pool_stall.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+            loaded.qz_pool_q8.argtypes = [ctypes.c_void_p, ctypes.c_int]
             loaded.qz_pool_stall_before.argtypes = [ctypes.c_void_p, ctypes.c_int64]
             loaded.qz_reference.argtypes = [ctypes.c_void_p, f32, f32]
             loaded.qz_expert_reference.argtypes = [
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, f32, f32,
-                ctypes.c_float, ctypes.c_float, ctypes.c_int,
+                ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int,
             ]
             loaded.qz_activate.argtypes = [
                 f32, f32, f32, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int,
@@ -322,40 +324,7 @@ def isa():
     return None if got is None else int(got.qz_isa())
 
 
-# ---------------------------------------------------------------- numpy & C++ references
-
-
-def bf16(a):
-    """bf16 bits (`uint16`) as `float32`."""
-    return (np.asarray(a, np.uint16).astype(np.uint32) << 16).view(np.float32)
-
-
-def unpack(weight, bits):
-    """Unpack MLX affine `[rows, words]` `uint32` words into `[rows, words * 32 / bits]` codes."""
-    w = np.asarray(weight, np.uint32)
-    per = 32 // bits
-    shifts = (np.arange(per, dtype=np.uint32) * bits)[None, None, :]
-    return ((w[..., None] >> shifts) & np.uint32((1 << bits) - 1)).reshape(w.shape[0], -1)
-
-
-E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
-
-
-def affine_reference(weight, scales, biases, bits, group, x):
-    """Exact `float64` `W x` reference for an MLX `affine` projection."""
-    q = unpack(weight, bits).astype(np.float64)
-    rows, cols = q.shape
-    w = q.reshape(rows, cols // group, group) * bf16(scales)[..., None] + bf16(biases)[..., None]
-    return (w.reshape(rows, cols) @ np.asarray(x, np.float64)).astype(np.float32)
-
-
-def mxfp4_reference(weight, scales, x):
-    """Exact `float64` `W x` reference for an `mxfp4` projection."""
-    codes = unpack(weight, 4)
-    rows, cols = codes.shape
-    scale = np.ldexp(1.0, np.asarray(scales, np.int64) - 127)
-    w = E2M1[codes].astype(np.float64).reshape(rows, cols // 32, 32) * scale[..., None]
-    return (w.reshape(rows, cols) @ np.asarray(x, np.float64)).astype(np.float32)
+# ---------------------------------------------------------------- elementwise roundings & C++ reference
 
 
 def to_bf16(a):
@@ -389,21 +358,7 @@ def activate(gate, up, limit=0.0, weight=1.0, activation='plain'):
     return fp8_roundtrip(to_bf16(h)) if v41 else h
 
 
-def project_reference(p, x):
-    if p['kind'] == 'mxfp4':
-        return mxfp4_reference(p['weight'], p['scales'], x)
-    return affine_reference(p['weight'], p['scales'], p['biases'], p['bits'], p['group'], x)
-
-
-def expert_reference(expert, x, limit=0.0, weight=1.0, activation='plain'):
-    """NumPy reference output `[D]` for one expert on input `x [D]`."""
-    h = activate(project_reference(expert['gate_proj'], x), project_reference(expert['up_proj'], x),
-                 limit, weight, activation)
-    y = project_reference(expert['down_proj'], h)
-    return to_bf16(y) if activation == 'deepseek_v41' else y
-
-
-def native_reference(expert, x, limit=0.0, weight=1.0, activation='plain'):
+def native_reference(expert, x, limit=0.0, weight=1.0, activation='plain', q8=False):
     """Single-threaded C++ `float64` reference (`qz_expert_reference`), avoiding BLAS worker threads."""
     x = np.ascontiguousarray(x, np.float32)
     gate, up, down = (_proj(expert[n]) for n in ('gate_proj', 'up_proj', 'down_proj'))
@@ -411,7 +366,7 @@ def native_reference(expert, x, limit=0.0, weight=1.0, activation='plain'):
     lib().qz_expert_reference(
         ctypes.byref(gate), ctypes.byref(up), ctypes.byref(down),
         _fptr(x), _fptr(out), ctypes.c_float(limit), ctypes.c_float(weight),
-        ACTIVATIONS.index(activation),
+        ACTIVATIONS.index(activation), int(bool(q8)),
     )
     return out
 
@@ -553,7 +508,7 @@ def default_threads():
 class Pool:
     """Lock-free C++ thread pool executing single-expert MLPs directly from `HostCopy` memory."""
 
-    def __init__(self, threads=None, isa_level=None, allowed=None, priority=None, spin_us=None, cpus=None):
+    def __init__(self, threads=None, isa_level=None, allowed=None, priority=None, spin_us=None, cpus=None, q8=None):
         self.threads = default_threads() if threads is None else max(1, int(threads))
         prio_name = default_priority(priority)
         self.priority = PRIORITIES.index(prio_name)
@@ -566,6 +521,9 @@ class Pool:
             lib().qz_pool_new(self.threads, self.priority, self.spin_us, held.ctypes.data, len(self.cpus))
             if lib() is not None else None
         )
+        self.q8 = (not variables.off('QUANTEEZE_CPU_Q8')) if q8 is None else bool(q8)
+        if self._handle is not None:
+            lib().qz_pool_q8(ctypes.c_void_p(self._handle), int(self.q8))
 
     def expert(self, expert, x, limit=0.0, weight=1.0, activation='plain'):
         """Compute one expert's output `[D]` float32 for `x [D]`, returning `None` if disabled or invalid."""
@@ -588,13 +546,13 @@ class Pool:
             return done, out
 
         done, out = run('plain' if _STATE['checked'] < CHECKS else activation)
-        if done == -2:
+        if done in (-2, -3):
             return None
         if done != 0:
             _STATE['failed'] = 'unsupported expert projection shape for CPU offload'
             return None
         if _STATE['checked'] < CHECKS:
-            want = native_reference(expert, x, limit, weight)
+            want = native_reference(expert, x, limit, weight, q8=self.q8 and self.isa >= 1)
             scale = max(float(np.abs(want).max()), 1e-6)
             err = float(np.abs(out - want).max()) / scale
             _STATE['checked'] += 1
@@ -720,7 +678,7 @@ class Server:
     def __init__(self, pool, layers, hidden_dim, spin_us=SERVE_SPIN_US, cpus=None, pinned=True):
         self.pool, self.D = pool, int(hidden_dim)
         n = (max(layers) + 1) if layers else 1
-        self.box_words, self.ans_words = SERVE_HEAD + self.D, SERVE_HEAD + SERVE_MMAX * self.D
+        self.box_words, self.ans_words = SERVE_HEAD + SERVE_BMAX * self.D, SERVE_HEAD + SERVE_MMAX * self.D
         if pinned:
             from . import cuda_ple
             self.box = cuda_ple.pinned(
@@ -824,80 +782,6 @@ class Server:
         if self._handle:
             lib().qz_server_free(ctypes.c_void_p(self._handle))
             self._handle = None
-
-
-class PyServer(Server):
-    """Pure-Python mailbox twin computing requests via `expert_reference`, for tests."""
-
-    native = False
-
-    def _make(self):
-        self._stop = threading.Event()
-        self._done = np.zeros(self.box.shape[0], np.int64)
-        self._serving = False
-        self._counts = dict.fromkeys(self.COUNTS, 0)
-        self._active = 1
-
-    def add(self, i, spec, limit=0.0, activation='plain'):
-        self.specs[i] = (spec, float(limit), activation)
-        self._done[i] = int(self.box[i, 0])
-
-    def start(self):
-        if not self._started:
-            self._thread = threading.Thread(target=self._loop, name='cpu-expert-server', daemon=True)
-            self._thread.start()
-            self._started = True
-        return self
-
-    def active(self, n):
-        self._active = int(n)
-
-    def busy(self):
-        return int(self._serving)
-
-    def _answer(self, i):
-        spec, limit, activation = self.specs[i]
-        stamp = int(self.box[i, 0])
-        n = min(max(int(self.box[i, 1]), 0), SERVE_MMAX)
-        slots = self.box[i, 2:2 + n].copy()
-        weights = self.box[i, 2 + SERVE_MMAX:2 + SERVE_MMAX + n].view(np.float32).copy()
-        x = self.box[i, SERVE_HEAD:SERVE_HEAD + self.D].view(np.float32).copy()
-        out = self.ans[i, SERVE_HEAD:].view(np.float32).reshape(SERVE_MMAX, self.D)
-        t0 = time.perf_counter_ns()
-        for m in range(n):
-            ok = 0
-            if slots[m] >= 0:
-                out[m] = expert_reference(layer_expert(spec, int(slots[m])), x, limit, float(weights[m]), activation)
-                ok = 1
-                self._counts['experts'] += 1
-            self.ans[i, 2 + m] = ok
-        self.ans[i, 1] = n
-        self._counts['compute_ns'] += time.perf_counter_ns() - t0
-        self.ans[i, 0] = stamp
-        self._done[i] = stamp
-        self._counts['requests'] += 1
-
-    def _loop(self):
-        while not self._stop.is_set():
-            new = [i for i in self.specs if int(self.box[i, 0]) > self._done[i]]
-            if not new:
-                time.sleep(0.0001)
-                continue
-            for i in new:
-                self._serving = True
-                try:
-                    self._answer(i)
-                finally:
-                    self._serving = False
-
-    def counts(self):
-        return dict(self._counts)
-
-    def close(self):
-        if self._started:
-            self._stop.set()
-            self._thread.join(2.0)
-            self._started = False
 
 
 # ---------------------------------------------------------------- background CPU load monitor
@@ -1050,14 +934,24 @@ CPU_ASK = r"""
       if (threadIdx.x == 0) { token[0] = 0; token[1] = 0; token[2] = 0; token[3] = 0; }
       return;
     }
-    for (int d = threadIdx.x; d < D; d += blockDim.x) boxf[HEAD + d] = static_cast<float>(x[d]);
+    for (int d = threadIdx.x; d < B * D; d += blockDim.x) boxf[HEAD + d] = static_cast<float>(x[d]);
     if (threadIdx.x == 0) {
       box[1] = M;
+      box[2 + 3 * MMAX] = B;
+      const int k_per = B > 1 ? (K / B) : K;
       for (int m = 0; m < M; ++m) {
         box[2 + m] = static_cast<int>(rows[m]);
         float w = 1.0f;
-        if (WEIGHS) for (int j = 0; j < K; ++j) if (static_cast<int>(inv[j]) == m) w = static_cast<float>(weights[j]);
+        int xr = 0;
+        for (int j = 0; j < K; ++j) {
+          if (static_cast<int>(inv[j]) == m) {
+            if (WEIGHS) w = static_cast<float>(weights[j]);
+            xr = k_per > 0 ? (j / k_per) : 0;
+            break;
+          }
+        }
         boxf[2 + MMAX + m] = w;
+        box[2 + 2 * MMAX + m] = xr;
       }
     }
     __threadfence_system();
@@ -1120,13 +1014,16 @@ def cpu_ask(addr, x, rows, inv, weights=None):
     """Post a layer's CPU expert request (`rows [M]`, `inv [K]`, `x`) to pinned mailbox `addr`."""
     import mlx.core as mx
     k, d, most = int(inv.size), int(x.shape[-1]), int(rows.size)
+    b_rows = max(1, int(x.size) // d)
     if most > SERVE_MMAX:
         raise ValueError(f'cpu_ask(): {most} rows asked, {SERVE_MMAX} at most')
+    if b_rows > SERVE_BMAX:
+        raise ValueError(f'cpu_ask(): {b_rows} batch rows asked, {SERVE_BMAX} at most')
     w = weights.reshape(-1).astype(mx.float32) if weights is not None else mx.ones((k,), mx.float32)
     return _cpu_ask_kernel()(
         inputs=[rows.astype(mx.int32).reshape(-1), inv.astype(mx.int32).reshape(-1), w, x.reshape(-1), addr],
         template=[
-            ('M', most), ('K', k), ('D', d), ('HEAD', SERVE_HEAD),
+            ('B', b_rows), ('M', most), ('K', k), ('D', d), ('HEAD', SERVE_HEAD),
             ('MMAX', SERVE_MMAX), ('WEIGHS', int(weights is not None)),
         ],
         grid=(256, 1, 1),
@@ -1154,13 +1051,3 @@ def cpu_wait(addr, token, y, inv, most=None):
         output_dtypes=[y.dtype, mx.int32],
     )
     return out.reshape(y.shape), status
-
-
-def cpu_computed(cpu, x, y, rows, inv, weights=None):
-    """Run `cpu_ask`, compute or take `y`, wait via `cpu_wait`, and record status on `cpu`."""
-    token = cpu_ask(cpu.addr, x, rows, inv, weights)
-    y_val = y() if callable(y) else y
-    out, status = cpu_wait(cpu.addr, token, y_val, inv, most=int(rows.size))
-    if hasattr(cpu, 'status') and isinstance(cpu.status, list):
-        cpu.status.append(status)
-    return out, status

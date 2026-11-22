@@ -46,6 +46,7 @@ def test_all_modules_import():
         'quanteeze.iq_experts',
         'quanteeze.iq_grids',
         'quanteeze.kquant_qmv',
+        'quanteeze.native_reads',
         'quanteeze.reask',
         'quanteeze.unindexed',
         'quanteeze.vision_ssd',
@@ -363,6 +364,59 @@ def test_ggml_quants_matches_iq_experts_decode(mode):
     np.testing.assert_array_equal(np.array(decoded_qz), np.array(decoded_iq))
 
 
+@pytest.mark.parametrize('mode', ['q2_k', 'q3_k', 'iq2_xs'])
+@pytest.mark.parametrize('dtype', [mx.bfloat16, mx.float16, mx.float32])
+def test_ggml_quants_gpu_kernels_match_reference_ops(mode, dtype):
+    """Fused GPU ggml quantizers match pure-MLX reference ops, tail-warp bounds, and `iq_experts.decode`."""
+    from quanteeze import ggml_quants, iq_experts
+
+    kinds = {'q2_k': iq_experts.Q2_K, 'q3_k': iq_experts.Q3_K, 'iq2_xs': iq_experts.IQ2_XS}
+    rng = np.random.default_rng(202)
+    w_np = (rng.standard_normal((3, 5, 512)) * 0.25).astype(np.float32)
+    w_np[1, 2, :] = 0.0
+    w = mx.array(w_np, dtype=dtype)
+    w_f32 = np.array(w.astype(mx.float32))
+
+    saved = ggml_quants.GPU_PACK[0]
+    try:
+        ggml_quants.GPU_PACK[0] = True
+        body, d, dmin, values = ggml_quants.FORMATS[mode](w)
+        body_a, d_a, dmin_a = ggml_quants.pack_arrays(w, mode)
+        ggml_quants.GPU_PACK[0] = False
+        _, _, _, values_ref = ggml_quants.FORMATS[mode](w)
+    finally:
+        ggml_quants.GPU_PACK[0] = saved
+
+    raw = ggml_quants.blocks(body, d, dmin, mode=mode)
+    decoded_iq = iq_experts.decode(raw, kinds[mode]).reshape(w.shape)
+    decoded_qz = ggml_quants.dequantize(body, d, dmin, mode)
+    mx.eval(body, d, values, body_a, d_a, values_ref, decoded_iq, decoded_qz,
+            *([dmin, dmin_a] if dmin is not None else []))
+
+    assert body.shape == (3, 5, 2, ggml_quants.BODY[mode])
+    assert body.dtype == mx.uint8
+    assert d.shape == (3, 5, 2)
+    assert d.dtype == mx.float16
+    assert values.shape == w.shape
+    assert values.dtype == mx.float32
+    np.testing.assert_array_equal(np.array(body_a), np.array(body))
+    np.testing.assert_array_equal(np.array(d_a), np.array(d))
+    if mode == 'q2_k':
+        assert dmin is not None and dmin.shape == (3, 5, 2) and dmin.dtype == mx.float16
+        np.testing.assert_array_equal(np.array(dmin_a), np.array(dmin))
+    else:
+        assert dmin is None and dmin_a is None
+
+    dec_np = np.array(decoded_qz)
+    np.testing.assert_array_equal(dec_np, np.array(values))
+    np.testing.assert_array_equal(dec_np, np.array(decoded_iq))
+    np.testing.assert_array_equal(dec_np[1, 2], 0.0)
+
+    mse_gpu = float(np.mean((dec_np - w_f32) ** 2))
+    mse_ref = float(np.mean((np.array(values_ref) - w_f32) ** 2))
+    assert mse_gpu <= 1.01 * mse_ref + 1e-7
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason='Metal-only K-quant kernels')
 @pytest.mark.parametrize('mode', ['q2_k', 'q3_k'])
 def test_kquant_qmv_metal_decode_and_prefill(mode):
@@ -478,6 +532,89 @@ def test_uniform_ggml_lower_model_and_demand(tmp_path, monkeypatch, mode):
                 rtol=2e-2,
                 atol=2e-2,
             )
+    finally:
+        dem.close()
+
+
+@pytest.mark.parametrize('mode', ['q2_k', 'q3_k', 'iq2_xs'])
+def test_uniform_ggml_lower_model_mlx_vlm_and_bf16_mixed_dims(tmp_path, monkeypatch, mode):
+    """`requant.lower_model` handles `mlx_vlm` `QuantizedSwitchLinear` and BF16 `SwitchLinear`,
+    including mixed 4D ggml (`gate_proj`/`up_proj`) and 3D affine (`down_proj`) dimensions."""
+    import mlx.nn as nn
+    from mlx_vlm.models.switch_layers import SwitchGLU as VlmSwitchGLU
+    from quanteeze import demand
+
+    monkeypatch.setenv('QUANTEEZE_QUANT_CACHE', str(tmp_path / 'qcache'))
+    monkeypatch.setenv('QUANTEEZE_CPU_EXPERTS', 'off')
+    mx.random.seed(404)
+    sw_stock = VlmSwitchGLU(input_dims=256, hidden_dims=128, num_experts=8, bias=False)
+    for proj in ('gate_proj', 'up_proj', 'down_proj'):
+        setattr(sw_stock, proj, getattr(sw_stock, proj).to_quantized(group_size=64, bits=4))
+    mx.eval(sw_stock.parameters())
+
+    tensors = {}
+    for proj in ('gate_proj', 'up_proj', 'down_proj'):
+        p = getattr(sw_stock, proj)
+        tensors[f'layers.0.mlp.switch_mlp.{proj}.weight'] = p.weight
+        tensors[f'layers.0.mlp.switch_mlp.{proj}.scales'] = p.scales
+        tensors[f'layers.0.mlp.switch_mlp.{proj}.biases'] = p.biases
+    ckpt_dir = tmp_path / 'ckpt'
+    ckpt_dir.mkdir()
+    (ckpt_dir / 'config.json').write_text(
+        '{"quantization": {"group_size": 64, "bits": 4}}',
+        encoding='utf-8',
+    )
+    mx.save_safetensors(str(ckpt_dir / 'model.safetensors'), tensors)
+
+    def build_model(quantized):
+        sw = VlmSwitchGLU(input_dims=256, hidden_dims=128, num_experts=8, bias=False)
+        if quantized:
+            for proj in ('gate_proj', 'up_proj', 'down_proj'):
+                setattr(sw, proj, getattr(sw, proj).to_quantized(group_size=64, bits=4))
+        mlp = nn.Module()
+        mlp.switch_mlp = sw
+        layer = nn.Module()
+        layer.mlp = mlp
+        m = nn.Module()
+        m.layers = [layer]
+        return m
+
+    m_ssd = build_model(True)
+    flat = requant.Flat(ckpt_dir, mode, 256)
+    dem = demand.Demand(m_ssd, flat, budget_bytes=1, workers=2)
+    try:
+        probes = [
+            ((1, 1, 256), mx.array([[[0, 2, 5, 7]]], dtype=mx.uint32)),
+            ((1, 20, 256), mx.array((np.arange(80, dtype=np.uint32).reshape(1, 20, 4)) % 8)),
+        ]
+        refs = []
+        for x_shape, idx_arr in probes:
+            x = mx.random.normal(x_shape).astype(mx.bfloat16)
+            mx.eval(x, idx_arr)
+            y_ref = m_ssd.layers[0].mlp.switch_mlp(x, idx_arr)
+            mx.eval(y_ref)
+            refs.append((x, idx_arr, np.array(y_ref.astype(mx.float32))))
+
+        for quantized in (True, False):
+            m = build_model(quantized)
+            requant.lower_model(m.layers, ckpt_dir, mode, 256)
+            sw = m.layers[0].mlp.switch_mlp
+            assert sw.gate_proj.mode == mode
+            assert sw.gate_proj.weight.ndim == 4
+            assert sw.up_proj.mode == mode
+            assert sw.up_proj.weight.ndim == 4
+            assert sw.down_proj.mode == 'affine'
+            assert sw.down_proj.weight.ndim == 3
+
+            for hooked in (False, True):
+                if hooked:
+                    expert_qmv.install_switch(sw)
+                for x, idx_arr, ref in refs:
+                    y = sw(x, idx_arr)
+                    mx.eval(y)
+                    got = np.array(y.astype(mx.float32))
+                    assert np.all(np.isfinite(got))
+                    np.testing.assert_allclose(got, ref, rtol=2e-2, atol=2e-2)
     finally:
         dem.close()
 

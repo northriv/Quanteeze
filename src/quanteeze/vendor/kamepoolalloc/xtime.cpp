@@ -1,0 +1,243 @@
+/***************************************************************************
+        Copyright (C) 2002-2026 Kentaro Kitagawa
+                           kitag@issp.u-tokyo.ac.jp
+
+        This file is dual-licensed under your choice of EITHER:
+
+          * Apache License, Version 2.0
+            (http://www.apache.org/licenses/LICENSE-2.0, or see
+            LICENSE-APACHE-2.0 in this directory)
+
+        -- OR --
+
+          * GNU General Public License, version 2 of the License,
+            or (at your option) any later version
+            (http://www.gnu.org/licenses/old-licenses/gpl-2.0.html,
+            or see LICENSE-GPL-2.0 in this directory).
+
+        Pick whichever license suits your project.  Unless required
+        by applicable law or agreed to in writing, this file is
+        distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+        CONDITIONS OF ANY KIND, either express or implied
+***************************************************************************/
+#include "xtime.h"
+#include <string.h>
+#include <stdint.h>
+#include "atomic.h"
+#include <chrono>
+#include <thread>
+
+#ifdef _MSC_VER
+    #include <windows.h>
+    #include <intrin.h>   // __rdtsc
+    #include <time.h>
+#else
+    #include <sys/time.h>
+    #include <errno.h>
+#endif
+
+#ifndef NDEBUG
+void (*g_sleep_in_transaction_reporter)(
+    unsigned int ms, const void *caller) noexcept = nullptr;
+static thread_local int s_sleep_in_tx_ok = 0;
+void enterSleepInTransactionOK() noexcept {++s_sleep_in_tx_ok;}
+void leaveSleepInTransactionOK() noexcept {--s_sleep_in_tx_ok;}
+#endif
+
+void msecsleep(unsigned int ms) noexcept {
+#ifndef NDEBUG
+    if(g_sleep_in_transaction_reporter && !s_sleep_in_tx_ok) {
+    #ifdef _MSC_VER
+        g_sleep_in_transaction_reporter(ms, nullptr);
+    #else
+        // The caller's address, not ours: msecsleep is out-of-line in this TU, so
+        // this identifies the offending site for atos / addr2line.
+        g_sleep_in_transaction_reporter(ms, __builtin_return_address(0));
+    #endif
+    }
+#endif
+    using namespace std::chrono;
+    auto start = steady_clock::now();
+#ifdef __WIN32__
+    unsigned int retry = 0;
+#endif
+    for(duration<double, std::milli> rest((double)ms); rest > duration<double, std::milli>(0.0) ;) {
+    #ifdef __WIN32__
+        if((rest > duration<double, std::milli>(10.0)) || (retry++ < 4))
+            std::this_thread::sleep_for(rest);
+        else
+            std::this_thread::yield();
+    #else
+        std::this_thread::sleep_for(rest);
+    #endif
+        rest -= duration_cast<duration<double, std::milli>>(steady_clock::now() - start);
+    }
+}
+
+timestamp_t timeStamp() noexcept {
+// cl defines _M_IX86 / _M_X64, never the GCC spellings; until they were
+// listed here every MSVC build fell through to the XTime::now() fallback
+// below (1 us) while the __rdtsc branch sat unreachable.
+#if defined __i386__ || defined __i486__ || defined __i586__ || defined __i686__ || defined __x86_64__ \
+    || defined _M_IX86 || defined _M_X64
+    memoryBarrier();
+    uint64_t r;
+    #ifdef _MSC_VER
+        r =  __rdtsc();
+    #else
+        // `asm volatile("rdtsc" : "=A" (r))` is only correct on i386, where
+        // the "A" constraint means the EDX:EAX *pair*.  On x86-64 "A" means a
+        // single 64-bit register (rax or rdx), so the compiler took just rax
+        // — i.e. the low 32 bits of the TSC, which wrap about every 1.4 s at
+        // 3 GHz.  Everything derived from timeStamp() (the negotiation
+        // watchdog, the RT WCET histograms) then saw random negative deltas.
+        #if defined __x86_64__
+            uint32_t lo, hi;
+            asm volatile("rdtsc" : "=a" (lo), "=d" (hi));
+            r = ((uint64_t)hi << 32) | lo;
+        #else
+            asm volatile("rdtsc" : "=A" (r));
+        #endif
+    #endif
+    memoryBarrier();
+    return r;
+#elif defined __aarch64__ && !defined _MSC_VER
+    // ARM64: CNTVCT_EL0 is the architectural virtual counter and the direct
+    // analogue of rdtsc — readable from EL0 on Linux and on Apple Silicon,
+    // with no syscall and no vDSO hop.  Without this branch aarch64 fell
+    // through to the XTime::now() fallback below, whose resolution is one
+    // MICROSECOND: on the platform that is most likely to be the realtime
+    // target from here on, the lowest-level timing primitive was 1000x
+    // coarser than on x86, silently.
+    //
+    // `isb` before the read: the counter read is not otherwise ordered
+    // against surrounding instruction execution, so without it the CPU may
+    // satisfy the mrs early and the interval comes out short.  This is the
+    // idiom the kernel's own arch_timer reader uses.
+    //
+    // Resolution is CNTFRQ_EL0, typically 24 MHz on Apple Silicon and
+    // 19.2-100 MHz on ARM SoCs — i.e. ~40 ns, coarser than rdtsc but 25x
+    // finer than the fallback.  Nothing here needs the frequency as a
+    // constant: timeStampCountsPerMilliSec() calibrates against XTime::now()
+    // empirically, so it works out whatever CNTFRQ_EL0 happens to be.
+    //
+    // (MSVC/Windows-on-ARM is excluded: it needs `_ReadStatusReg(ARM64_CNTVCT)`
+    // rather than inline asm, and there is no Windows-on-ARM build to test it
+    // against.  It keeps the fallback.)
+    memoryBarrier();
+    uint64_t r;
+    asm volatile("isb\n\tmrs %0, cntvct_el0" : "=r" (r) :: "memory");
+    memoryBarrier();
+    return r;
+#else
+    XTime time(XTime::now());
+    return (time.usec() + time.sec() * 1000000uL);
+#endif
+}
+
+static atomic<timestamp_t> s_time_stamp_cnt_per_ms = 0;
+static atomic<timestamp_t> s_time_stamp_calc;
+
+DECLSPEC_KAME timestamp_t timeStampCountsPerMilliSec() noexcept {
+    if( !s_time_stamp_cnt_per_ms) {
+        for(;;) {
+            timestamp_t time_stamp_start = timeStamp();
+            s_time_stamp_calc = time_stamp_start;
+            XTime time_start(XTime::now());
+            timestamp_t time_stamp_start2 = timeStamp();
+            // Legitimate: one-time TSC calibration, and it can be triggered
+            // lazily by the first timeStamp() inside a transaction.
+#ifndef NDEBUG
+            ScopedSleepInTransactionOK _sleep_ok;
+#endif
+            msecsleep(20);
+            timestamp_t dt = timeStamp() - time_stamp_start2;
+            unsigned int msec = XTime::now().diff_msec(time_start);
+            timestamp_t dt2 = timeStamp() - time_stamp_start;
+            s_time_stamp_cnt_per_ms = (dt+dt2)/2 / msec;
+//            fprintf(stderr, "Clocks per ms = %d\n", (int)s_time_stamp_cnt_per_ms);
+            if((double)dt2 / dt < 1.2)
+                break;
+        }
+    }
+    return s_time_stamp_cnt_per_ms;
+}
+
+
+XTime::XTime(const system_clock::time_point &p) {
+    duration d = p.time_since_epoch();
+    auto sec = duration_cast<seconds>(d);
+    tv_sec = sec.count();
+    d -= sec;
+    tv_usec = duration_cast<microseconds>(d).count();
+}
+XTime::operator system_clock::time_point() const {
+    system_clock::time_point p{};
+    p += seconds(tv_sec);
+    p += microseconds(tv_usec);
+    return p;
+}
+
+
+XTime
+XTime::now() noexcept {
+#ifdef _MSC_VER
+    // No gettimeofday in the UCRT; system_clock is FILETIME-backed and
+    // carries the same microsecond resolution into the constructor above.
+    return XTime(system_clock::now());
+#else
+    timeval tv;
+    gettimeofday(&tv, NULL);
+    return XTime(tv.tv_sec, tv.tv_usec);
+#endif
+};
+
+XString
+XTime::getTimeStr(bool subsecond) const {
+    if(isSet()) {
+        char str[100] = {};
+#if defined _MSC_VER || defined(__MINGW32__) // __MINGW32__: both widths of mingw-w64; __MINGW64__ left i686 to ctime_r, which its CRT lacks
+        __time32_t t32 = tv_sec;
+        __time64_t t64 = tv_sec;
+        if(sizeof(tv_sec) == 4)
+            _ctime32_s(str, sizeof(str) - 1, &t32);
+        else
+            _ctime64_s(str, sizeof(str) - 1, &t64);
+#else
+        ctime_r( &tv_sec, str);
+#endif
+        str[(std::min)(strlen(str), sizeof(str)) - 1] = '\0'; //erases \n (parenthesised: windows.h's min macro)
+        if(subsecond)
+			sprintf(str + strlen(str), " +%.3dms", (int)tv_usec/1000);
+        return {str};
+    }
+    else {
+        return {};
+    }
+}
+XString
+XTime::getTimeFmtStr(const char *fmt, bool subsecond) const {
+    if(isSet()) {
+        struct tm time;
+#if defined _MSC_VER || defined(__MINGW32__) // __MINGW32__: both widths of mingw-w64; __MINGW64__ left i686 to ctime_r, which its CRT lacks
+        __time32_t t32 = tv_sec;
+        __time64_t t64 = tv_sec;
+        if(sizeof(tv_sec) == 4)
+            _localtime32_s( &time, &t32);
+        else
+            _localtime64_s( &time, &t64);
+#else
+		localtime_r( &tv_sec, &time);
+#endif
+        char str[100] = {};
+        if( !strftime(str, 100, fmt, &time))
+            return {"(Undefined)"};
+		if(subsecond)
+			sprintf(str + strlen(str), " +%.3f", 1e-6 * tv_usec);
+        return {str};
+    }
+    else {
+        return {};
+    }
+}
+

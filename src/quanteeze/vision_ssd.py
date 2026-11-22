@@ -20,14 +20,91 @@ from . import variables
 
 TOWERS = ('vision_tower',)
 PREFIXES = ('vision_tower.', 'model.visual.', 'visual.', 'model.vision_tower.')
+_AUTO = {}                      # {(path, working_set, bits, gguf, reserve, whole, fs): bool}
 
 
-def enabled():
-    """`QUANTEEZE_VISION_SSD`: `on`, stream vision tower weights from the checkpoint on demand; `off` (default)."""
-    value = (variables.get('QUANTEEZE_VISION_SSD') or 'off').strip().lower()
-    if value not in ('on', 'off'):
-        raise ValueError(f'QUANTEEZE_VISION_SSD: on or off, not {value}')
-    return value == 'on'
+def vision_whole(path, model=None):
+    """Whether holding the vision tower still leaves room for all routed experts in memory."""
+    from mlx.utils import tree_flatten
+    from . import arch, fitting, gguf_experts, guards, parallel
+
+    if (variables.get('QUANTEEZE_LOAD_WHOLE') or '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        return True
+    working_set = guards.recommended_budget()
+    if not working_set:
+        return True
+    if model is not None:
+        try:
+            layers = arch.decoder_layers(model)
+        except AttributeError:
+            layers = []
+        moe = [(i, arch.switch_of(l)) for i, l in enumerate(layers) if arch.switch_of(l) is not None]
+        if not moe:
+            resident = sum(a.nbytes for _, a in arch.in_memory(model))
+            return resident <= working_set * (1 - fitting.reserve())
+        switches = [sw for _, sw in moe]
+        sw_bytes = sum(a.nbytes for s in switches for _, a in tree_flatten(s.parameters()))
+        resident = sum(a.nbytes for _, a in arch.in_memory(model)) - sw_bytes
+        space = fitting.room(resident, working_set)
+        gguf_path = parallel._experts_gguf_path()
+        target_bits = None if gguf_path is not None else parallel._bits_target()
+        if gguf_path is not None:
+            experts_bytes = gguf_experts.ExpertGGUF(gguf_path).total_bytes([i for i, _ in moe])
+        elif target_bits is not None:
+            experts_bytes = sum(fitting.quantized_bytes(fitting.weights(s), target_bits) for s in switches)
+        else:
+            experts_bytes = sw_bytes
+        return space is None or experts_bytes <= space
+
+    layer_bytes, rest = parallel.sizes(path, include_vision=True)
+    meta = parallel._config_meta(path)
+    text_cfg = meta.get('text_config') or {}
+    model_type = meta.get('model_type') or text_cfg.get('model_type')
+    if (not variables.is_set('QUANTEEZE_MEMORY_RESERVE') and model_type in fitting.RESERVE_ON_CUDA
+            and not mx.metal.is_available() and mx.default_device() == mx.gpu):
+        res = fitting.RESERVE_ON_CUDA[model_type]
+    else:
+        res = fitting.reserve()
+    return (sum(layer_bytes.values()) + rest) <= working_set * (1 - res)
+
+
+def reads(path, model=None):
+    """Decision for `QUANTEEZE_VISION_SSD=auto` on `path`: stream on demand if holding the
+    vision tower keeps routed experts from fitting whole, unless `path` is on a network FS."""
+    from . import guards, q2_experts
+    key = str(Path(path).expanduser().resolve())
+    fs = q2_experts.file_system(key)
+    cache_key = (
+        key,
+        guards.recommended_budget(),
+        variables.get('QUANTEEZE_BITS'),
+        variables.get('QUANTEEZE_EXPERTS_GGUF'),
+        variables.get('QUANTEEZE_MEMORY_RESERVE'),
+        variables.get('QUANTEEZE_LOAD_WHOLE'),
+        variables.get('QUANTEEZE_V41_READS_IMAGES'),
+        fs,
+    )
+    if cache_key not in _AUTO:
+        if fs in q2_experts.NETWORK:
+            _AUTO[cache_key], why = False, f'held: checkpoint lies on a network file system ({fs})'
+        elif vision_whole(key, model=model):
+            _AUTO[cache_key], why = False, 'held: routed experts fit whole beside it'
+        else:
+            _AUTO[cache_key], why = True, (
+                'streamed from checkpoint on demand: holding it leaves routed experts less room than they take'
+            )
+        print(f'quanteeze: QUANTEEZE_VISION_SSD=auto: vision tower {why}', file=sys.stderr, flush=True)
+    return _AUTO[cache_key]
+
+
+def enabled(path=None, model=None):
+    """`QUANTEEZE_VISION_SSD`: `auto` (default), `on`, or `off`."""
+    value = (variables.get('QUANTEEZE_VISION_SSD') or 'auto').strip().lower()
+    if value not in ('auto', 'on', 'off'):
+        raise ValueError(f'QUANTEEZE_VISION_SSD: auto, on, or off, not {value}')
+    if value != 'auto':
+        return value == 'on'
+    return path is not None and reads(path, model=model)
 
 
 def weight_map(path):
@@ -71,12 +148,13 @@ def set_param(root, key, value):
 
 
 def bf16_maps(path, names, index=None):
-    """`{name: uint16 memmap}` for checkpoint BF16 tensors in `names` at `path`."""
+    """`{name: uint16 memmap view}` for checkpoint BF16 tensors in `names` at `path` (one map per file)."""
+    from . import mapped
     if index is None:
         index = weight_map(path)
     if index is None:
         return {}
-    headers, out = {}, {}
+    headers, files, out = {}, {}, {}
     for name in names:
         shard = index.get(name)
         if shard is None:
@@ -90,8 +168,8 @@ def bf16_maps(path, names, index=None):
         if not isinstance(tensor, dict) or tensor.get('dtype') != 'BF16':
             continue
         start, _ = tensor['data_offsets']
-        out[name] = np.memmap(
-            Path(path) / shard, mode='r', dtype=np.uint16, offset=8 + length + start, shape=tuple(tensor['shape'])
+        out[name] = mapped.view(
+            files, Path(path) / shard, np.uint16, 8 + length + start, tuple(tensor['shape'])
         )
     return out
 
@@ -209,7 +287,8 @@ def tower_of(model):
 
 def install(model, path):
     """Hook `model`'s vision tower for block-by-block evaluation and embedding caching, and when
-    `QUANTEEZE_VISION_SSD=on`, release matching BF16 weights to stream from `path` on demand."""
+    `QUANTEEZE_VISION_SSD` enables it (`on`, or `auto` when memory is tight), release matching BF16
+    weights to stream from `path` on demand."""
     from mlx.utils import tree_flatten
     tower = tower_of(model)
     if tower is None:
@@ -221,7 +300,7 @@ def install(model, path):
         _hook(type(blocks[0]), _evaluated)
     object.__setattr__(tower, '_quanteeze_keep', True)
     _hook(type(tower), _tower)
-    if not enabled():
+    if not enabled(path, model=model):
         return 0
     params = [([p + k for p in PREFIXES], tower, k, a) for k, a in tree_flatten(tower.parameters())]
     taken, maps, freed = matching(path, params)

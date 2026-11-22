@@ -40,12 +40,29 @@ def _close(got, want, tol=1e-4):
     return float(np.abs(got - want).max()) <= tol * max(float(np.abs(want).max()), 1e-6)
 
 
+def _native_project(p, x):
+    y = np.empty(p['rows'], np.float32)
+    ce.lib().qz_reference(ce.ctypes.byref(ce._proj(p)), ce._fptr(np.ascontiguousarray(x, np.float32)), ce._fptr(y))
+    return y
+
+
+def _expert(made, limit=0.0, weight=1.0, activation='plain'):
+    expert = dict(zip(('gate_proj', 'up_proj', 'down_proj'), (p for p, _ in made)))
+    g, u, d = (f for _, f in made)
+
+    def mlx(x, limit=limit, weight=weight, activation=activation):
+        y = d(ce.activate(g(x), u(x), limit, weight, activation))
+        return ce.to_bf16(y) if activation == 'deepseek_v41' else y
+
+    return expert, mlx
+
+
 @pytest.mark.parametrize('bits,group', [(4, 64), (4, 32), (8, 64), (2, 128), (4, 128)])
 def test_affine_projection_matches_mlx_on_every_isa(bits, group):
     p, mlx = _affine(48, 256, bits, group, seed=bits)
     x = np.random.default_rng(1).normal(size=256).astype(np.float32)
     want = mlx(x)
-    assert _close(ce.project_reference(p, x), want)
+    assert _close(_native_project(p, x), want)
     for level in range(ce.isa() + 1):
         assert _close(ce.project(p, x, level), want), ce.ISA_NAMES[level]
 
@@ -54,7 +71,7 @@ def test_mxfp4_projection_matches_mlx_on_every_isa():
     p, mlx = _mxfp4(40, 256)
     x = np.random.default_rng(2).normal(size=256).astype(np.float32)
     want = mlx(x)
-    assert _close(ce.project_reference(p, x), want)
+    assert _close(_native_project(p, x), want)
     for level in range(ce.isa() + 1):
         assert _close(ce.project(p, x, level), want), ce.ISA_NAMES[level]
 
@@ -69,17 +86,13 @@ def test_unsupported_projection_shape_is_refused():
 def test_expert_pool_checks_against_reference(monkeypatch):
     monkeypatch.setattr(ce, '_STATE', {'checked': 0, 'failed': None})
     D, I = 256, 128
-    expert = {
-        'gate_proj': _affine(I, D, 4, 64, 1)[0],
-        'up_proj': _affine(I, D, 4, 64, 2)[0],
-        'down_proj': _affine(D, I, 4, 64, 3)[0],
-    }
+    expert, mlx = _expert([_affine(I, D, 4, 64, 1), _affine(I, D, 4, 64, 2), _affine(D, I, 4, 64, 3)])
     x = np.random.default_rng(3).normal(size=D).astype(np.float32)
-    pool = ce.Pool(3)
+    pool = ce.Pool(3, q8=False)
     try:
         for limit in (0.0, 1.0):
             got = pool.expert(expert, x, limit)
-            assert got.shape == (D,) and _close(got, ce.expert_reference(expert, x, limit), 1e-3)
+            assert got.shape == (D,) and _close(got, mlx(x, limit), 1e-3)
         assert ce.verified() == (2, None)
         monkeypatch.setattr(ce, 'TOLERANCE', -1.0)
         assert pool.expert(expert, x) is None and ce.verified()[1] is not None
@@ -168,16 +181,12 @@ def test_mxfp4_expert_through_pool_on_each_isa(level, monkeypatch):
         pytest.skip('ISA unsupported on this CPU')
     monkeypatch.setattr(ce, '_STATE', {'checked': 0, 'failed': None})
     D, I = 256, 128
-    expert = {
-        'gate_proj': _mxfp4(I, D, 1)[0],
-        'up_proj': _mxfp4(I, D, 2)[0],
-        'down_proj': _mxfp4(D, I, 3)[0],
-    }
+    expert, mlx = _expert([_mxfp4(I, D, 1), _mxfp4(I, D, 2), _mxfp4(D, I, 3)])
     x = np.random.default_rng(4).normal(size=D).astype(np.float32)
-    pool = ce.Pool(4, level)
+    pool = ce.Pool(4, level, q8=False)
     try:
         got = pool.expert(expert, x, 10.0)
-        assert _close(got, ce.expert_reference(expert, x, 10.0), 1e-3) and ce.verified() == (1, None)
+        assert _close(got, mlx(x, 10.0), 1e-3) and ce.verified() == (1, None)
     finally:
         pool.close()
 
@@ -237,10 +246,10 @@ def test_stalled_worker_in_chunk_is_stolen(monkeypatch):
         'down_proj': _affine(D, I, 4, 64, 3)[0],
     }
     x = np.random.default_rng(6).normal(size=D).astype(np.float32)
-    pool = ce.Pool(2, spin_us=200)
+    pool = ce.Pool(2, spin_us=200, q8=False)
     try:
         want = pool.expert(expert, x)
-        assert _close(want, ce.expert_reference(expert, x), 1e-3)
+        assert _close(want, ce.native_reference(expert, x), 1e-3)
         ce.lib().qz_pool_stall(ce.ctypes.c_void_p(pool._handle), 300_000_000)
         outs = []
         t = time.monotonic()
@@ -260,30 +269,20 @@ def test_stalled_worker_in_chunk_is_stolen(monkeypatch):
 
 
 @pytest.mark.parametrize('kind', ['affine2', 'affine4', 'affine8', 'mxfp4'])
-def test_cpp_reference_matches_numpy(kind, monkeypatch):
+def test_cpp_reference_matches_mlx(kind, monkeypatch):
     D, I = 256, 96
     if kind == 'mxfp4':
-        expert = {
-            'gate_proj': _mxfp4(I, D, 1)[0],
-            'up_proj': _mxfp4(I, D, 2)[0],
-            'down_proj': _mxfp4(D, I, 3)[0],
-        }
+        made = [_mxfp4(I, D, 1), _mxfp4(I, D, 2), _mxfp4(D, I, 3)]
     else:
         bits = int(kind[-1])
-        expert = {
-            'gate_proj': _affine(I, D, bits, 32, 1)[0],
-            'up_proj': _affine(I, D, bits, 64, 2)[0],
-            'down_proj': _affine(D, I, bits, 32, 3)[0],
-        }
+        made = [_affine(I, D, bits, 32, 1), _affine(I, D, bits, 64, 2), _affine(D, I, bits, 32, 3)]
+    expert, mlx = _expert(made)
     x = np.random.default_rng(8).normal(size=D).astype(np.float32)
     p = expert['gate_proj']
-    y = np.empty(p['rows'], np.float32)
-    ce.lib().qz_reference(ce.ctypes.byref(ce._proj(p)), ce._fptr(x), ce._fptr(y))
-    assert _close(y, ce.project_reference(p, x), 1e-6)
+    assert _close(_native_project(p, x), made[0][1](x), 1e-4)
     for limit in (0.0, 1.0):
-        assert _close(ce.native_reference(expert, x, limit), ce.expert_reference(expert, x, limit), 1e-5)
+        assert _close(ce.native_reference(expert, x, limit), mlx(x, limit), 1e-3)
     monkeypatch.setattr(ce, '_STATE', {'checked': 0, 'failed': None})
-    monkeypatch.setattr(ce, 'expert_reference', None)
     pool = ce.Pool(2)
     try:
         assert pool.expert(expert, x) is not None and ce.verified() == (1, None)
@@ -323,7 +322,7 @@ def test_deepseek_v41_expert_matches_mlx_vlm(monkeypatch):
             x.astype(mx.float32), q[0], q[1], transpose=True, group_size=32, bits=4, mode='mxfp4',
         ).astype(mx.bfloat16)
 
-    pool = ce.Pool(2)
+    pool = ce.Pool(2, q8=False)
     try:
         for k, (limit, weight) in enumerate(((0.0, 1.0), (10.0, 0.37), (1.0, 2.5))):
             x = mx.array(np.random.default_rng(20 + k).normal(size=(1, D)).astype(np.float32)).astype(mx.bfloat16)
@@ -337,9 +336,9 @@ def test_deepseek_v41_expert_matches_mlx_vlm(monkeypatch):
             got = pool.expert(expert, xf, limit, weight, 'deepseek_v41')
             assert np.array_equal(checked, got)
             assert _close(got, want, 1e-2) and np.mean(got == want) >= 0.98
-            ref = ce.expert_reference(expert, xf, limit, weight, 'deepseek_v41')
+            ref = ce.native_reference(expert, xf, limit, weight, 'deepseek_v41')
             assert np.mean(ref == want) >= 0.98
-            assert _close(ce.native_reference(expert, xf, limit, weight, 'deepseek_v41'), ref, 1e-2)
+            assert _close(ref, want, 1e-2)
     finally:
         pool.close()
 
@@ -382,5 +381,61 @@ def test_serving_thread_excludes_worker_cores():
     try:
         free = ce.free_cpus(pool.cpus)
         assert free and not ({top[c] for c in free} & {top[c] for c in pool.cpus})
+    finally:
+        pool.close()
+
+
+def test_second_caller_refused_without_blocking(monkeypatch):
+    import threading
+    monkeypatch.setattr(ce, '_STATE', {'checked': ce.CHECKS, 'failed': None})
+    D, I = 2048, 1536
+    expert, _ = _expert([_affine(I, D, 4, 64, 1), _affine(I, D, 4, 64, 2), _affine(D, I, 4, 64, 3)])
+    x = np.random.default_rng(10).normal(size=D).astype(np.float32)
+    pool = ce.Pool(2)
+    try:
+        want = pool.expert(expert, x)
+        outs, stop = [], threading.Event()
+
+        def other():
+            while not stop.is_set():
+                outs.append(pool.expert(expert, x))
+
+        t = threading.Thread(target=other)
+        t.start()
+        try:
+            mine = [pool.expert(expert, x) for _ in range(200)]
+        finally:
+            stop.set()
+            t.join()
+        got = [o for o in mine + outs if o is not None]
+        assert got and all(np.array_equal(o, want) for o in got)
+        assert any(o is None for o in mine + outs), 'never contended in 200 concurrent calls'
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize('kind', ['affine4', 'mxfp4', 'affine2', 'affine8'])
+def test_q8_kernels_and_reference(kind, monkeypatch):
+    monkeypatch.setattr(ce, '_STATE', {'checked': 0, 'failed': None})
+    D, I = 512, 256
+    if kind == 'mxfp4':
+        made = [_mxfp4(I, D, 1), _mxfp4(I, D, 2), _mxfp4(D, I, 3)]
+    else:
+        bits = int(kind[-1])
+        made = [_affine(I, D, bits, 64, 1), _affine(I, D, bits, 64, 2), _affine(D, I, bits, 64, 3)]
+    expert, mlx = _expert(made)
+    x = np.random.default_rng(11).normal(size=D).astype(np.float32)
+    ref_q8 = ce.native_reference(expert, x, 10.0, q8=True)
+    assert np.all(np.isfinite(ref_q8)) and _close(ref_q8, mlx(x, 10.0), 6e-2)
+    pool = ce.Pool(4, q8=True)
+    try:
+        got = pool.expert(expert, x, 10.0)
+        assert got is not None and ce.verified() == (1, None)
+        assert _close(got, ce.native_reference(expert, x, 10.0, q8=pool.isa >= 1), 1e-3)
+        if pool.isa >= 1 and kind in ('affine4', 'mxfp4'):
+            assert not _close(got, mlx(x, 10.0), 1e-3)
+            assert _close(got, mlx(x, 10.0), 6e-2)
+        else:
+            assert _close(got, mlx(x, 10.0), 1e-3)
     finally:
         pool.close()

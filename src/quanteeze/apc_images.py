@@ -36,6 +36,7 @@ from mlx_vlm import apc as _apc
 PLANS_KEPT = 256
 _MEDIA_IDS = set()
 _PLANS = OrderedDict()          # the request's salt -> (salt without images, image hashes)
+_PLANS_LOCK = threading.Lock()
 _LOCAL = threading.local()      # .images: this request's image hashes; .relax: a lookup that may end before an image
 PRECISION = [None]              # what the served weights compute a prompt with, as text (use_precision)
 
@@ -115,11 +116,17 @@ def segments(plan, token_ids):
     return [(_salt(plan, m), bounds[m], bounds[m + 1]) for m in range(len(starts), -1, -1)]
 
 
+def _plan(full):
+    with _PLANS_LOCK:
+        return _PLANS.get(full)
+
+
 def _note(full, base, hashes):
-    _PLANS[full] = (base, hashes)
-    _PLANS.move_to_end(full)
-    while len(_PLANS) > PLANS_KEPT:
-        _PLANS.popitem(last=False)
+    with _PLANS_LOCK:
+        _PLANS[full] = (base, hashes)
+        _PLANS.move_to_end(full)
+        while len(_PLANS) > PLANS_KEPT:
+            _PLANS.popitem(last=False)
 
 
 def install(generator_cls, batch_cls, manager_cls):
@@ -146,7 +153,7 @@ def install(generator_cls, batch_cls, manager_cls):
         return full
 
     def lookup_exact_cache(self, token_ids, extra_hash=0, max_prefix_tokens=None, min_prefix_tokens=0):
-        plan = _PLANS.get(extra_hash)
+        plan = _plan(extra_hash)
         parts = segments(plan, token_ids) if plan is not None else None
         if parts is None:
             return lookup(self, token_ids, extra_hash=extra_hash, max_prefix_tokens=max_prefix_tokens,
@@ -163,7 +170,7 @@ def install(generator_cls, batch_cls, manager_cls):
         return None, 0
 
     def store_exact_cache(self, token_ids, prompt_cache, *, extra_hash=0):
-        plan = _PLANS.get(extra_hash)
+        plan = _plan(extra_hash)
         salt = prefix_salt(plan, token_ids) if plan is not None else None
         return store(self, token_ids, prompt_cache, extra_hash=extra_hash if salt is None else salt)
 
@@ -171,7 +178,7 @@ def install(generator_cls, batch_cls, manager_cls):
         ids, kwargs = sequence[1], sequence[3] or {}
         embeds = kwargs.get('inputs_embeds')
         relax = (self.apc_manager is not None and embeds is not None and embeds.ndim == 3
-                 and embeds.shape[1] == len(ids) and self._apc_extra_hash(kwargs) in _PLANS)
+                 and embeds.shape[1] == len(ids) and _plan(self._apc_extra_hash(kwargs)) is not None)
         before, _LOCAL.relax = getattr(_LOCAL, 'relax', False), relax
         try:
             return pick(self, sequence)

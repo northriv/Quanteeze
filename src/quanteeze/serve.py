@@ -42,8 +42,10 @@ from . import (
     apc_disk,
     apc_images,
     arch,
+    context_compress,
     control,
     cuda_attn,
+    cuda_engram,
     cuda_experts,
     cuda_head,
     cuda_kernels,
@@ -68,6 +70,7 @@ from . import (
     home,
     hyper,
     kquant_qmv,
+    leases,
     linear_attn,
     loops,
     mtp,
@@ -78,6 +81,7 @@ from . import (
     progress,
     q2_experts,
     reask,
+    request_threads,
     requant,
     shutdown,
     sigmoid_router,
@@ -98,6 +102,7 @@ _SPLIT = []
 _ADMISSION = [None]
 _KEEPER = [None]
 _IN_MEMORY = [True]
+_WIRED = [0]
 
 
 def serving_info():
@@ -105,14 +110,15 @@ def serving_info():
     info = dict(_SERVING.get('info') or {})
     dem = _SERVING.get('demand')
     if dem is not None:
-        info['demand'] = dem.summary()
+        info['demand'] = dem.summary(flush=False)
     return info
 
 
 def _precision():
     """The served model's precision settings that change what a prompt computes, '' when none."""
     info = _SERVING.get('info') or {}
-    return f'{info.get("mode", "")}:{info.get("bits", "")}' if info else ''
+    base = f'{info.get("mode", "")}:{info.get("bits", "")}' if info else ''
+    return '; '.join(t for t in (base, context_compress.tag()) if t)
 
 
 WARM_TEXT = ('A model warms up before its first request: the kernels it compiles at their first use are '
@@ -225,6 +231,7 @@ def _load_whole():
 def _load_hooked(*args, **kwargs):
     """`mlx_vlm`'s load with Quanteeze's uniform quantization, kernel hooks, and progress reporting."""
     guards.note_others()
+    _wire()
     path = _checkpoint_path(args, kwargs)
     if path and os.path.isdir(path):
         try:
@@ -275,7 +282,7 @@ def _load_serving(*args, **kwargs):
         print(f'quanteeze: {kind}\'s routed experts and projections quantized as the checkpoint stores them',
               file=sys.stderr, flush=True)
     if path and os.path.isdir(path):
-        if vision_ssd.install(model, path) + embed_ssd.install(model, path):
+        if embed_ssd.install(model, path) + vision_ssd.install(model, path):
             gc.collect()
             mx.clear_cache()
     switches = [arch.switch_of(layer) for layer in layers if arch.switch_of(layer) is not None]
@@ -320,7 +327,7 @@ def _load_serving(*args, **kwargs):
         print(f'quanteeze: thermal throttle from pressure {throttle.at:g}: the GPU works {shares} of the time',
               file=sys.stderr, flush=True)
 
-    drafter = _drafter(path, kind)
+    drafter = _drafter(path, kind, model)
 
     if not has_experts:
         if on_demand is not None or uniform or experts_gguf is not None:
@@ -397,7 +404,7 @@ def _load_serving(*args, **kwargs):
             progress.phase('experts', len(switches), 'MoE layers')
             source = requant.cached_checkpoint(
                 layers, path, *uniform,
-                on_layer=lambda done, _total: progress.advance(done),
+                on_layer=lambda _done, _total: progress.advance(1),
             )
             if source is not None:
                 mx.clear_cache()
@@ -463,7 +470,7 @@ def _load_serving(*args, **kwargs):
         progress.phase('experts', len(switches), 'MoE layers')
         gguf_experts.load_model(
             layers, experts_gguf,
-            on_layer=lambda done, _total: progress.advance(done),
+            on_layer=lambda _done, _total: progress.advance(1),
         )
         mx.clear_cache()
         print(
@@ -477,7 +484,7 @@ def _load_serving(*args, **kwargs):
         progress.phase('experts', len(switches), 'MoE layers')
         requant.lower_model(
             layers, path, uniform[0], uniform[1],
-            on_layer=lambda done, _total: progress.advance(done),
+            on_layer=lambda _done, _total: progress.advance(1),
         )
         for layer in layers:
             sw = arch.switch_of(layer)
@@ -518,8 +525,8 @@ def _parallel_failed(why):
     raise RuntimeError(f'quanteeze: {why}')
 
 
-def _drafter(path, kind):
-    mode = variables.get('QUANTEEZE_MTP').lower()
+def _drafter(path, kind, model=None):
+    mode = (variables.get('QUANTEEZE_MTP') or 'auto').strip().lower()
     if variables.compact():
         kept = variables.get('QUANTEEZE_COMPACT_KEEP')
         print('quanteeze: QUANTEEZE_COMPACT=on: MTP off, vision towers and token embeddings streamed from SSD '
@@ -532,6 +539,36 @@ def _drafter(path, kind):
         print('quanteeze: DeepSeek V4.1 split over GPUs: no drafting yet (its drafter reads what enters layers '
               'another rank holds)', file=sys.stderr, flush=True)
         return None
+    external = None if variables.compact() else mtp.resolve_external(path, kind)
+    if external is not None or mode == 'dflash2':
+        if external is None:
+            print(f'quanteeze: QUANTEEZE_MTP=dflash2: no DFlash2 drafter configured for {kind!r} '
+                  f'(set QUANTEEZE_DRAFTER)', file=sys.stderr, flush=True)
+            return None
+        _IN_MEMORY[0] = True
+        bits = None if variables.off('QUANTEEZE_MTP_BITS') else variables.integer('QUANTEEZE_MTP_BITS')
+        t = time.time()
+        try:
+            drafter = mtp.load_external(external, bits, target_model=model)
+        except Exception as e:
+            print(f'quanteeze: QUANTEEZE_DRAFTER={external}: failed to load ({type(e).__name__}: {e}); '
+                  f'decoding 1 token/pass', file=sys.stderr, flush=True)
+            return None
+        block = mtp.block_for(variables.get('QUANTEEZE_MTP_BLOCK'), kind)
+        if block is not None:
+            eff_block = mtp.set_block(drafter[0], block)
+        else:
+            mtp.OVERRIDE_BLOCK[0] = None
+            eff_block = getattr(drafter[0].config, 'runtime_block_size', None) or getattr(
+                drafter[0], 'default_runtime_block_size', None
+            )
+        print(f'quanteeze: {mtp.label_of(drafter[0])} drafter ({external}) read in {time.time() - t:.0f} s: '
+              f'{mtp.nbytes(drafter[0]) / 1e9:.1f} GB, at {mtp.bits_of(drafter[0])} bits, '
+              + (f'{eff_block} tokens a round' if eff_block is not None else 'mlx-vlm\'s tokens a round'),
+              file=sys.stderr, flush=True)
+        _at_exit('mtp', lambda: print(f'quanteeze: {mtp.label_of(drafter[0])}, {mtp.summary(drafter[0])}',
+                                       file=sys.stderr, flush=True))
+        return drafter
     _IN_MEMORY[0] = True
     if mode != 'on':
         drafts, why = mtp.auto(path, kind)
@@ -567,13 +604,20 @@ def _drafter(path, kind):
                                              file=sys.stderr, flush=True))
     block = mtp.block_for(variables.get('QUANTEEZE_MTP_BLOCK'), kind)
     if block is not None:
-        mtp.set_block(drafter[0], block)
-    print(f'quanteeze: MTP drafter of {kind} read in {time.time() - t:.0f} s: {mtp.nbytes(drafter[0]) / 1e9:.1f} GB, '
+        eff_block = mtp.set_block(drafter[0], block)
+    else:
+        mtp.OVERRIDE_BLOCK[0] = None
+        eff_block = getattr(drafter[0].config, 'runtime_block_size', None) or getattr(
+            drafter[0], 'default_runtime_block_size', None
+        )
+    print(f'quanteeze: {mtp.label_of(drafter[0])} drafter of {kind} read in {time.time() - t:.0f} s: '
+          f'{mtp.nbytes(drafter[0]) / 1e9:.1f} GB, '
           f'its experts at {mtp.bits_of(drafter[0])} bits, '
-          + (f'{block} tokens a round' if block is not None else 'mlx-vlm\'s tokens a round')
+          + (f'{eff_block} tokens a round' if eff_block is not None else 'mlx-vlm\'s tokens a round')
           + mtp.gate_said(drafter[0]),
           file=sys.stderr, flush=True)
-    _at_exit('mtp', lambda: print(f'quanteeze: MTP, {mtp.summary(drafter[0])}', file=sys.stderr, flush=True))
+    _at_exit('mtp', lambda: print(f'quanteeze: {mtp.label_of(drafter[0])}, {mtp.summary(drafter[0])}',
+                                   file=sys.stderr, flush=True))
     return drafter
 
 
@@ -604,6 +648,7 @@ def _let_go():
     ngram_prefetch.let_go()
     vision_ssd.IMAGES.clear()
     fitting.MODEL[0] = None
+    leases.reset()
     _AT_EXIT.clear()
     _SERVING.clear()
     gc.collect()
@@ -731,7 +776,7 @@ def _hold_experts(source_or_path, passing=0):
         if (mx.metal.is_available() or mx.default_device() != mx.gpu or cuda_ple.integrated()
                 or q2_experts.in_memory(check_path)):
             return None
-        budget = (fitting.host_room() or 0) - ngram_prefetch.unread() - passing - HELD_AFTER
+        budget = (_room_kept() or 0) - ngram_prefetch.unread() - passing - HELD_AFTER
         if budget <= 0:
             return None
     else:
@@ -783,6 +828,57 @@ def _hold_experts(source_or_path, passing=0):
     return held
 
 
+def _room_kept(readings=None):
+    """Host memory the server's copies may take: `fitting.host_room()`, and no more than the keeper's
+    limit (`QUANTEEZE_KEEP_GB`) leaves beside the server's current footprint. Returns None where unknown."""
+    room = fitting.host_room() if readings is None else fitting.host_room(readings)
+    keeper = _KEEPER[0]
+    if keeper is None or not keeper.limit:
+        return room
+    held = (readings or guards.Readings()).footprint()
+    if held is None:
+        return room
+    left = max(0, int(keeper.limit - held))
+    return left if room is None else min(room, left)
+
+
+def _tables_room(path):
+    """Host room auto allocates to n-gram tables: `_room_kept()` less every routed expert of `path`
+    (`home.experts_bytes`) and `HELD_AFTER`; 0 when unavailable. Across multiple GPUs (`_tables_room_split`),
+    the host's shared room less what each rank on this host keeps for its own layer run."""
+    room = _room_kept() or 0
+    if not room or not path or not os.path.exists(str(path)):
+        return 0
+    try:
+        runs = parallel.runs_here()
+        if runs:
+            return _tables_room_split(path, runs, room)
+        from .home import experts_bytes
+        experts = experts_bytes(path)
+    except Exception:
+        return 0
+    return max(0, room - experts - HELD_AFTER)
+
+
+def _tables_room_split(path, runs, room):
+    """`_tables_room` across multiple GPUs for ranks on this host owning `runs`: subtract the largest
+    per-rank expert + spare buffer need from `fitting.host_room()`, scaled by ranks sharing the host,
+    and bounded by `room` less this rank's own need."""
+    from .home import layer_experts_bytes
+    by = layer_experts_bytes(path)
+
+    def need(run):
+        sizes = [by.get(layer, 0) for layer in run]
+        return sum(sizes) + 2 * max(sizes, default=0) + HELD_AFTER
+
+    share = fitting.host_room() or 0
+    table = len(runs) * (share - max(need(run) for run in runs))
+    mine = need(parallel.owned() or runs[0])
+    if room < share:
+        table = min(table, room - mine)
+    return max(0, int(table))
+
+
 def _hold_tables(model, path=None):
     value = (variables.get('QUANTEEZE_HOST_NGRAM_GB') or 'auto').strip().lower()
     if value == 'off':
@@ -790,7 +886,7 @@ def _hold_tables(model, path=None):
     if value == 'auto':
         if mx.metal.is_available() or mx.default_device() != mx.gpu or cuda_ple.integrated():
             return None
-        budget = fitting.host_room()
+        budget = _tables_room(path)
         if not budget:
             return None
     else:
@@ -1030,7 +1126,32 @@ def _prompt_steps_waited(batch_cls):
 
 
 def _wired_limit():
-    return int(variables.number('QUANTEEZE_WIRED_GB') * 1e9)
+    given = str(variables.get('QUANTEEZE_WIRED_GB') or '0').strip().lower()
+    if given in ('', '0', 'off'):
+        return 0
+    if given == 'auto':
+        return int(mx.device_info().get('max_recommended_working_set_size', 0)) if mx.metal.is_available() else 0
+    return int(float(given) * 1e9)
+
+
+def _wire():
+    """Apply `QUANTEEZE_WIRED_GB` at server start and on each model load (`0`/`off`, `'auto'`, or GB)."""
+    limit = _wired_limit()
+    if limit == _WIRED[0] or not mx.metal.is_available():
+        return
+    mx.set_wired_limit(limit)
+    _WIRED[0] = limit
+    auto = str(variables.get('QUANTEEZE_WIRED_GB') or '').strip().lower() == 'auto'
+    if limit:
+        print(
+            f'quanteeze: up to {limit / 1e9:.1f} GB wired from the load on'
+            + (' (auto: the working set Metal recommends)' if auto else '')
+            + ' (macOS lets it go while the GPU is idle)',
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print('quanteeze: none wired but while generating (QUANTEEZE_WIRED_GB)', file=sys.stderr, flush=True)
 
 
 def _cache_eval_when_batched(generator_cls):
@@ -1065,11 +1186,29 @@ def _exit_now():
     os._exit(1)
 
 
+def _relieve(rates):
+    """Release cached buffers and clear idle APC memory entries under host memory strain."""
+    if not rates.get('strained'):
+        return
+    for mgr in list(_APC_MANAGERS):
+        trim = getattr(mgr, 'clear', None) or getattr(mgr, 'reset', None)
+        if callable(trim):
+            try:
+                trim()
+            except Exception:
+                pass
+    if request_threads.running() == 0:
+        _shed()
+
+
 def _keep_memory():
     """The server's footprint kept to (quanteeze.guards.Keeper), or None with QUANTEEZE_KEEP_GB=off."""
     import faulthandler
-    keeper = guards.Keeper.from_env(idle=_idle, shed=_shed, stop=lambda: os.kill(os.getpid(), signal.SIGTERM),
-                                    exit=_exit_now, stacks=lambda: faulthandler.dump_traceback(all_threads=True))
+    keeper = guards.Keeper.from_env(
+        idle=_idle, shed=_shed, stop=lambda: os.kill(os.getpid(), signal.SIGTERM),
+        exit=_exit_now, stacks=lambda: faulthandler.dump_traceback(all_threads=True),
+        relieve=_relieve,
+    )
     if keeper is None:
         print('quanteeze: the memory keeper off (QUANTEEZE_KEEP_GB)', file=sys.stderr, flush=True)
         return None
@@ -1152,8 +1291,33 @@ def _extract_cli_flags(argv):
     return kept
 
 
+OPEN_FILES = 65536
+
+
+def _more_open_files(resource=None):
+    """Raise the process soft RLIMIT_NOFILE toward OPEN_FILES (at most hard limit; fallback 10240 on macOS)."""
+    if resource is None:
+        try:
+            import resource
+        except ImportError:
+            return None
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    for want in (OPEN_FILES, 10240):
+        want = want if hard == resource.RLIM_INFINITY else min(want, hard)
+        if want <= soft:
+            return soft
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+        except (ValueError, OSError):
+            continue
+        print(f'quanteeze: open files: the soft limit raised from {soft} to {want}', file=sys.stderr, flush=True)
+        return want
+    return soft
+
+
 def main():
     sys.argv = _extract_cli_flags(sys.argv)
+    _more_open_files()
     alloc_msg = allocator.ensure_active(sys.argv[1:])
     if sys.platform.startswith('linux'):
         try:
@@ -1217,9 +1381,7 @@ def main():
           f'({"AES-256-GCM disk sealing on" if apc_disk.ON[0] else "disk sealing off"})',
           file=sys.stderr, flush=True)
     _keep_memory()
-    if _wired_limit():
-        mx.set_wired_limit(_wired_limit())
-        print(f'quanteeze: up to {_wired_limit() / 1e9:g} GB wired between requests', file=sys.stderr, flush=True)
+    _wire()
     generation.load = _load_hooked
     efforts.install(generation.GenerationArguments)
     prefetcher = ngram_prefetch.use()
@@ -1227,6 +1389,13 @@ def main():
           else 'quanteeze: n-gram read-ahead off', file=sys.stderr, flush=True)
     apc_images.install(generation.ResponseGenerator, BatchGenerator, APCManager)
     apc_images.use_precision(_precision)
+    if context_compress.install():
+        print(f'quanteeze: prompt cache compression: {context_compress.tag()}', file=sys.stderr, flush=True)
+        atexit.register(
+            lambda: print(f'quanteeze: context compression, {context_compress.summary()}',
+                          file=sys.stderr, flush=True)
+            if context_compress.STATS['compressed'] else None
+        )
     _image_embeddings_now(generation.ResponseGenerator)
     _prefill_steps(generation.ResponseGenerator)
     _coalesce_on_demand(generation.ResponseGenerator)
@@ -1248,6 +1417,7 @@ def main():
     phases.install(generation.ResponseGenerator)
     shutdown.patch(uvicorn.server.Server, variables.number('QUANTEEZE_SHUTDOWN_S'))
     mtp.install(generation.ResponseGenerator)
+    request_threads.install(generation.ResponseGenerator)
     _failures_let_go(generation)
     verify = variables.get('QUANTEEZE_VERIFY_QMV').lower()
     if verify != 'off':
@@ -1279,11 +1449,15 @@ def main():
     linear_attn.DELTA[0] = not variables.off('QUANTEEZE_CUDA_DELTA')
     linear_attn.few()
     cuda_qmv.ON[0] = not variables.off('QUANTEEZE_CUDA_QMV')
+    cuda_qmv.ROWS_ON[0] = not variables.off('QUANTEEZE_CUDA_QMV_ROWS')
     cuda_router.ON[0] = not variables.off('QUANTEEZE_CUDA_ROUTER')
     cuda_v41.ROUTE_ON[0] = cuda_router.ON[0]
     cuda_experts.ON[0] = not variables.off('QUANTEEZE_CUDA_EXPERTS')
     cuda_kernels.FUSE[0] = not variables.off('QUANTEEZE_CUDA_FUSE')
     cuda_attn.ON[0] = not variables.off('QUANTEEZE_CUDA_ATTN')
+    cuda_attn.ROWS_ON[0] = not variables.off('QUANTEEZE_CUDA_ATTN_ROWS')
+    if cuda_attn.ON[0] and cuda_attn.ROWS_ON[0]:
+        cuda_attn.install_masks()
     atexit.register(lambda: print(f'quanteeze: the PLE layer\'s kernels, {cuda_ple_layer.summary()}', file=sys.stderr,
                                   flush=True) if cuda_ple_layer.CHOICE else None)
     atexit.register(lambda: print(f'quanteeze: the full attention\'s kernels, {cuda_attn.summary()}', file=sys.stderr,
@@ -1301,6 +1475,9 @@ def main():
         cuda_ple.install()
         atexit.register(lambda: print(f'quanteeze: the n-gram rows\' kernel, {cuda_ple.summary()}', file=sys.stderr,
                                       flush=True) if cuda_ple.CHOICE else None)
+    if cuda_ple.ON[0] and cuda_kernels.available():
+        atexit.register(lambda: print(f'quanteeze: the Engram\'s and embedding\'s row kernels, {cuda_engram.summary()}',
+                                      file=sys.stderr, flush=True) if cuda_engram.CHOICE else None)
     atexit.register(lambda: print(f'quanteeze: DeepSeek V4.1 CUDA kernels, {cuda_v41.summary()}', file=sys.stderr,
                                   flush=True) if cuda_v41.STATS['checked'] or cuda_v41.ROUTE[0] or cuda_v41.FP8_CHOICE else None)
     atexit.register(lambda: print(f'quanteeze: the MoE blocks\' kernels, {cuda_moe.summary()}', file=sys.stderr,
@@ -1330,6 +1507,15 @@ def main():
                                   flush=True) if kquant_qmv.CHOICE else None)
     atexit.register(lambda: print(f'quanteeze: gguf_qmv kernels, {gguf_qmv.summary()}', file=sys.stderr,
                                   flush=True) if gguf_qmv.CHOICE else None)
+    from . import v41_attention, engram_host
+    atexit.register(
+        lambda: print(f'quanteeze: V4.1 native attention, {v41_attention.stats()}', file=sys.stderr, flush=True)
+        if v41_attention._STATE['served'] or v41_attention._STATE['compared'] else None
+    )
+    atexit.register(
+        lambda: print(f'quanteeze: Engram hashes on host, {engram_host.STATE}', file=sys.stderr, flush=True)
+        if engram_host.STATE['checked'] or engram_host.STATE['passes'] else None
+    )
     watch = variables.get('QUANTEEZE_LOOPS').lower()
     if watch != 'off':
         loops.install(generation.ResponseGenerator)

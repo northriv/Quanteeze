@@ -1,0 +1,133 @@
+/***************************************************************************
+        Copyright (C) 2002-2026 Kentaro Kitagawa
+                           kitag@issp.u-tokyo.ac.jp
+
+        This file is dual-licensed under your choice of EITHER:
+
+          * Apache License, Version 2.0
+            (http://www.apache.org/licenses/LICENSE-2.0, or see
+            LICENSE-APACHE-2.0 in this directory)
+
+        -- OR --
+
+          * GNU General Public License, version 2 of the License,
+            or (at your option) any later version
+            (http://www.gnu.org/licenses/old-licenses/gpl-2.0.html,
+            or see LICENSE-GPL-2.0 in this directory).
+
+        Pick whichever license suits your project.  Unless required
+        by applicable law or agreed to in writing, this file is
+        distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+        CONDITIONS OF ANY KIND, either express or implied
+***************************************************************************/
+#ifndef supportH
+#define supportH
+
+// kamestm/support.h — minimal Qt-free `support.h` for downstream
+// consumers that link `libkamestm` without the rest of KAME.
+//
+// This file defines the symbol-visibility macros that the public
+// headers (transaction.h, threadlocal.h, xtime.h, etc.) annotate
+// declarations with, plus the few Qt-free type aliases those headers
+// *reference* but do not own (`XString`, `shared_ptr`/`weak_ptr`).  It
+// deliberately does NOT redefine `XTime`, `msecsleep`, or any other API
+// surface — `xtime.h` etc. own those.
+//
+// The full KAME application build gets the richer, QString-aware
+// `XString` class and the `using std::shared_ptr` declarations from
+// `kame/support.h` (which wins on INCLUDEPATH); this minimal variant
+// provides only the plain-`std` equivalents libkamestm's own
+// translation units (`xtime.cpp`, `xthread.cpp`) need to compile.
+//
+// Include-path priority that selects the right `support.h`:
+//
+//   * KAME application build (kame/kame.pro):
+//       kame/ comes first on INCLUDEPATH -> kame/support.h
+//       (Qt-aware, full version).
+//
+//   * Standalone test build (kamestm/tests/, kamepoolalloc/tests/):
+//       The Qt-free harness in `kamestm/tests/support_standalone.h`
+//       is preincluded via `-include`; it sets `supportH` and
+//       provides the test-time `XTime` / `msecsleep` inline.
+//       Any subsequent `#include "support.h"` lands on the shim in
+//       `kamestm/tests/support.h`, which is a no-op (`supportH`
+//       already defined).
+//
+//   * libkamestm dylib build (kamestm/kamestm.pro), or any
+//     downstream consumer linking only `libkamestm` + `libkamepoolalloc`:
+//       kame/ is NOT on the include path; this file (kamestm/support.h)
+//       is found instead.  Provides DECLSPEC_KAME / DEBUG_XTHREAD /
+//       a few similar macros — just enough to satisfy the header
+//       declarations.  The real `xtime.h` defines `XTime` as usual,
+//       and `xtime.cpp`'s out-of-line definitions match.
+
+#ifndef DECLSPEC_KAME
+    #define DECLSPEC_KAME
+#endif
+#ifndef DECLSPEC_MODULE
+    #define DECLSPEC_MODULE
+#endif
+#ifndef DECLSPEC_SHARED
+    #define DECLSPEC_SHARED
+#endif
+
+#include <cstdint>   //!< Fixed-width integer types are used all over the
+                     //!< tree.  They used to arrive only by leaking out of
+                     //!< <string>, which newer libstdc++ no longer does —
+                     //!< guarantee them here instead of in every header.
+#include <cassert>
+#ifdef NDEBUG
+#  define DEBUG_XTHREAD 0
+#else
+#  define DEBUG_XTHREAD 1
+#endif
+
+// Qt-free type aliases referenced by the public headers.  Plain-`std`
+// equivalents of the QString-aware definitions in `kame/support.h`:
+//   * XString   — return type of `XTime::getTimeStr()` (xtime.h); the
+//                 dylib is Qt-free, so a `std::string` alias is the
+//                 correct realization (matches the test harness shim).
+//   * shared_ptr / weak_ptr — `XThread`'s ctor takes `shared_ptr<X>`
+//                 (xthread.h); `transaction.h` uses both.
+//   * static_pointer_cast / dynamic_pointer_cast — `XThread`'s member-
+//                 function ctor calls `dynamic_pointer_cast<T>(r)`
+//                 unqualified (xthread.h).  A call with an EXPLICIT
+//                 template argument needs the name visible to ordinary
+//                 unqualified lookup before C++20's P0846, which clang
+//                 grants as an extension but GCC does not — so without
+//                 these the standalone library fails to build on
+//                 Linux/GCC while building fine on macOS/clang.  Present
+//                 in `kame/support.h`; the shim was missing them.
+#include <string>
+#include <memory>
+typedef std::string XString;
+using std::shared_ptr;
+using std::weak_ptr;
+using std::static_pointer_cast;
+using std::dynamic_pointer_cast;
+
+// XKameError -- `transaction_signal.h` catches it around a listener's call
+// (and prints it), a non-dependent name inside templates, so every consumer
+// that includes `transaction.h` needs it declared, whether or not it ever
+// throws one.  `kame/support.h` has the full class and the test harness
+// (`tests/support_standalone.h`) its own; this shim had none, so a downstream
+// consumer of libkamestm alone could not compile `transaction.h` at all
+// ("unknown type name 'XKameError'", 2026-11-17).  A header-only minimum: the
+// message, where it was made, and print() to stderr.
+#include <cstdio>
+#include <stdexcept>
+struct XKameError : public std::runtime_error {
+    XKameError(const XString &s, const char *file, int line)
+        : std::runtime_error(s), m_msg(s), m_file(file), m_line(line) {}
+    virtual ~XKameError() noexcept {}
+    void print() const {
+        std::fprintf(stderr, "%s (%s:%d)\n", m_msg.c_str(), m_file ? m_file : "?", m_line);
+    }
+    const XString &msg() const {return m_msg;}
+private:
+    XString m_msg;
+    const char *m_file;
+    int m_line;
+};
+
+#endif /* supportH */

@@ -1,0 +1,433 @@
+/***************************************************************************
+        Copyright (C) 2002-2026 Kentaro Kitagawa
+                           kitag@issp.u-tokyo.ac.jp
+
+        This file is dual-licensed under your choice of EITHER:
+
+          * Apache License, Version 2.0
+            (http://www.apache.org/licenses/LICENSE-2.0, or see
+            LICENSE-APACHE-2.0 in this directory)
+
+        -- OR --
+
+          * GNU General Public License, version 2 of the License,
+            or (at your option) any later version
+            (http://www.gnu.org/licenses/old-licenses/gpl-2.0.html,
+            or see LICENSE-GPL-2.0 in this directory).
+
+        Pick whichever license suits your project.  Unless required
+        by applicable law or agreed to in writing, this file is
+        distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+        CONDITIONS OF ANY KIND, either express or implied
+***************************************************************************/
+#ifndef ATOMIC_QUEUE_H_
+#define ATOMIC_QUEUE_H_
+
+#include "atomic.h"
+#include <memory>
+#include <string.h>
+// abort() and assert() are used inside class templates below.  They only ever
+// reached this header transitively through libc++'s <memory>; libstdc++ does
+// not pull them in, and because both calls are non-dependent inside a template
+// GCC's two-phase lookup rejects them at definition time — a hard error, not a
+// warning.  KAME itself happens to include <cstdlib> earlier, so this only
+// bites a standalone consumer of the dual-licensed kamestm library (or any
+// include reordering).
+#include <cstdlib>
+#include <cassert>
+#include <type_traits>
+
+//! Atomic FIFO with a pre-defined size for POD-type data of non-zero values (e.g. pointers).
+//! \sa atomic_queue, atomic_pointer_queue
+template <typename T, unsigned int SIZE, typename const_ref = T>
+class atomic_nonzero_pod_queue {
+public:
+    struct nospace_error {};
+
+    atomic_nonzero_pod_queue() : m_pFirst(m_ptrs), m_pLast(m_ptrs), m_count(0) {
+        memset(m_ptrs, 0, SIZE * sizeof(T));
+    }
+
+    void push(T t) {
+    	if( !atomicPush(t))
+    		throw nospace_error();
+    }
+
+    //! This is not reentrant.
+    void pop() {
+        *m_pFirst = 0;
+        --m_count;
+    }
+    //! This is not reentrant.
+    T front() {
+        atomic<T> *first = m_pFirst;
+        while((T)*first == 0) {
+            first++;
+            if(first == &m_ptrs[SIZE]) {
+            	first = m_ptrs;
+            }
+        }
+        m_pFirst = first;
+        return *first;
+    }
+    //! This is not reentrant.
+    bool empty() const {
+        return m_count == 0;
+    }
+    unsigned int size() const {
+        return m_count;
+    }
+
+    //! Tries to push an item.
+	//! \param item to be added.
+	//! \return true if succeeded.
+    bool atomicPush(T t) {
+        assert(t);//has to be nonzero.
+        //m_count++ atomically, and the room is reserved.
+        for(;;) {
+            unsigned int x = m_count;
+            if(x == SIZE) {
+                if(m_count == SIZE)
+                    return false;
+                continue;
+            }
+            if(m_count.compare_set_strong(x, x + 1)) {
+                break;
+            }
+        }
+        for(int spins = 1;;) {
+            atomic<T> *last = m_pLast;
+            atomic<T> *last_org = last;
+            //finds zero.
+            while((T)*last != 0) {
+                last++;
+                if(last == &m_ptrs[SIZE]) {
+                    last = m_ptrs;
+
+                    spins *= 2;
+                    for(int i = 0; i < spins / 2; ++i)
+                        pause4spin(); //exponential backoff.
+                }
+            }
+            //tags the end of the queue.
+            if(m_pLast.compare_set_strong(last_org, last)) {
+                //CAS from zero to the item.
+                if(last->compare_set_strong((T)0, t)) {
+                    break;
+                }
+            }
+        }
+		return true;
+    }
+    //! Tries to pop the front item.
+	//! \param item to be released.
+	//! \return true if succeeded.
+    bool atomicPop(const_ref item) {
+    	assert(item);
+        atomic<T> *first = m_pFirst;
+        if(first->compare_set_strong((T)item, (T)0)) {
+            --m_count;
+            return true;
+        }
+        return false;
+    }
+    //! Tries to obtain the front item.
+    const_ref atomicFront() {
+        for(;;) {
+            if(empty())
+                return 0L;
+            atomic<T> *first = m_pFirst;
+            atomic<T> *first_org = first;
+            for(;;) {
+                const_ref t = *first;
+                if(t) {
+                    if(m_pFirst.compare_set_strong(first_org, first))
+                        return t;
+                    break;
+                }
+                first++;
+                if(first == &m_ptrs[SIZE]) {
+                    first = m_ptrs;
+                    if(empty())
+                        return 0L;
+                }
+            }
+        }
+    }
+    T atomicPopAny() {
+        if(empty())
+        	return 0L;
+        atomic<T> *first = m_pFirst;
+    	for(;;) {
+    		if( *first) {
+                T obj = first->exchange((T)0);
+				if(obj) {
+		            m_pFirst = first;
+                    --m_count;
+					return obj;
+				}
+    		}
+            first++;
+            if(first == &m_ptrs[SIZE]) {
+            	first = m_ptrs;
+	            if(empty())
+	            	return 0L;
+            }
+    	}
+    }
+private:
+    atomic<T> m_ptrs[SIZE];
+    atomic<atomic<T> *> m_pFirst;
+    atomic<atomic<T> *> m_pLast;
+    atomic<unsigned int> m_count;
+};
+
+//! Atomic FIFO with a pre-defined size for pointers.
+template <typename T, unsigned int SIZE>
+class atomic_pointer_queue : public atomic_nonzero_pod_queue<T*, SIZE, const T*> {};
+
+//! Atomic FIFO with a pre-defined size for copy-constructable class.
+template <typename T, unsigned int SIZE>
+class atomic_queue {
+public:
+    typedef typename atomic_pointer_queue<T, SIZE>::nospace_error nospace_error;
+
+    atomic_queue() {}
+    ~atomic_queue() {
+        while( !empty()) pop();
+    }
+
+    void push(const T&t) {
+        T *obj = new T(t);
+        try {
+            m_queue.push(obj);
+        }
+        catch (nospace_error &e) {
+            delete obj;
+            throw e;
+        }
+    }
+    //! This is not reentrant.
+    void pop() {
+        delete m_queue.front();
+        m_queue.pop();
+    }
+    //! This is not reentrant.
+    T &front() {
+        return *m_queue.front();
+    }
+    //! This is not reentrant.
+    bool empty() const {
+        return m_queue.empty();
+    }
+    unsigned int size() const {
+        return m_queue.size();
+    }
+private:
+    atomic_pointer_queue<T, SIZE> m_queue;
+};
+
+//! Atomic FIFO of a pre-defined size for copy-able class.
+template <typename T, unsigned int SIZE>
+class atomic_queue_reserved {
+    static_assert(std::is_trivially_copyable<T>::value,
+        "atomic_queue_reserved reads items optimistically while a push may be "
+        "rewriting the slot: T must be trivially copyable.");
+public:
+    typedef typename atomic_pointer_queue<T, SIZE>::nospace_error nospace_error;
+    typedef uint_cas_max key;
+
+    atomic_queue_reserved() {
+    	static_assert(SIZE < (1uLL << (sizeof(key) * 8 - 8)), "Size mismatch.");
+    	for(unsigned int i = 0; i < SIZE; i++) {
+			m_reservoir.push(key_index_serial(i, 0));
+    	}
+    }
+    ~atomic_queue_reserved() {
+        while(!empty()) pop();
+        assert(m_reservoir.size() == SIZE);
+    }
+
+    void push(const T&t) {
+    	key pack = m_reservoir.atomicPopAny();
+    	if( !pack)
+    		throw nospace_error();
+    	int idx = key2index(pack);
+    	m_array[idx].store(t, std::memory_order_relaxed);
+    	int serial = key2serial(pack) + 1;
+    	pack = key_index_serial(idx, serial);
+    	try {
+	    	m_queue.push(pack);
+    	}
+    	catch (nospace_error&e) {
+	    	try {
+	    		m_reservoir.push(pack);
+	    	}
+	    	catch (nospace_error&) {
+	    		abort();
+	    	}
+    		throw e;
+    	}
+    }
+    //! This is not reentrant.
+    void pop() {
+        key pack = m_queue.front();
+		m_queue.pop();
+    	try {
+    		m_reservoir.push(pack);
+    	}
+    	catch (nospace_error&) {
+    		abort();
+    	}
+    }
+    //! This is not reentrant.
+    T front() {
+        return m_array[key2index(m_queue.front())].load(std::memory_order_relaxed);
+    }
+    //! This is not reentrant.
+    bool empty() const {
+        return m_queue.empty();
+    }
+    unsigned int size() const {
+        return m_queue.size();
+    }
+
+	//! Try to pop the front item.
+	//! \param item to be released.
+	//! \return true if succeeded.
+    bool atomicPop(key item) {
+        if(m_queue.atomicPop(item)) {
+	    	try {
+				m_reservoir.push(item);
+	    	}
+	    	catch (nospace_error&) {
+	    		abort();
+	    	}
+	    	return true;
+        }
+        return false;
+    }
+    //! Try to obtain the front item.
+    key atomicFront(T *val) {
+        key pack = m_queue.atomicFront();
+        if(pack)
+        	*val = m_array[key2index(pack)].load(std::memory_order_relaxed);
+        return pack;
+    }
+private:
+    int key2index(key i) {return (unsigned int)i / 0x100;}
+    int key2serial(key i) {return ((unsigned int)i % 0x100) - 1;}
+    key key_index_serial(int index, int serial) {return index * 0x100 + (serial % 0xff) + 1;}
+    atomic_nonzero_pod_queue<key, SIZE> m_queue, m_reservoir;
+    //! Item slots.  atomicFront() reads a slot while a push() that reused it
+    //! (after another consumer popped its key) may be writing it; the serial
+    //! in the key then fails the caller's atomicPop(), so the value is
+    //! discarded.  Atomic slots make that overlap well-defined.  Relaxed
+    //! suffices: m_queue's acq_rel CAS publishes a slot's write before its
+    //! key.  Same instructions as plain copies wherever atomic<T> is
+    //! lock-free; elsewhere (a 64-bit T on i486) libatomic's lock.
+    std::atomic<T> m_array[SIZE];
+};
+
+
+//! Bounded, non-allocating FIFO for fat POD records, safe for any number of
+//! producers and consumers.
+//!
+//! The queues above cannot serve a producer that must not block, allocate or
+//! fail silently: `atomic_queue` allocates per item, and the pod queues carry
+//! one word and reserve zero as a sentinel.  This one owns its storage, moves
+//! records by assignment into a slot claimed with a single CAS, and answers
+//! false rather than waiting when it is full — so a caller on a real-time or
+//! signal-bounded path can offer a record and carry on.
+//!
+//! Each slot carries a sequence number, which is what makes claiming a slot
+//! and publishing its contents two separate steps (Vyukov's bounded MPMC
+//! queue): a producer may only write to a slot whose sequence equals the
+//! position it claimed, and a consumer may only read one that is a full lap
+//! ahead.  A slow producer therefore holds up only its own slot, never the
+//! queue.
+//!
+//! The positions are `uintptr_t`, not `uint64_t`, deliberately: a 64-bit
+//! atomic is NOT lock-free on RV32, ARMv5/v6, MIPS32 or i486, where it becomes
+//! a libatomic call taking a lock — which is precisely what this class exists
+//! to avoid.  Pointer width wraps sooner, and wrapping is harmless here since
+//! positions are only ever compared as a signed difference.
+template <typename T, unsigned int SIZE>
+class atomic_bounded_ring {
+public:
+    static_assert(std::is_trivially_copyable<T>::value,
+        "atomic_bounded_ring stores records by plain copy: no allocation and no "
+        "destructor may run while a slot is claimed.");
+    static_assert(SIZE && !(SIZE & (SIZE - 1)),
+        "SIZE must be a power of two, so the position wraps into an index with a mask.");
+
+    atomic_bounded_ring() noexcept : m_enqueue(0), m_dequeue(0) {
+        for(unsigned int i = 0; i < SIZE; ++i)
+            m_cells[i].seq.store(i, std::memory_order_relaxed);
+    }
+
+    //! Offers \a t.  Never blocks and never allocates.
+    //! \return false if the ring is full, in which case nothing was stored.
+    bool push(const T &t) noexcept {
+        uintptr_t pos = m_enqueue.load(std::memory_order_relaxed);
+        Cell *cell;
+        for(;;) {
+            cell = &m_cells[pos & (SIZE - 1)];
+            uintptr_t seq = cell->seq.load(std::memory_order_acquire);
+            intptr_t diff = (intptr_t)(seq - pos);
+            if(diff == 0) {
+                //The slot is ours if the claim lands; the CAS is relaxed
+                //because the acquire above already ordered the read of seq.
+                if(m_enqueue.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed))
+                    break;
+            }
+            else if(diff < 0)
+                return false;   //a full lap behind: the ring is full
+            else
+                pos = m_enqueue.load(std::memory_order_relaxed);
+        }
+        cell->data = t;
+        //Publishes the record: a consumer that sees this sequence sees the
+        //write above.
+        cell->seq.store(pos + 1, std::memory_order_release);
+        return true;
+    }
+
+    //! Takes the oldest record.  \return false if the ring is empty.
+    bool pop(T &t) noexcept {
+        uintptr_t pos = m_dequeue.load(std::memory_order_relaxed);
+        Cell *cell;
+        for(;;) {
+            cell = &m_cells[pos & (SIZE - 1)];
+            uintptr_t seq = cell->seq.load(std::memory_order_acquire);
+            intptr_t diff = (intptr_t)(seq - (pos + 1));
+            if(diff == 0) {
+                if(m_dequeue.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed))
+                    break;
+            }
+            else if(diff < 0)
+                return false;   //nothing published here yet: empty
+            else
+                pos = m_dequeue.load(std::memory_order_relaxed);
+        }
+        t = cell->data;
+        //Releases the slot for the producer a lap ahead.
+        cell->seq.store(pos + SIZE, std::memory_order_release);
+        return true;
+    }
+
+    constexpr unsigned int capacity() const noexcept {return SIZE;}
+private:
+    struct Cell {
+        atomic<uintptr_t> seq;
+        T data;
+    };
+    Cell m_cells[SIZE];
+    //Kept apart so producers and consumers do not share a cache line.
+    alignas(64) atomic<uintptr_t> m_enqueue;
+    alignas(64) atomic<uintptr_t> m_dequeue;
+};
+
+#endif /*ATOMIC_QUEUE_H_*/

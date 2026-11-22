@@ -3023,7 +3023,7 @@ struct KameTlsPage {
     //! stored here so both the dedicated-chunk fast paths (32 KiB < size ≤
     //! 4 MiB − K_MAX) and `l1_pop_fit` / `l1_push` reach it off `kame_page()`
     //! with zero `_tlv_get_addr` (macOS) or `_tls_index` (Windows) calls on
-    //! the hot path.  `lrc_l1` points to `tls_l1_array`; `lrc_l1_mask` packs
+    //! the hot path.  `lrc_l1` points to `tls_l1_storage.rows`; `lrc_l1_mask` packs
     //! into 32 bits (ILP32 + LP64 safe):
     //!   - bits [0..24]  (`0..LRC_N_MAX_L1`): demand-opened L1 band bits, set
     //!                   only when `idx <= cut_idx` AND this thread requested

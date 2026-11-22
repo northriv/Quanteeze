@@ -220,9 +220,9 @@ inline bool XWaitCell::wait(uint32_t g, unsigned usec) noexcept {
 }
 
 inline void XWaitCell::wake_one() noexcept {
-    // Bump the generation FIRST so a waiter still between gen() and
-    // wait() observes the change and skips sleeping; then wake any
-    // waiter already parked on the old value.
+    // Bump the generation FIRST so a waiter still between gen() and wait()
+    // observes the change and skips sleeping; then wake any waiter already
+    // parked on the old value.
     m_word.fetch_add(1, std::memory_order_release);
     ::syscall(SYS_futex, reinterpret_cast<uint32_t *>( &m_word),
               FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, nullptr, nullptr, 0);

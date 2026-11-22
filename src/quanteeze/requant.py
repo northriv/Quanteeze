@@ -334,8 +334,7 @@ def quantize(w, bits, group_size=GROUP_SIZE, iterations=ITERATIONS):
     if b in GGML_MODES:
         from . import ggml_quants
         if w.shape[-1] % 256 == 0:
-            body, d, dmin, _ = ggml_quants.FORMATS[b](w)
-            return [body, d, dmin]
+            return list(ggml_quants.pack_arrays(w, b, iterations))
         fb, fgs, _ = effective_format(b, w.shape[-1])
         return quantize(w, fb, fgs, iterations)
     bits = int(b)
@@ -474,7 +473,7 @@ class QuantCache:
                      else (mx.array(biases_np).view(mx.bfloat16) if biases_np.dtype == np.uint16 else mx.array(biases_np)))
         return [weight_mx, scales_mx, biases_mx]
 
-    def ensure(self, layer, projection, total, compute, chunk=32):
+    def ensure(self, layer, projection, total, compute, chunk=32, ahead=None):
         """Ensure all `0..total-1` expert rows for `(layer, projection)` are materialized on disk."""
         with open(self.dir / f'{layer}.{projection}.lock', 'a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -483,6 +482,8 @@ class QuantCache:
             missing = np.flatnonzero(~done)
             for start in range(0, missing.size, chunk):
                 sub = missing[start:start + chunk]
+                if ahead is not None:
+                    ahead(missing[start + chunk:start + 2 * chunk])
                 self._write_rows(layer, projection, sub, compute(sub), total, done, done_path)
 
     def close(self):
@@ -528,17 +529,31 @@ class Reader:
         return 'affine', int(self._config['group_size']), int(self._config['bits'])
 
     def experts(self, layer, projection, experts):
+        from . import parallel
+        parallel.require(layer, 'requant read')
         experts = np.asarray(experts, np.int64)
         if self.cache is None:
             return self._computed(layer, projection, experts)
         return self.cache.get(layer, projection, experts, self.count(layer, projection),
                               lambda ids: self._computed(layer, projection, ids))
 
+    def _ahead(self, layer, projection, rows):
+        if rows.size:
+            names = [self.base.name(layer, projection, k) for k in q2_experts.NAMES
+                     if self.base.has(layer, projection, k)]
+            self.base.ahead([(name, rows) for name in names])
+
+    def close(self):
+        self.base.close()
+        if self.cache is not None:
+            self.cache.close()
+
     def _computed(self, layer, projection, experts):
         mode, group_size, bits = self._quantization(layer, projection)
         parts = []
         for s in range(0, experts.size, self.chunk):
             weight, scales, biases = self.base.experts(layer, projection, experts[s:s + self.chunk])
+            self._ahead(layer, projection, experts[s + self.chunk:s + 2 * self.chunk])
             if mode == 'mxfp4' and self.bits == 'mxfp4':
                 part = [weight, scales, None]
             else:
@@ -569,6 +584,8 @@ class Flat:
 
     def expert(self, layer, projection, expert, out=None, cache=True):
         """One expert's `[weight, scales, biases]` `[1, ...]` at `self.bits`, evaluated here."""
+        from . import parallel
+        parallel.require(layer, 'requant read')
         buf = self.base.buffers(layer, projection) if out is None else out
         arrays = self.base.expert(layer, projection, expert, buf, cache=cache)
         mode, group_size, bits = self._quantization(layer, projection)
@@ -585,50 +602,43 @@ class Flat:
 def lower_model(layers, path, bits, group_size=None, on_layer=None):
     """Lower every MoE layer's `SwitchGLU` in `layers` uniformly to `bits` (integer affine least-squares,
     `'mxfp4'`, or ggml `'q3_k'`, `'q2_k'`, `'iq2_xs'`), streaming from `path` in chunks of 32 experts."""
-    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
-    from . import fitting, ggml_quants
+    from . import demand, fitting, ggml_quants, parallel
     bits_spec = _norm_bits(bits)
     gs_default = fitting.group_size(bits_spec) if group_size is None else int(group_size)
     reader = Reader(path, bits_spec, gs_default)
-    moe_layers = [(i, arch.switch_of(layer)) for i, layer in enumerate(layers) if arch.switch_of(layer) is not None]
-    for idx, (layer_idx, switch) in enumerate(moe_layers):
-        n_experts = reader.count(layer_idx, 'gate_proj')
-        all_ids = np.arange(n_experts, dtype=np.int64)
-        for p in PROJECTIONS:
-            proj = getattr(switch, p)
-            w, s, b = reader.experts(layer_idx, p, all_ids)
-            if w.ndim == 4:
-                eff_bits = ggml_quants.FORMAT_BITS[bits_spec]
-                eff_gs = 256
-                eff_mode = bits_spec
-                out_dims, in_dims = w.shape[1], w.shape[2] * 256
-            else:
-                eff_bits = (4 if bits_spec == 'mxfp4'
-                            else ggml_quants.FORMAT_BITS[bits_spec] if bits_spec in GGML_MODES
-                            else int(bits_spec))
-                eff_mode = 'mxfp4' if (bits_spec == 'mxfp4' and b is None) else 'affine'
-                out_dims = w.shape[1]
-                in_dims = w.shape[2] * 32 // eff_bits
-                eff_gs = in_dims // s.shape[-1]
-            if not isinstance(proj, QuantizedSwitchLinear):
-                init_gs = eff_gs if eff_gs in (32, 64, 128) else 64
-                init_bits = eff_bits if eff_bits in (2, 3, 4, 8) else 4
-                proj = QuantizedSwitchLinear(in_dims, out_dims, n_experts, bias=False,
-                                             group_size=init_gs, bits=init_bits, mode=eff_mode)
+    moe_layers = [
+        (i, arch.switch_of(layer)) for i, layer in enumerate(layers)
+        if arch.switch_of(layer) is not None and parallel.own_layer(i)
+    ]
+    try:
+        for idx, (layer_idx, switch) in enumerate(moe_layers):
+            n_experts = reader.count(layer_idx, 'gate_proj')
+            all_ids = np.arange(n_experts, dtype=np.int64)
+            for p in PROJECTIONS:
+                w, s, b = reader.experts(layer_idx, p, all_ids)
+                if w.ndim == 4:
+                    eff_bits = ggml_quants.FORMAT_BITS[bits_spec]
+                    eff_gs = 256
+                    eff_mode = bits_spec
+                else:
+                    eff_bits = (4 if bits_spec == 'mxfp4'
+                                else ggml_quants.FORMAT_BITS[bits_spec] if bits_spec in GGML_MODES
+                                else int(bits_spec))
+                    eff_mode = 'mxfp4' if (bits_spec == 'mxfp4' and b is None) else 'affine'
+                    in_dims = w.shape[2] * 32 // eff_bits
+                    eff_gs = in_dims // s.shape[-1]
+                proj = demand.Projection(
+                    demand._with_weight_room(w), demand._to_device(s), demand._to_device(b),
+                    eff_gs, eff_bits, mode=eff_mode,
+                )
+                del w, s, b
+                mx.eval(proj.parameters())
                 setattr(switch, p, proj)
-            proj.weight = w
-            proj.scales = s
-            if b is not None:
-                proj.biases = b
-            else:
-                proj.pop('biases', None)
-            proj.bits = eff_bits
-            proj.group_size = eff_gs
-            proj.mode = eff_mode
-            mx.eval(*[t for t in (proj.weight, proj.scales, proj.get('biases')) if t is not None])
-        mx.clear_cache()
-        if on_layer is not None:
-            on_layer(idx + 1, len(moe_layers))
+            mx.clear_cache()
+            if on_layer is not None:
+                on_layer(idx + 1, len(moe_layers))
+    finally:
+        reader.close()
 
 
 _NPY_TO_SAFETENSORS = {
@@ -691,23 +701,30 @@ class CachedCheckpoint(q2_experts.Checkpoint):
 def cached_checkpoint(layers, path, bits, group_size=None, on_layer=None):
     """Materialize uniform `bits` expert arrays for `layers` in `QuantCache` and return a
     `CachedCheckpoint` (or `None` when `QUANTEEZE_QUANT_CACHE=off`)."""
-    from . import fitting
+    from . import fitting, parallel
     bits_spec = _norm_bits(bits)
     gs_default = fitting.group_size(bits_spec) if group_size is None else int(group_size)
     reader = Reader(path, bits_spec, gs_default)
     if reader.cache is None:
+        reader.close()
         return None
-    moe_indices = [i for i, layer in enumerate(layers) if arch.switch_of(layer) is not None]
-    for idx, layer_idx in enumerate(moe_indices):
-        n_experts = reader.count(layer_idx, 'gate_proj')
-        for p in PROJECTIONS:
-            reader.cache.ensure(
-                layer_idx, p, n_experts,
-                lambda ids, l=layer_idx, proj=p: reader._computed(l, proj, ids),
-                chunk=reader.chunk,
-            )
-        mx.clear_cache()
-        if on_layer is not None:
-            on_layer(idx + 1, len(moe_indices))
-    reader.cache.close()
-    return CachedCheckpoint(reader, moe_indices)
+    try:
+        moe_indices = [
+            i for i, layer in enumerate(layers)
+            if arch.switch_of(layer) is not None and parallel.own_layer(i)
+        ]
+        for idx, layer_idx in enumerate(moe_indices):
+            n_experts = reader.count(layer_idx, 'gate_proj')
+            for p in PROJECTIONS:
+                reader.cache.ensure(
+                    layer_idx, p, n_experts,
+                    lambda ids, l=layer_idx, proj=p: reader._computed(l, proj, ids),
+                    chunk=reader.chunk,
+                    ahead=lambda ids, l=layer_idx, proj=p: reader._ahead(l, proj, ids),
+                )
+            mx.clear_cache()
+            if on_layer is not None:
+                on_layer(idx + 1, len(moe_indices))
+        return CachedCheckpoint(reader, moe_indices)
+    finally:
+        reader.close()

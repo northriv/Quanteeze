@@ -41,12 +41,13 @@ def _weight_map(path):
 
 
 def _maps(path, names, index=None):
-    """`{name: (numpy memmap, safetensors dtype)}` of `names` at checkpoint `path`."""
+    """`{name: (numpy memmap view, safetensors dtype)}` of `names` at checkpoint `path` (one map per file)."""
+    from . import mapped
     if index is None:
         index = _weight_map(path)
     if index is None:
         return None
-    headers, out = {}, {}
+    headers, files, out = {}, {}, {}
     for name in names:
         shard = index.get(name)
         if shard is None:
@@ -61,8 +62,7 @@ def _maps(path, names, index=None):
             return None
         start, _ = t['data_offsets']
         out[name] = (
-            np.memmap(Path(path) / shard, mode='r', dtype=DTYPES[t['dtype']], offset=8 + length + start,
-                      shape=tuple(t['shape'])),
+            mapped.view(files, Path(path) / shard, DTYPES[t['dtype']], 8 + length + start, tuple(t['shape'])),
             t['dtype'],
         )
     return out

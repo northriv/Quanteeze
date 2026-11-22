@@ -10,6 +10,7 @@
 //   scales [rows, cols / 32] uint8 E8M0: w = 2^(scale - 127) * e2m1(q).
 //
 // AVX-512 (16 lanes) and AVX2 with FMA (8 lanes) are selected at runtime when supported (isa 2, 1), else plain C++ (0).
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -70,6 +71,16 @@ static void mxfp4_plain(const uint32_t* w, const uint8_t* sc, int cols, const fl
             acc += e8m0(sc[size_t(r) * groups + g]) * dot;
         }
         y[r] = acc;
+    }
+}
+
+static void quantize_q8(const float* x, int cols, int8_t* xq, float* xd) {
+    for (int b = 0; b < cols / 32; ++b) {
+        float m = 0.0f;
+        for (int j = b * 32; j < (b + 1) * 32; ++j) m = std::max(m, std::fabs(x[j]));
+        const float d = m / 127.0f, inv = m > 0.0f ? 127.0f / m : 0.0f;
+        xd[b] = d;
+        for (int j = b * 32; j < (b + 1) * 32; ++j) xq[j] = static_cast<int8_t>(std::lrintf(x[j] * inv));
     }
 }
 
@@ -153,6 +164,60 @@ __attribute__((target("avx2,fma"))) static void mxfp4_avx2(const uint32_t* w, co
             total = _mm256_fmadd_ps(dot, _mm256_set1_ps(e8m0(sc[size_t(r) * groups + g])), total);
         }
         y[r] = hsum8(total);
+    }
+}
+
+// ---------------------------------------------------------------- AVX2 + Q8 inputs: 32 values per step
+
+__attribute__((target("avx2,fma"))) static inline __m256i nibbles32(const uint32_t* w) {
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w));
+    const __m128i m = _mm_set1_epi8(15);
+    const __m128i lo = _mm_and_si128(b, m), hi = _mm_and_si128(_mm_srli_epi16(b, 4), m);
+    return _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+}
+
+__attribute__((target("avx2,fma"))) static inline __m256 dot32(__m256i wu8, __m256i xs8) {
+    const __m256i p16 = _mm256_maddubs_epi16(wu8, xs8);
+    return _mm256_cvtepi32_ps(_mm256_madd_epi16(p16, _mm256_set1_epi16(1)));
+}
+
+__attribute__((target("avx2,fma"))) static void mxfp4_q8(const uint32_t* w, const uint8_t* sc, int cols,
+                                                         const int8_t* xq, const float* xd, float* y, int row0,
+                                                         int row1) {
+    const int words = cols / 8, groups = cols / 32;
+    const __m256i lut = _mm256_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+                                         0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    for (int r = row0; r < row1; ++r) {
+        const uint32_t* wr = w + size_t(r) * words;
+        __m256 total = _mm256_setzero_ps();
+        for (int g = 0; g < groups; ++g) {
+            const __m256i v = _mm256_shuffle_epi8(lut, nibbles32(wr + g * 4));
+            const __m256i x8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + g * 32));
+            const __m256 dot = dot32(_mm256_sign_epi8(v, v), _mm256_sign_epi8(x8, v));
+            total = _mm256_fmadd_ps(dot, _mm256_set1_ps(0.5f * e8m0(sc[size_t(r) * groups + g]) * xd[g]), total);
+        }
+        y[r] = hsum8(total);
+    }
+}
+
+__attribute__((target("avx2,fma"))) static void affine4_q8(const uint32_t* w, const uint16_t* sc, const uint16_t* bi,
+                                                           int cols, int group, const int8_t* xq, const float* xd,
+                                                           const float* xsum, float* y, int row0, int row1) {
+    const int words = cols / 8, groups = cols / group, per = group / 32;
+    for (int r = row0; r < row1; ++r) {
+        const uint32_t* wr = w + size_t(r) * words;
+        __m256 total = _mm256_setzero_ps();
+        float bias = 0.0f;
+        for (int g = 0; g < groups; ++g) {
+            const float s = bf16(sc[size_t(r) * groups + g]);
+            for (int k = 0; k < per; ++k) {
+                const int b = g * per + k;
+                const __m256i x8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + b * 32));
+                total = _mm256_fmadd_ps(dot32(nibbles32(wr + b * 4), x8), _mm256_set1_ps(s * xd[b]), total);
+            }
+            bias += bf16(bi[size_t(r) * groups + g]) * xsum[g];
+        }
+        y[r] = hsum8(total) + bias;
     }
 }
 
@@ -285,11 +350,9 @@ API int qz_mxfp4(const uint32_t* w, const uint8_t* sc, int cols, const float* x,
 
 // ---------------------------------------------------------------- lock-free worker pool
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
-#include <mutex>
 #include <thread>
 #include <vector>
 #include "atomic_smart_ptr.h"
@@ -310,6 +373,39 @@ struct Proj {
     const void* bi;
     int rows, cols, bits, group;
 };
+
+static bool q8_takes(const Proj& p, int isa) {
+#ifdef QZ_X86
+    if (isa < 1) return false;
+    if (p.kind == 1) return p.cols % 32 == 0;
+    return p.bits == 4 && p.group % 32 == 0 && p.cols % p.group == 0;
+#else
+    (void)p;
+    (void)isa;
+    return false;
+#endif
+}
+
+static int project_q8(const Proj& p, const int8_t* xq, const float* xd, const float* xsum, float* y, int r0,
+                      int r1) {
+#ifdef QZ_X86
+    if (p.kind == 1)
+        mxfp4_q8(static_cast<const uint32_t*>(p.w), static_cast<const uint8_t*>(p.sc), p.cols, xq, xd, y, r0, r1);
+    else
+        affine4_q8(static_cast<const uint32_t*>(p.w), static_cast<const uint16_t*>(p.sc),
+                   static_cast<const uint16_t*>(p.bi), p.cols, p.group, xq, xd, xsum, y, r0, r1);
+    return 0;
+#else
+    (void)p;
+    (void)xq;
+    (void)xd;
+    (void)xsum;
+    (void)y;
+    (void)r0;
+    (void)r1;
+    return -1;
+#endif
+}
 
 static int project(const Proj& p, const float* x, const float* xsum, float* y, int r0, int r1, int isa) {
     if (p.kind == 1)
@@ -421,13 +517,47 @@ static void reference_rows(const Proj& p, const float* x, float* y) {
 
 API void qz_reference(const Proj* p, const float* x, float* y) { reference_rows(*p, x, y); }
 
+static void as_q8(const float* x, int cols, std::vector<float>& out) {
+    std::vector<int8_t> q(cols);
+    std::vector<float> d(cols / 32);
+    quantize_q8(x, cols, q.data(), d.data());
+    out.resize(cols);
+    for (int j = 0; j < cols; ++j) out[j] = d[j / 32] * static_cast<float>(q[j]);
+}
+
+static void bias_back(const Proj& p, const float* x, const float* xhat, float* y) {
+    if (p.kind == 1) return;
+    const int groups = p.cols / p.group;
+    const uint16_t* bi = static_cast<const uint16_t*>(p.bi);
+    for (int g = 0; g < groups; ++g) {
+        double d = 0.0;
+        for (int j = g * p.group; j < (g + 1) * p.group; ++j) d += double(x[j]) - double(xhat[j]);
+        for (int r = 0; r < p.rows; ++r) y[r] += static_cast<float>(double(bf16_value(bi[size_t(r) * groups + g])) * d);
+    }
+}
+
 API void qz_expert_reference(const Proj* gate, const Proj* up, const Proj* down, const float* x, float* out,
-                             float limit, float weight, int style) {
-    std::vector<float> g(gate->rows), u(up->rows), h(gate->rows);
-    reference_rows(*gate, x, g.data());
-    reference_rows(*up, x, u.data());
+                             float limit, float weight, int style, int q8) {
+    std::vector<float> g(gate->rows), u(up->rows), h(gate->rows), xin, hin;
+    const float* a = x;
+    if (q8 && q8_takes(*gate, 1) && q8_takes(*up, 1)) {
+        as_q8(x, gate->cols, xin);
+        a = xin.data();
+    }
+    reference_rows(*gate, a, g.data());
+    reference_rows(*up, a, u.data());
+    if (a != x) {
+        bias_back(*gate, x, a, g.data());
+        bias_back(*up, x, a, u.data());
+    }
     activate(g.data(), u.data(), h.data(), gate->rows, limit, weight, style);
-    reference_rows(*down, h.data(), out);
+    const float* b = h.data();
+    if (q8 && q8_takes(*down, 1)) {
+        as_q8(h.data(), down->cols, hin);
+        b = hin.data();
+    }
+    reference_rows(*down, b, out);
+    if (b != h.data()) bias_back(*down, h.data(), b, out);
     finish(out, down->rows, style);
 }
 
@@ -438,6 +568,8 @@ static inline int64_t now_ns() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Monotonic telemetry counters and test stall injection scalars; KAME pointer/wait-cell primitives
+// coordinate phase publication and wakeup, whereas these require lock-free arithmetic/bitmask updates.
 struct Counts {
     std::atomic<int64_t> rung{0}, woke{0}, wake_ns{0}, wake_ns_max{0}, by_workers{0}, by_caller{0}, stolen{0};
     std::atomic<int64_t> workers_ns{0}, caller_ns{0};
@@ -458,6 +590,9 @@ struct Phase : atomic_countable {
     Proj proj[2];
     const Proj* p[2];
     std::vector<float> x_own, xsum_own[2];
+    std::vector<int8_t> xq_own;
+    std::vector<float> xd_own;
+    bool q8 = false;
     const float* x;
     const float* xsum[2];
     float* y[2];
@@ -466,8 +601,11 @@ struct Phase : atomic_countable {
     int chunks[2];
     int total;
     int64_t rung_at = 0;
+    // Per-chunk CAS states and timestamps plus fetch_add index/done counters have no KAME multi-slot equivalent;
+    // thread sleep/wakeup on phase completion uses KAME XWaitCell (`done`).
     std::unique_ptr<std::atomic<int>[]> state;
     std::unique_ptr<std::atomic<int64_t>[]> taken_at;
+    int capacity = 0;
     std::atomic<int> next{0}, failed{0}, finished{0};
     XWaitCell done;
     Counts* counts = nullptr;
@@ -478,7 +616,9 @@ struct Phase : atomic_countable {
         const Proj& q = *p[k];
         const int r0 = local * CHUNK_ROWS, r1 = std::min(q.rows, r0 + CHUNK_ROWS);
         if (int(scratch.size()) < q.rows) scratch.resize(q.rows);
-        if (project(q, x, xsum[k], scratch.data(), r0, r1, isa) != 0) failed = 1;
+        const int got = q8 ? project_q8(q, xq_own.data(), xd_own.data(), xsum[k], scratch.data(), r0, r1)
+                           : project(q, x, xsum[k], scratch.data(), r0, r1, isa);
+        if (got != 0) failed = 1;
         int taken = TAKEN;
         if (!state[c].compare_exchange_strong(taken, DONE, std::memory_order_acq_rel)) return;
         std::copy(scratch.data() + r0, scratch.data() + r1, y[k] + r0);
@@ -551,9 +691,21 @@ struct Pool {
     std::vector<std::thread> threads;
     std::unique_ptr<Bell[]> bells;
     std::vector<int> cpus;
+    // Non-blocking shutdown flag checked in spin loops alongside KAME XWaitCell bell wakeups.
     std::atomic<int> stop{0};
-    std::mutex call;
-    std::vector<float> g, u, hidden_sums[3];
+    bool q8 = false;
+    // Non-blocking single-caller try-claim: returns -3 immediately when another caller is active
+    // instead of blocking on a mutex (KAME primitives do not model non-blocking try-claim return).
+    std::atomic<int> calling{0};
+    std::vector<local_shared_ptr<Phase>> spare;
+
+    local_shared_ptr<Phase> phase() {
+        for (auto& p : spare)
+            if (p.unique()) return p;
+        spare.emplace_back(make_local_shared<Phase>());
+        return spare.back();
+    }
+
     int priority = 0;         // 0: SCHED_IDLE (else nice 19), 1: nice 19, 2: normal, 3: wake normal -> SCHED_IDLE
     int spin_us = 0;
     Counts counts;
@@ -650,9 +802,9 @@ struct Pool {
     }
 };
 
-static local_shared_ptr<Phase> make_phase(const Proj* a, const Proj* b, const float* x, const float* xa,
-                                          const float* xb, float* ya, float* yb, int isa, int parts) {
-    local_shared_ptr<Phase> p(new Phase());
+static local_shared_ptr<Phase> make_phase(Pool* pool, const Proj* a, const Proj* b, const float* x,
+                                          const float* xa, const float* xb, float* ya, float* yb, int isa, int parts) {
+    local_shared_ptr<Phase> p = pool->phase();
     p->proj[0] = *a;
     p->p[0] = &p->proj[0];
     p->p[1] = nullptr;
@@ -662,6 +814,12 @@ static local_shared_ptr<Phase> make_phase(const Proj* a, const Proj* b, const fl
     }
     p->x_own.assign(x, x + a->cols);
     p->x = p->x_own.data();
+    p->q8 = pool->q8 && q8_takes(*a, isa) && (!b || q8_takes(*b, isa));
+    if (p->q8) {
+        p->xq_own.resize(a->cols);
+        p->xd_own.resize(a->cols / 32);
+        quantize_q8(p->x, a->cols, p->xq_own.data(), p->xd_own.data());
+    }
     const float* given[2] = {xa, xb};
     for (int k = 0; k < 2; ++k) {
         p->xsum[k] = nullptr;
@@ -677,8 +835,15 @@ static local_shared_ptr<Phase> make_phase(const Proj* a, const Proj* b, const fl
     p->chunks[0] = (a->rows + CHUNK_ROWS - 1) / CHUNK_ROWS;
     p->chunks[1] = b ? (b->rows + CHUNK_ROWS - 1) / CHUNK_ROWS : 0;
     p->total = p->chunks[0] + p->chunks[1];
-    p->state.reset(new std::atomic<int>[p->total]);
-    p->taken_at.reset(new std::atomic<int64_t>[p->total]);
+    if (p->total > p->capacity) {
+        p->state = std::make_unique<std::atomic<int>[]>(p->total);
+        p->taken_at = std::make_unique<std::atomic<int64_t>[]>(p->total);
+        p->capacity = p->total;
+    }
+    p->next.store(0, std::memory_order_relaxed);
+    p->failed.store(0, std::memory_order_relaxed);
+    p->finished.store(0, std::memory_order_relaxed);
+    p->counts = nullptr;
     for (int c = 0; c < p->total; ++c) {
         p->state[c].store(FREE, std::memory_order_relaxed);
         p->taken_at[c].store(0, std::memory_order_relaxed);
@@ -692,6 +857,10 @@ API int qz_pool_busy(void* handle) {
 
 API void qz_pool_stall(void* handle, int64_t ns) {
     static_cast<Pool*>(handle)->counts.stall.store(ns);
+}
+
+API void qz_pool_q8(void* handle, int on) {
+    static_cast<Pool*>(handle)->q8 = on != 0;
 }
 
 API void qz_pool_stall_before(void* handle, int64_t ns) {
@@ -723,21 +892,21 @@ static void sums(const Proj& p, const float* x, std::vector<float>& out) {
 }
 
 API void* qz_pool_new(int threads, int priority, int spin_us, const int* cpus, int ncpus) {
-    Pool* pool = new Pool();
+    auto owned = std::make_unique<Pool>();
+    Pool* pool = owned.get();
     pool->priority = priority;
     pool->spin_us = spin_us;
-    pool->bells.reset(new Bell[threads > 0 ? threads : 1]);
+    pool->bells = std::make_unique<Bell[]>(threads > 0 ? threads : 1);
     for (int i = 0; i < threads; ++i) pool->cpus.push_back(ncpus > 0 ? cpus[i % ncpus] : -1);
     for (int i = 0; i < threads; ++i) pool->threads.emplace_back([pool, i] { pool->work(i); });
-    return pool;
+    return owned.release();
 }
 
 API void qz_pool_free(void* handle) {
-    Pool* pool = static_cast<Pool*>(handle);
+    std::unique_ptr<Pool> pool(static_cast<Pool*>(handle));
     pool->stop.store(1, std::memory_order_release);
     for (size_t i = 0; i < pool->threads.size(); ++i) pool->bells[i].rung.wake_one();
     for (auto& t : pool->threads) t.join();
-    delete pool;
 }
 
 API int qz_expert(void* handle, int active, const Proj* gate, const Proj* up, const Proj* down, const float* x,
@@ -746,30 +915,39 @@ API int qz_expert(void* handle, int active, const Proj* gate, const Proj* up, co
     const int parts = active < int(pool->threads.size()) ? active : int(pool->threads.size());
     if (parts <= 0) return -2;
     if (style == ACTIVATION_DEEPSEEK_V41 && gate->rows % 32 != 0) return -1;
-    std::lock_guard<std::mutex> guard(pool->call);
+    if (pool->calling.exchange(1, std::memory_order_acquire)) return -3;
+    struct Release {
+        Pool* p;
+        ~Release() { p->calling.store(0, std::memory_order_release); }
+    } release{pool};
     const int inner = gate->rows;
-    pool->g.resize(inner);
-    pool->u.resize(inner);
-    std::vector<float>* xs = pool->hidden_sums;
+    static thread_local std::vector<float> g, u, xs[3];
+    if (int(g.size()) < inner) {
+        g.resize(inner);
+        u.resize(inner);
+    }
     sums(*gate, x, xs[0]);
     sums(*up, x, xs[1]);
-    if (pool->run(make_phase(gate, up, x, xs[0].data(), xs[1].data(), pool->g.data(), pool->u.data(), isa, parts)))
+    if (pool->run(make_phase(pool, gate, up, x, xs[0].data(), xs[1].data(), g.data(), u.data(), isa, parts)))
         return -1;
-    activate(pool->g.data(), pool->u.data(), hidden, inner, limit, weight, style);
+    activate(g.data(), u.data(), hidden, inner, limit, weight, style);
     sums(*down, hidden, xs[2]);
-    if (pool->run(make_phase(down, nullptr, hidden, xs[2].data(), nullptr, out, nullptr, isa, parts))) return -1;
+    if (pool->run(make_phase(pool, down, nullptr, hidden, xs[2].data(), nullptr, out, nullptr, isa, parts))) return -1;
     finish(out, down->rows, style);
     return 0;
 }
 
 // ---------------------------------------------------------------- zero-GIL CUDA handshake server
 
-// Request row layout (int32 words): [stamp, n, slots[MMAX] (-1: none), weights[MMAX] (float)], then x [D] float at HEAD.
+// Request row layout (int32 words): [stamp, n, slots[MMAX] (-1: none), weights[MMAX] (float), xrow[MMAX], B],
+// then x [B, D] float at HEAD.
 // Answer row layout (int32 words): [stamp, n, done[MMAX] (1: computed)], then outputs [MMAX, D] float at HEAD.
 static const int SERVE_MMAX = 16;
+static const int SERVE_BMAX = 8;
 static const int SERVE_HEAD = 64;
 
 struct ServeLayer {
+    // Release-acquire publication flag read unlocked by the polling server loop once layer descriptors are written.
     std::atomic<bool> on{false};
     const uint8_t* base[3][3] = {};
     int64_t rowb[3][3] = {};
@@ -788,6 +966,8 @@ struct Server {
     int n_layers = 0;
     std::vector<int64_t> done;
     std::vector<int> cpus;
+    // Non-blocking active count, shutdown flag, and scalar telemetry for the pinned-mailbox polling loop
+    // (the polling loop cannot block on KAME XWaitCell while scanning GPU mailboxes across layers).
     std::atomic<int> active{1};
     std::atomic<int> stop{0};
     std::atomic<int64_t> requests{0}, experts{0}, failed{0}, compute_ns{0}, serving{0};
@@ -812,6 +992,8 @@ struct Server {
                 int32_t wbits = b[2 + SERVE_MMAX + m];
                 float weight;
                 std::memcpy(&weight, &wbits, 4);
+                int xr = b[2 + 2 * SERVE_MMAX + m];
+                if (xr < 0 || xr >= SERVE_BMAX) xr = 0;
                 Proj p[3];
                 for (int q = 0; q < 3; ++q) {
                     p[q] = L.like[q];
@@ -822,8 +1004,8 @@ struct Server {
                 static thread_local std::vector<float> hidden;
                 if (int(hidden.size()) < p[0].rows) hidden.resize(p[0].rows);
                 const int act = active.load(std::memory_order_relaxed);
-                const int r = qz_expert(pool, act > 0 ? act : 1, &p[0], &p[1], &p[2], x, out + int64_t(m) * D,
-                                        hidden.data(), L.limit, weight, L.style, isa);
+                const int r = qz_expert(pool, act > 0 ? act : 1, &p[0], &p[1], &p[2], x + int64_t(xr) * D,
+                                        out + int64_t(m) * D, hidden.data(), L.limit, weight, L.style, isa);
                 ok = r == 0;
                 if (ok) experts.fetch_add(1, std::memory_order_relaxed);
                 else failed.fetch_add(1, std::memory_order_relaxed);
@@ -874,7 +1056,8 @@ struct Server {
 
 API void* qz_server_new(void* pool, int isa, int D, int n_layers, int32_t* box, int64_t box_words, int32_t* ans,
                         int64_t ans_words, int spin_us) {
-    Server* s = new Server();
+    auto owned = std::make_unique<Server>();
+    Server* s = owned.get();
     s->pool = static_cast<Pool*>(pool);
     s->isa = isa;
     s->D = D;
@@ -883,11 +1066,11 @@ API void* qz_server_new(void* pool, int isa, int D, int n_layers, int32_t* box, 
     s->box_words = box_words;
     s->ans_words = ans_words;
     s->spin_us = spin_us;
-    s->layers.reset(new ServeLayer[n_layers]);
+    s->layers = std::make_unique<ServeLayer[]>(n_layers);
     s->n_layers = n_layers;
     s->done.assign(n_layers, 0);
     for (int i = 0; i < n_layers; ++i) s->done[i] = box[int64_t(i) * box_words];
-    return s;
+    return owned.release();
 }
 
 API void qz_server_layer(void* handle, int i, const Proj* like, const void* const* bases, const int64_t* rowb,
@@ -935,8 +1118,7 @@ API void qz_server_counts(void* handle, int64_t* out) {
 }
 
 API void qz_server_free(void* handle) {
-    Server* s = static_cast<Server*>(handle);
+    std::unique_ptr<Server> s(static_cast<Server*>(handle));
     s->stop.store(1, std::memory_order_release);
     if (s->thread.joinable()) s->thread.join();
-    delete s;
 }

@@ -9,16 +9,19 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
+import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx_vlm.models.linear import DECODE_BLOCK_SIZE
 
-from . import arch, expert_qmv, prefill, q2_experts, requant
+from . import arch, cuda_kernels, expert_qmv, prefill, q2_experts, requant
 from .q2_experts import NAMES, PROJECTIONS
 
 DECAY = 0.999
+_LIVE = weakref.WeakSet()
+_NEED_PREFILL = object()
 
 
 class Projection(nn.Module):
@@ -65,9 +68,9 @@ class Projection(nn.Module):
                 if kquant_qmv.takes_rows(self, x, indices):
                     return kquant_qmv.gather_rows(self, x, indices, unpacked)
             return unpacked()
-        return mx.gather_qmm(x, self.weight, self.scales, self.get('biases'), rhs_indices=indices, transpose=True,
-                             group_size=self.group_size, bits=self.bits, mode=self.mode,
-                             sorted_indices=sorted_indices)
+        return mx.gather_qmm(cuda_kernels.qmm_room(x), self.weight, self.scales, self.get('biases'),
+                             rhs_indices=indices, transpose=True, group_size=self.group_size,
+                             bits=self.bits, mode=self.mode, sorted_indices=sorted_indices)
 
 
 _STAGE_RING = 8
@@ -105,17 +108,56 @@ def _to_device(arr):
     return dst
 
 
+WEIGHT_ROOM = 256
+
+
+def _with_weight_room(arr):
+    """Ensure `arr` resides on device with at least `WEIGHT_ROOM` bytes of trailing zero padding on
+    non-Metal GPU backends so MLX 0.32.4's CUDA `qmm_sm80_kernel` never reads unmapped memory past
+    the last expert row."""
+    if arr is None:
+        return None
+    if mx.metal.is_available() or mx.default_device() != mx.gpu or arr.ndim == 0 or arr.size == 0:
+        return _to_device(arr)
+    if arr.dtype == mx.uint8 and arr.size % 4 == 0:
+        words = arr.size // 4
+        pad_words = -(-WEIGHT_ROOM // 4)
+        base = mx.zeros((words + pad_words,), dtype=mx.uint32)
+        mx.eval(base)
+        idx = mx.arange(words, dtype=mx.int32)
+        base[idx] = arr.reshape(-1).view(mx.uint32)
+        out = base[:words].view(mx.uint8).reshape(arr.shape)
+        del base
+        mx.eval(out)
+        return out
+    pad = -(-WEIGHT_ROOM // arr.dtype.size)
+    base = mx.zeros((arr.size + pad,), dtype=arr.dtype)
+    mx.eval(base)
+    idx = mx.arange(arr.size, dtype=mx.int32)
+    base[idx] = arr.reshape(-1)
+    out = base[:arr.size].reshape(arr.shape)
+    del base
+    mx.eval(out)
+    return out
+
+
 def _place_attr(proj, attr, idx, val):
     cur = getattr(proj, attr)
     sh = cur.shape
+    on_cuda_w = attr == 'weight' and not mx.metal.is_available() and mx.default_device() == mx.gpu
     if cur.dtype == mx.uint8 and sh[0] > 0 and (cur.size // sh[0]) % 4 == 0:
         setattr(proj, attr, None)
         u32 = cur.reshape(sh[0], -1).view(mx.uint32)
         del cur
         u32[idx] = val.reshape(val.shape[0], -1).view(mx.uint32)
-        setattr(proj, attr, u32.view(mx.uint8).reshape(sh))
+        out = u32.view(mx.uint8).reshape(sh)
+        if on_cuda_w:
+            out = _with_weight_room(out)
+        setattr(proj, attr, out)
     else:
         cur[idx] = val
+        if on_cuda_w:
+            setattr(proj, attr, _with_weight_room(cur))
 
 
 def _take_rows(arr, take_idx):
@@ -167,6 +209,8 @@ class DemandSwitchGLU(nn.Module):
         exps_arr = np.asarray(experts, dtype=np.int64).reshape(-1)
         if not slots_arr.size:
             return []
+        if self.demand is not None:
+            self.demand._before_switch_placed(self)
         old_exps = self.experts[slots_arr].copy()
         for slot, old in zip(slots_arr.tolist(), old_exps.tolist()):
             if old >= 0 and self.route[old] == slot:
@@ -196,6 +240,8 @@ class DemandSwitchGLU(nn.Module):
         if upd_exps.size:
             self._local[mx.array(upd_exps)] = mx.array(upd_vals)
             written.append(self._local)
+        if self.demand is not None:
+            self.demand._on_switch_placed(self)
         return written
 
     def place(self, slot, expert, arrays):
@@ -204,6 +250,8 @@ class DemandSwitchGLU(nn.Module):
 
     def replace_all(self, experts, arrays_by_proj):
         """Replace the entire bank with `experts` and their stacked `[weight, scales, biases]`."""
+        if self.demand is not None:
+            self.demand._before_switch_placed(self)
         self.experts = np.array(experts, dtype=np.int64, copy=True)
         self.route.fill(-1)
         self.route[self.experts] = np.arange(self.experts.size)
@@ -211,7 +259,8 @@ class DemandSwitchGLU(nn.Module):
         written = []
         for p in PROJECTIONS:
             proj = getattr(self, p)
-            w, s, b = (_to_device(a) for a in arrays_by_proj[p])
+            w_raw, s_raw, b_raw = arrays_by_proj[p]
+            w, s, b = _with_weight_room(w_raw), _to_device(s_raw), _to_device(b_raw)
             proj.weight = w
             written.append(proj.weight)
             if s is not None:
@@ -222,6 +271,8 @@ class DemandSwitchGLU(nn.Module):
                 written.append(proj.biases)
         self._local = _to_device(mx.array(np.maximum(self.route, 0).astype(np.uint32)))
         written.append(self._local)
+        if self.demand is not None:
+            self.demand._on_switch_placed(self)
         return written
 
     def __call__(self, x, indices, scores=None):
@@ -254,14 +305,27 @@ class Demand:
     """On-demand expert streaming manager across all MoE layers of `model`."""
 
     def __init__(self, model, checkpoint, budget_bytes, workers=4, prompt_room=None):
-        from . import cpu_experts, cuda_ple, fitting
+        from . import cpu_experts, cuda_ple, fitting, native_reads
         self.checkpoint = checkpoint
         self.base = checkpoint.base if isinstance(checkpoint, requant.Flat) else checkpoint
         self.workers = max(1, int(workers))
         self.prompt_room = None if not prompt_room else float(prompt_room)
         self._pool = ThreadPoolExecutor(self.workers, thread_name_prefix='demand-read')
+        self._native = (
+            native_reads.Readers(self.workers)
+            if (hasattr(checkpoint, 'segments') and native_reads.enabled())
+            else None
+        )
+        self.native_reads = 0
         self._stream_threads = set()
         self._stream_lock = threading.Lock()
+        self._seq_lock = threading.Lock()
+        self._prefill_lock = threading.RLock()
+        self._stage_lock = threading.RLock()
+        self._buf_lock = threading.Lock()
+        self._pass_seq = 0
+        self._stm = None
+        self._stm_why = None
         self._free_least = cuda_ple.free_least()
         self._decode_steps = 0
         self._after_prefill = False
@@ -272,6 +336,8 @@ class Demand:
         self._cpu_load = cpu_experts.Load(cpu_experts.default_threads()).start() if self._cpu_mode == 'auto' else None
         self._cpu_status = []
         self._cpu_counts = []
+        self._cpu_status_lock = threading.Lock()
+        self._cpu_eval_tid = None
         self.cpu_served = 0
         self.cpu_late = 0
         self.cpu_wait_ms = 0.0
@@ -378,7 +444,7 @@ class Demand:
                     p_mode = self.base.mode(l, p) or 'affine'
                     _, in_d = _proj_dims(getattr(old_switch, p))
                     p_gs, p_bits = self.base.quantization(l, p, in_d)
-                w, s, b = _to_device(w), _to_device(s), _to_device(b)
+                w, s, b = _with_weight_room(w), _to_device(s), _to_device(b)
                 projs[p] = Projection(w, s, b, p_gs, p_bits, mode=p_mode)
                 del w, s, b
                 mx.eval(projs[p].parameters())
@@ -390,11 +456,48 @@ class Demand:
             self.switches[l] = d_switch
             mx.clear_cache()
 
+        self._layer_locks = {l: threading.RLock() for l in self.moe_indices}
+        from . import stm_core
+        self._stm = stm_core.create_driver(self)
+        _LIVE.add(self)
+
+    def _before_switch_placed(self, switch):
+        if getattr(self, '_stm', None) is not None:
+            self._stm.before_switch_placed(switch)
+
+    def _on_switch_placed(self, switch):
+        if getattr(self, '_stm', None) is not None:
+            self._stm.on_switch_placed(switch)
+
+    def _has_layer_inflight(self, layer):
+        with self._stage_lock:
+            return any(entry is not None and entry[0] == layer for entry in self._stage_inflight)
+
+    def _finish_decode_step(self):
+        with self._seq_lock:
+            self._decode_steps += 1
+            do_room = self._after_prefill or (self._decode_steps % 64 == 0)
+            if do_room:
+                self._after_prefill = False
+        if do_room:
+            self._room_back()
+
+    def _mark_prefill(self):
+        with self._seq_lock:
+            self._after_prefill = True
+            self._decode_steps = 0
+
+    def thread_done(self):
+        """Release any STM layer leases remaining from the calling thread's last pass."""
+        if getattr(self, '_stm', None) is not None:
+            self._stm.thread_done()
+
     def _room_back(self):
         if self._free_least is not None:
             from . import cuda_ple
             if cuda_ple.room_back(self._free_least):
-                self.trimmed += 1
+                with self._seq_lock:
+                    self.trimmed += 1
 
     def _host(self):
         """The host's copy of the experts by rows (q2_experts.HostCopy with `by_rows=True`), or None."""
@@ -413,32 +516,44 @@ class Demand:
 
     def _flush_cpu_counts(self):
         """Evaluate accumulated CUDA `CPU_WAIT` status telemetry into scalar counters."""
-        if self._cpu_status:
-            self._cpu_counts.append(mx.sum(mx.stack(self._cpu_status)[:, 1::2], axis=0))
+        with self._cpu_status_lock:
+            statuses = self._cpu_status
             self._cpu_status = []
-        if self._cpu_counts:
-            totals = mx.sum(mx.stack(self._cpu_counts), axis=0)
-            mx.eval(totals)
-            self.cpu_late += int(totals[0].item())
-            self.cpu_wait_ms += float(totals[1].item()) / 1e3
+            counts = self._cpu_counts
             self._cpu_counts = []
-            if self.cpu_late > 0 and self._cpu_why is None:
-                self._cpu_why = 'CPU expert server timed out'
+        if statuses:
+            counts.append(mx.sum(mx.stack(statuses)[:, 1::2], axis=0))
+        if counts:
+            totals = mx.sum(mx.stack(counts), axis=0)
+            mx.eval(totals)
+            late_add = int(totals[0].item())
+            wait_ms_add = float(totals[1].item()) / 1e3
+            with self._cpu_status_lock:
+                self.cpu_late += late_add
+                self.cpu_wait_ms += wait_ms_add
+                if self.cpu_late > 0 and self._cpu_why is None:
+                    self._cpu_why = 'CPU expert server timed out'
 
     def _step_cpu(self):
         """Fold the previous step's CPU statuses asynchronously and refresh allowed worker count."""
-        if self._cpu_status:
-            late = mx.sum(mx.stack(self._cpu_status)[:, 1::2], axis=0)
-            mx.async_eval(late)
-            self._cpu_counts.append(late)
+        with self._cpu_status_lock:
+            self._cpu_eval_tid = threading.get_ident()
+            statuses = self._cpu_status
             self._cpu_status = []
-            if len(self._cpu_counts) >= 16:
+        if statuses:
+            late = mx.sum(mx.stack(statuses)[:, 1::2], axis=0)
+            mx.async_eval(late)
+            with self._cpu_status_lock:
+                self._cpu_counts.append(late)
+                should_flush = len(self._cpu_counts) >= 16
+            if should_flush:
                 self._flush_cpu_counts()
-        if self._cpu is not None:
+        cpu = self._cpu
+        if cpu is not None:
             allowed = self._cpu_allowed()
-            self._cpu.active = allowed
-            if self._cpu.server is not None:
-                self._cpu.server.active(allowed)
+            cpu.active = allowed
+            if cpu.server is not None:
+                cpu.server.active(allowed)
 
     def _cpu_layer(self, layer, switch, hidden_dim, host):
         """Ensure the CPU worker pool/server are started and `layer` is registered, or return False."""
@@ -538,10 +653,11 @@ class Demand:
                     active=active_init,
                 )
                 where = (f'server thread on CPUs {server.cpus}' if server is not None else 'direct pool')
+                q8_info = ', q8' if (pool.q8 and pool.isa >= 1) else ''
                 print(
                     f'quanteeze: decode misses in host memory computed on the CPU '
                     f'(QUANTEEZE_CPU_EXPERTS={self._cpu_mode}): {pool.threads} workers on CPUs {pool.cpus}, '
-                    f'{where}, {cpu_experts.ISA_NAMES[pool.isa]}',
+                    f'{where}, {cpu_experts.ISA_NAMES[pool.isa]}{q8_info}',
                     file=sys.stderr, flush=True,
                 )
             if self._cpu.server is not None:
@@ -555,86 +671,274 @@ class Demand:
             print(f'quanteeze: CPU expert offload off ({self._cpu_why})', file=sys.stderr, flush=True)
             return False
 
-    def _load_disk_missing(self, layer, switch, disk_victims, disk_missing):
-        """Read `disk_missing` experts from disk using `_pool` and place them into `disk_victims`."""
-        for start in range(0, len(disk_victims), self.workers):
-            batch_slots = disk_victims[start:start + self.workers]
-            batch_exps = disk_missing[start:start + len(batch_slots)]
-            futures = [
-                self._pool.submit(self._read_one, layer, e, w_idx)
-                for w_idx, e in enumerate(batch_exps)
-            ]
-            results = [fut.result() for fut in futures]
-            batch_exps_done = [int(r[0]) for r in results]
-            if len(results) == 1:
-                batch_arrays = results[0][1]
+    def _native_submit_expert(self, layer, expert, worker_slot, cache=True):
+        """Submit one expert's 3-projection read via `native_reads`, or return None."""
+        from . import native_reads
+        if self._native is None or not native_reads.enabled() or not hasattr(self.checkpoint, 'segments'):
+            return None
+        rooms = {}
+        segs = []
+        for p in PROJECTIONS:
+            room = self.buffers[(layer, p)][worker_slot]
+            got = self.checkpoint.segments(layer, p, int(expert), room)
+            if not got:
+                return None
+            rooms[p] = room
+            segs.extend(got)
+        if len(segs) > native_reads.MAX_SEGMENTS:
+            return None
+
+        ckpt = self.checkpoint
+        exp_id = int(expert)
+
+        def finish():
+            return exp_id, {p: ckpt.made(layer, p, rooms[p]) for p in PROJECTIONS}
+
+        check = None
+        if native_reads.checking():
+            def check():
+                for _file, _off, _length, _ptr, dst_u8, key in segs:
+                    want = ckpt._from_file(key, [exp_id], cache=cache).view(np.uint8).reshape(-1)
+                    if dst_u8.shape != want.shape or not np.array_equal(dst_u8, want):
+                        native_reads.record_check(False, f'{key} expert {exp_id}')
+                        return False
+                native_reads.record_check(True)
+                return True
+
+        def fallback():
+            self._native = None
+            return self._read_one(layer, exp_id, worker_slot)
+
+        return self._native.read(segs, finish=finish, cache=cache, priority=0, check=check, fallback=fallback)
+
+    def _native_prefill_targets(self, remaining_targets, rows_arg):
+        """Read unheld prefill targets directly via `native_reads`, or return False to fall back."""
+        from . import native_reads, request_threads
+        if self._native is None or not native_reads.enabled() or not hasattr(self.base, 'tensors'):
+            return False
+        prio = 1 if request_threads.others_serving() else 0
+        segs = []
+        for t_name, out_view in remaining_targets:
+            entry = self.base.tensors.get(t_name)
+            if entry is None:
+                return False
+            file, _st_dtype, shape, offset = entry
+            rows_arr = np.arange(shape[0], dtype=np.int64) if rows_arg is None else np.asarray(rows_arg, dtype=np.int64).reshape(-1)
+            if rows_arr.size == 0:
+                continue
+            if not out_view.flags.c_contiguous or not out_view.flags.writeable or out_view.shape[0] != rows_arr.size:
+                return False
+            u8_out = out_view.reshape(rows_arr.size, -1).view(np.uint8)
+            row_bytes = int(u8_out.shape[1])
+            if file is not None:
+                i = 0
+                while i < rows_arr.size:
+                    j = i + 1
+                    while j < rows_arr.size and rows_arr[j] == rows_arr[j - 1] + 1:
+                        j += 1
+                    segs.append((str(file), int(offset) + int(rows_arr[i]) * row_bytes, (j - i) * row_bytes,
+                                 int(u8_out[i].ctypes.data), u8_out[i:j].reshape(-1), t_name, rows_arr[i:j]))
+                    i = j
             else:
-                batch_arrays = {
-                    p: [
-                        None if results[0][1][p][i] is None
-                        else mx.concatenate([r[1][p][i] for r in results], axis=0)
-                        for i in range(len(NAMES))
-                    ]
-                    for p in PROJECTIONS
-                }
-            batch_written = switch.place_many(batch_slots, batch_exps_done, batch_arrays)
-            if batch_written:
-                mx.eval(batch_written)
+                for i, e in enumerate(rows_arr):
+                    part_file, part_off = offset[int(e)]
+                    segs.append((str(part_file), int(part_off), row_bytes,
+                                 int(u8_out[i].ctypes.data), u8_out[i:i + 1].reshape(-1), t_name, rows_arr[i:i + 1]))
+        if not segs:
+            return True
+        futs = []
+        ok = False
+        try:
+            for idx in range(0, len(segs), native_reads.MAX_SEGMENTS):
+                batch = segs[idx:idx + native_reads.MAX_SEGMENTS]
+                check = None
+                fallback = None
+                if idx == 0 and native_reads.checking():
+                    def check(b=batch):
+                        for _f, _o, _l, _p, dst_u8, key, part_rows in b:
+                            want = self.base._from_file(key, part_rows, cache=False).view(np.uint8).reshape(-1)
+                            if dst_u8.shape != want.shape or not np.array_equal(dst_u8, want):
+                                native_reads.record_check(False, f'{key} prefill')
+                                return False
+                        native_reads.record_check(True)
+                        return True
+
+                    def fallback(b=batch):
+                        self._native = None
+                        for _f, _o, _l, _p, dst_u8, key, part_rows in b:
+                            dst_u8[:] = self.base._from_file(key, part_rows, cache=False).view(np.uint8).reshape(-1)
+                fut = self._native.read(batch, cache=False, priority=prio, check=check, fallback=fallback)
+                if fut is None:
+                    return False
+                futs.append(fut)
+            for fut in futs:
+                fut.result()
+            with self._seq_lock:
+                self.native_reads += len(futs)
+            ok = True
+            return True
+        finally:
+            if not ok:
+                for fut in futs:
+                    fut.close()
+
+    def _load_disk_missing(self, layer, switch, disk_victims, disk_missing, in_pass=True):
+        """Read `disk_missing` experts from disk via C++ STM lander, lock-free `pread`, or `_pool`."""
+        from . import native_reads, parallel
+        parallel.require(layer, 'demand load')
+        stm = getattr(self, '_stm', None)
+        if stm is not None and stm.can_serve_reads() and not native_reads.checking():
+            self._drain_layer_inflight(layer)
+            if stm.land_missing(layer, switch, disk_victims, disk_missing, in_pass=in_pass):
+                return
+        reacquire = False
+        if stm is not None and stm.started:
+            if in_pass:
+                stm.layer_done(layer)
+                reacquire = True
+            stm.wait_layer_idle(layer)
+        try:
+            with self._buf_lock:
+                for start in range(0, len(disk_victims), self.workers):
+                    batch_slots = disk_victims[start:start + self.workers]
+                    batch_exps = disk_missing[start:start + len(batch_slots)]
+                    futures = []
+                    native_flags = []
+                    try:
+                        for w_idx, e in enumerate(batch_exps):
+                            fut = self._native_submit_expert(layer, int(e), w_idx, cache=True)
+                            if fut is not None:
+                                futures.append(fut)
+                                native_flags.append(True)
+                            else:
+                                futures.append(self._pool.submit(self._read_one, layer, e, w_idx))
+                                native_flags.append(False)
+                        results = [fut.result() for fut in futures]
+                    finally:
+                        for flag, fut in zip(native_flags, futures):
+                            if flag:
+                                fut.close()
+                    n_native = sum(1 for flag in native_flags if flag and native_reads._STATE['failed'] is None)
+                    if n_native:
+                        with self._seq_lock:
+                            self.native_reads += n_native
+                    if any(native_flags):
+                        to_eval = [
+                            a for flag, (_, d) in zip(native_flags, results) if flag
+                            for p in PROJECTIONS for a in d[p] if a is not None
+                        ]
+                        if to_eval:
+                            mx.eval(to_eval)
+                    batch_exps_done = [int(r[0]) for r in results]
+                    if len(results) == 1:
+                        batch_arrays = results[0][1]
+                    else:
+                        batch_arrays = {
+                            p: [
+                                None if results[0][1][p][i] is None
+                                else mx.concatenate([r[1][p][i] for r in results], axis=0)
+                                for i in range(len(NAMES))
+                            ]
+                            for p in PROJECTIONS
+                        }
+                    batch_written = switch.place_many(batch_slots, batch_exps_done, batch_arrays)
+                    if batch_written:
+                        mx.eval(batch_written)
+        finally:
+            if reacquire:
+                stm.begin_layer(layer)
+
+    def _load_and_place(self, layer, switch, victims, in_host, disk_missing, *, in_pass=True):
+        """Stage host-resident experts and/or load disk-missing experts into `switch` safely under STM."""
+        from . import parallel
+        parallel.require(layer, 'demand load')
+        self._drain_layer_inflight(layer)
+        stm = getattr(self, '_stm', None)
+        written = []
+        ring = None
+        reacquire = False
+        try:
+            if in_host.size:
+                ring, copied = self._stage_host_experts(layer, in_host)
+                if stm is not None and stm.started:
+                    if in_pass:
+                        stm.layer_done(layer)
+                        reacquire = True
+                    stm.wait_layer_idle(layer)
+                written = switch.place_many(victims[:in_host.size], in_host, copied)
+            disk_victims = victims[in_host.size:]
+            if disk_missing.size == 0:
+                if written:
+                    if in_pass:
+                        with self._stage_lock:
+                            self._stage_inflight[ring] = (layer, written)
+                    else:
+                        mx.eval(written)
+                    del written
+            else:
+                if written:
+                    mx.eval(written)
+                    written.clear()
+                self._load_disk_missing(layer, switch, disk_victims, disk_missing, in_pass=in_pass)
+        finally:
+            if reacquire and stm is not None:
+                stm.begin_layer(layer)
 
     def _cpu_offload(self, layer, switch, x, indices, scores, ids, active_ids, present_mask, missing, host, in_host):
-        """Compute `in_host` decode misses on CPU in parallel with GPU-resident experts, or return None."""
+        """Compute `in_host` decode misses (`B=1..8`) on CPU in parallel with GPU-resident experts, or return None."""
         from . import cpu_experts
-        if (x.ndim != 3 or x.shape[0] != 1 or x.shape[1] != 1
+        if (x.ndim != 3 or x.shape[1] != 1 or not 1 <= x.shape[0] <= cpu_experts.SERVE_BMAX
                 or x.dtype not in (mx.bfloat16, mx.float16, mx.float32)):
             return None
         if self._cpu_allowed() <= 0 or not self._cpu_layer(layer, switch, int(x.shape[-1]), host):
             return None
         c = self._cpu
-        cpu_exps = in_host[:cpu_experts.SERVE_MMAX]
-        cpu_pos = {int(e): i for i, e in enumerate(cpu_exps.tolist())}
+        b_rows, top_k = int(x.shape[0]), int(indices.shape[-1])
+        in_host_set = set(int(e) for e in in_host.tolist())
+        ids_flat = [int(e) for e in ids.tolist()]
+        req_exps, req_xrows, inv_list = [], [], []
         if switch.weighs:
-            req_exps, inv_list, handled = [], [], set()
-            for e in ids.tolist():
-                if e in cpu_pos and len(req_exps) < cpu_experts.SERVE_MMAX:
+            for j, e in enumerate(ids_flat):
+                b_idx = j // top_k
+                if e in in_host_set and len(req_exps) < cpu_experts.SERVE_MMAX:
                     inv_list.append(len(req_exps))
                     req_exps.append(e)
-                    handled.add(e)
+                    req_xrows.append(b_idx)
                 else:
                     inv_list.append(-1)
-            if not req_exps:
-                return None
         else:
-            inv_list = [cpu_pos.get(int(e), -1) for e in ids.tolist()]
-            req_exps = cpu_exps.tolist()
-            handled = set(req_exps)
+            pair_pos = {}
+            for j, e in enumerate(ids_flat):
+                b_idx = j // top_k
+                key = (b_idx, e)
+                if key in pair_pos:
+                    inv_list.append(pair_pos[key])
+                elif e in in_host_set and len(req_exps) < cpu_experts.SERVE_MMAX:
+                    m_idx = len(req_exps)
+                    pair_pos[key] = m_idx
+                    inv_list.append(m_idx)
+                    req_exps.append(e)
+                    req_xrows.append(b_idx)
+                else:
+                    inv_list.append(-1)
+        if not req_exps:
+            return None
 
-        gpu_missing = np.array([int(e) for e in missing.tolist() if int(e) not in handled], dtype=np.int64)
-        gpu_in_host = np.array([int(e) for e in in_host.tolist() if int(e) not in handled], dtype=np.int64)
+        unhandled_missing = {
+            ids_flat[j] for j, iv in enumerate(inv_list) if iv < 0 and switch.route[ids_flat[j]] < 0
+        }
+        gpu_missing = np.array([int(e) for e in missing.tolist() if int(e) in unhandled_missing], dtype=np.int64)
+        gpu_in_host = np.array([int(e) for e in in_host.tolist() if int(e) in unhandled_missing], dtype=np.int64)
         if gpu_missing.size:
             free_mask = np.ones(switch.experts.size, dtype=bool)
             if present_mask.any():
                 free_mask[switch.route[active_ids[present_mask]]] = False
             cand = np.flatnonzero(free_mask)
             victims = cand[np.argsort(self.weight[layer][switch.experts[cand]], kind='stable')[:gpu_missing.size]]
-            self._drain_layer_inflight(layer)
-            written = []
-            ring = None
-            if gpu_in_host.size:
-                ring, copied = self._stage_host_experts(layer, gpu_in_host)
-                written = switch.place_many(victims[:gpu_in_host.size], gpu_in_host, copied)
-            disk_victims = victims[gpu_in_host.size:]
             gpu_in_host_set = set(gpu_in_host.tolist())
             disk_missing = np.array([int(e) for e in gpu_missing.tolist() if int(e) not in gpu_in_host_set],
                                     dtype=np.int64)
-            if disk_missing.size == 0:
-                if written:
-                    self._stage_inflight[ring] = (layer, written)
-                    del written
-            else:
-                if written:
-                    mx.eval(written)
-                    written.clear()
-                self._load_disk_missing(layer, switch, disk_victims, disk_missing)
+            self._load_and_place(layer, switch, victims, gpu_in_host, disk_missing, in_pass=True)
 
         req_slots = host.slot_of[layer][np.asarray(req_exps, dtype=np.int64)].astype(np.int32)
         inv = np.asarray(inv_list, dtype=np.int32)
@@ -648,15 +952,17 @@ class Demand:
             if has_gpu_slots:
                 y_gpu = expert_qmv.decode(switch, x, switch._local_indices(indices), weights)
             else:
-                y_gpu = mx.zeros((1, 1, int(ids.size), int(x.shape[-1])), dtype=x.dtype)
+                y_gpu = mx.zeros((b_rows, 1, top_k, int(x.shape[-1])), dtype=x.dtype)
             out, status = cpu_experts.cpu_wait(c.server.addr[layer], token, y_gpu, inv_mx, most=int(req_slots.size))
             mx.async_eval(out, status)
-            self._cpu_status.append(status)
+            with self._cpu_status_lock:
+                self._cpu_eval_tid = threading.get_ident()
+                self._cpu_status.append(status)
         else:
             if has_gpu_slots:
                 y_gpu = expert_qmv.decode(switch, x, switch._local_indices(indices), weights)
                 mx.async_eval(y_gpu)
-            xf = np.array(x.astype(mx.float32)).reshape(-1)
+            xf = np.array(x.astype(mx.float32)).reshape(b_rows, -1)
             w_np = np.array(scores.astype(mx.float32)).reshape(-1) if switch.weighs else None
             spec, limit, activation = c.specs[layer]
             computed = []
@@ -667,33 +973,48 @@ class Demand:
                         if iv == m:
                             w_val = float(w_np[j])
                             break
-                res = c.pool.expert(cpu_experts.layer_expert(spec, int(slot)), xf, limit, w_val, activation)
+                res = c.pool.expert(cpu_experts.layer_expert(spec, int(slot)), xf[req_xrows[m]], limit, w_val, activation)
                 if res is None:
-                    self._cpu_why = cpu_experts.verified()[1] or 'CPU expert computation failed'
+                    err = cpu_experts.verified()[1]
+                    if err:
+                        with self._cpu_status_lock:
+                            self._cpu_why = err
                     return None
                 computed.append(res)
             stacked = np.stack(computed, axis=0)
             valid_inv = np.where(inv >= 0, inv, 0)
-            cpu_y = mx.array(stacked[valid_inv]).astype(x.dtype).reshape(1, 1, int(ids.size), int(x.shape[-1]))
-            out = mx.where(mx.array(inv >= 0).reshape(1, 1, -1, 1), cpu_y, y_gpu) if has_gpu_slots else cpu_y
+            cpu_y = mx.array(stacked[valid_inv]).astype(x.dtype).reshape(b_rows, 1, top_k, int(x.shape[-1]))
+            out = mx.where(mx.array(inv >= 0).reshape(b_rows, 1, top_k, 1), cpu_y, y_gpu) if has_gpu_slots else cpu_y
 
-        self.host_served += int(gpu_in_host.size + len(handled))
-        self.cpu_served += int(len(handled))
+        cpu_unique = len({int(e) for e in req_exps if int(e) not in unhandled_missing})
+        with self._seq_lock:
+            self.host_served += int(gpu_in_host.size + cpu_unique)
+        with self._cpu_status_lock:
+            self.cpu_served += int(len(req_exps))
         return out
 
     def _close_cpu(self):
         """Flush telemetry and stop the CPU worker pool, polling server, and load monitor."""
-        self._flush_cpu_counts()
-        if self._cpu is not None:
+        with self._cpu_status_lock:
+            eval_tid = self._cpu_eval_tid
+        if eval_tid is not None and threading.get_ident() == eval_tid:
+            self._flush_cpu_counts()
+        else:
+            with self._cpu_status_lock:
+                self._cpu_status = []
+                self._cpu_counts = []
+        with self._cpu_status_lock:
+            cpu = self._cpu
+            self._cpu = None
+        if cpu is not None:
             try:
                 mx.synchronize()
             except Exception:
                 pass
-            if self._cpu.server is not None:
-                self._cpu.server.close()
-            if self._cpu.pool is not None:
-                self._cpu.pool.close()
-            self._cpu = None
+            if cpu.server is not None:
+                cpu.server.close()
+            if cpu.pool is not None:
+                cpu.pool.close()
         if self._cpu_load is not None:
             self._cpu_load.close()
             self._cpu_load = None
@@ -701,66 +1022,68 @@ class Demand:
     def _drain_layer_inflight(self, layer):
         """Ensure any async stage write targeting `layer` has completed and been cleared so bank
         buffers have refcount 1 for in-place donation."""
-        for k, entry in enumerate(self._stage_inflight):
-            if entry is not None and entry[0] == layer:
-                mx.eval(entry[1])
-                self._stage_inflight[k] = None
+        with self._stage_lock:
+            for k, entry in enumerate(self._stage_inflight):
+                if entry is not None and entry[0] == layer:
+                    mx.eval(entry[1])
+                    self._stage_inflight[k] = None
 
     def _stage_host_experts(self, layer, in_host):
         """Copy `in_host` expert rows from `HostCopy` directly into reusable `cuMemAdvise`-hinted
         `stream=mx.cpu` staging buffers in the next ring slot."""
         from . import cuda_ple
-        ring = self._stage_cursor
-        self._stage_cursor = (ring + 1) % _STAGE_RING
-        if self._stage_inflight[ring] is not None:
-            mx.eval(self._stage_inflight[ring][1])
-            self._stage_inflight[ring] = None
-        m = int(in_host.size)
-        cap = max(8, 1 << max(0, m - 1).bit_length())
-        copied = {}
-        targets = []
-        for p in PROJECTIONS:
-            parts = []
-            for part in NAMES:
-                if not self.base.has(layer, p, part):
-                    parts.append(None)
-                    continue
-                t_name = self.base.name(layer, p, part)
-                _, st_dtype, full_shape, _ = self.base.tensors[t_name]
-                tail = tuple(full_shape[1:])
-                np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
-                row_bytes = int(np.prod(tail, dtype=np.int64)) * np_dt.itemsize
-                used_bytes = m * row_bytes
-                need_bytes = cap * row_bytes
-                need_words = max(1, (need_bytes + 3) // 4)
-                slot_key = (p, part)
-                entry = self._stage_ring[ring].get(slot_key)
-                if entry is None or entry[0].shape[0] < need_words:
-                    if entry is not None and entry[2]:
-                        cuda_ple.advise_host_staging(entry[1], enable=False)
-                    mlx_arr = mx.zeros((need_words,), mx.uint32, stream=mx.cpu)
-                    mx.eval(mlx_arr)
-                    np_view = np.asarray(mlx_arr).view(np.uint8)
-                    adv = cuda_ple.advise_host_staging(np_view, enable=True)
-                    entry = (mlx_arr, np_view, adv)
-                    self._stage_ring[ring][slot_key] = entry
-                mlx_arr, np_u8, _ = entry
-                out_view = np_u8[:used_bytes].view(np_dt).reshape((m,) + tail)
-                targets.append((t_name, out_view))
-                if np_dt == np.uint32:
-                    raw_part = mlx_arr[:used_bytes // 4].reshape((m,) + tail)
-                elif (used_bytes % 4) == 0:
-                    raw_part = mlx_arr[:used_bytes // 4].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
-                else:
-                    raw_part = mlx_arr.view(mx.uint8)[:used_bytes].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
-                parts.append(q2_experts._as_mlx(raw_part, st_dtype))
-            copied[p] = parts
-        host = self._host()
-        if targets:
-            if host is None or not host.copy_layer(layer, in_host, targets):
-                for t_name, out_view in targets:
-                    self.base._read(t_name, in_host, cache=True, out=out_view)
-        return ring, copied
+        with self._stage_lock:
+            ring = self._stage_cursor
+            self._stage_cursor = (ring + 1) % _STAGE_RING
+            if self._stage_inflight[ring] is not None:
+                mx.eval(self._stage_inflight[ring][1])
+                self._stage_inflight[ring] = None
+            m = int(in_host.size)
+            cap = max(8, 1 << max(0, m - 1).bit_length())
+            copied = {}
+            targets = []
+            for p in PROJECTIONS:
+                parts = []
+                for part in NAMES:
+                    if not self.base.has(layer, p, part):
+                        parts.append(None)
+                        continue
+                    t_name = self.base.name(layer, p, part)
+                    _, st_dtype, full_shape, _ = self.base.tensors[t_name]
+                    tail = tuple(full_shape[1:])
+                    np_dt = np.dtype(q2_experts._SAFETENSORS[st_dtype])
+                    row_bytes = int(np.prod(tail, dtype=np.int64)) * np_dt.itemsize
+                    used_bytes = m * row_bytes
+                    need_bytes = cap * row_bytes
+                    need_words = max(1, (need_bytes + 3) // 4)
+                    slot_key = (p, part)
+                    entry = self._stage_ring[ring].get(slot_key)
+                    if entry is None or entry[0].shape[0] < need_words:
+                        if entry is not None and entry[2]:
+                            cuda_ple.advise_host_staging(entry[1], enable=False)
+                        mlx_arr = mx.zeros((need_words,), mx.uint32, stream=mx.cpu)
+                        mx.eval(mlx_arr)
+                        np_view = np.asarray(mlx_arr).view(np.uint8)
+                        adv = cuda_ple.advise_host_staging(np_view, enable=True)
+                        entry = (mlx_arr, np_view, adv)
+                        self._stage_ring[ring][slot_key] = entry
+                    mlx_arr, np_u8, _ = entry
+                    out_view = np_u8[:used_bytes].view(np_dt).reshape((m,) + tail)
+                    targets.append((t_name, out_view))
+                    if np_dt == np.uint32:
+                        raw_part = mlx_arr[:used_bytes // 4].reshape((m,) + tail)
+                    elif (used_bytes % 4) == 0:
+                        raw_part = mlx_arr[:used_bytes // 4].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
+                    else:
+                        raw_part = mlx_arr.view(mx.uint8)[:used_bytes].view(q2_experts._MLX[np_dt]).reshape((m,) + tail)
+                    parts.append(q2_experts._as_mlx(raw_part, st_dtype))
+                copied[p] = parts
+            host = self._host()
+            if targets:
+                if host is None or not host.copy_layer(layer, in_host, targets):
+                    for t_name, out_view in targets:
+                        self.base._read(t_name, in_host, cache=True, out=out_view)
+            return ring, copied
 
     def _has_tensor_table(self):
         return (
@@ -829,14 +1152,15 @@ class Demand:
             for p in PROJECTIONS:
                 w, s, b = reader.experts(layer, p, exp_ids)
                 if on_cuda:
-                    w, s, b = _to_device(w), _to_device(s), _to_device(b)
+                    w, s, b = _with_weight_room(w), _to_device(s), _to_device(b)
                 ref = getattr(switch, p)
                 projs[p] = Projection(w, s, b, ref.group_size, ref.bits, mode=ref.mode)
             mx.eval([
                 a for pr in projs.values()
                 for a in (pr.weight, pr.get('scales'), pr.get('biases')) if a is not None
             ])
-            self.prefill_read_s += time.perf_counter() - t_read
+            with self._seq_lock:
+                self.prefill_read_s += time.perf_counter() - t_read
             return projs
 
         is_all = (m == self.num_experts and np.array_equal(exp_ids, np.arange(self.num_experts, dtype=np.int64)))
@@ -893,8 +1217,9 @@ class Demand:
         if remaining_targets:
             host = self._host()
             if host is None or not host.copy_layer(layer, rows_arg, remaining_targets):
-                for t_name, out_view in remaining_targets:
-                    self.base._read(t_name, rows_arg, cache=False, out=out_view)
+                if not self._native_prefill_targets(remaining_targets, rows_arg):
+                    for t_name, out_view in remaining_targets:
+                        self.base._read(t_name, rows_arg, cache=False, out=out_view)
 
         if on_cuda and self._prefill_dev:
             needed_keys = set(stage_meta.keys())
@@ -917,11 +1242,11 @@ class Demand:
                 stage_u32 = entry[0]
                 if on_cuda:
                     dev_u32 = self._prefill_dev.pop(slot_key, None)
-                    if dev_u32 is None or dev_u32.shape[0] < pages_cap:
+                    if dev_u32 is None or dev_u32.shape[0] < pages_cap + 1:
                         if dev_u32 is not None:
                             dev_u32 = None
                             mx.clear_cache()
-                        dev_u32 = mx.zeros((pages_cap, _PREFILL_WORDS), mx.uint32)
+                        dev_u32 = mx.zeros((pages_cap + 1, _PREFILL_WORDS), mx.uint32)
                         mx.eval(dev_u32)
                     idx = mx.arange(pages_used, dtype=mx.int32)
                     dev_u32[idx] = stage_u32[:pages_used]
@@ -943,11 +1268,13 @@ class Demand:
             a for pr in projs.values()
             for a in (pr.weight, pr.get('scales'), pr.get('biases')) if a is not None
         ])
-        self.prefill_read_s += time.perf_counter() - t_read
+        with self._seq_lock:
+            self.prefill_read_s += time.perf_counter() - t_read
         return projs
 
     def _update_bank_after_prefill(self, switch, seen_experts, source_ids, source_projs):
         """Promote highest-weight experts seen during prefill into `switch`'s resident bank once."""
+        from . import native_reads
         layer = switch.layer
         candidates = np.union1d(switch.experts, seen_experts)
         top = np.sort(candidates[np.argsort(-self.weight[layer][candidates], kind='stable')[:self.slots]])
@@ -957,6 +1284,7 @@ class Demand:
         self._drain_layer_inflight(layer)
         top_set = set(int(t) for t in top)
         gone = [s for s, e in enumerate(switch.experts) if int(e) not in top_set]
+        stm = getattr(self, '_stm', None)
         last_map = {int(e): idx for idx, e in enumerate(source_ids)} if source_ids is not None else {}
         to_read = np.array([int(e) for e in new_exps if int(e) not in last_map], dtype=np.int64)
         if to_read.size == 0 and source_projs is not None:
@@ -968,11 +1296,18 @@ class Demand:
                 ]
                 for p in PROJECTIONS
             }
+            if stm is not None and stm.started:
+                stm.wait_layer_idle(layer)
             written = switch.place_many(gone[:new_exps.size], new_exps, stacked)
             if written:
                 mx.eval(written)
             del stacked, written
             return
+
+        if (to_read.size == new_exps.size and stm is not None
+                and stm.can_serve_reads() and not native_reads.checking()):
+            if stm.land_missing(layer, switch, gone[:new_exps.size], new_exps, in_pass=False):
+                return
 
         t_read = time.perf_counter()
         fetched = None
@@ -1006,7 +1341,8 @@ class Demand:
                 if isinstance(self.checkpoint, requant.Flat) else self.base
             )
             fetched = ({p: reader.experts(layer, p, to_read) for p in PROJECTIONS} if to_read.size else None)
-        self.prefill_read_s += time.perf_counter() - t_read
+        with self._seq_lock:
+            self.prefill_read_s += time.perf_counter() - t_read
         fetch_map = {int(e): idx for idx, e in enumerate(to_read)}
         slot_arrays = {p: [[], [], []] for p in PROJECTIONS}
         for e in new_exps:
@@ -1036,6 +1372,8 @@ class Demand:
             ]
             for p in PROJECTIONS
         }
+        if stm is not None and stm.started:
+            stm.wait_layer_idle(layer)
         written = switch.place_many(gone[:new_exps.size], new_exps, stacked)
         if written:
             mx.eval(written)
@@ -1056,18 +1394,22 @@ class Demand:
     def end_layer_prefill(self, switch, ok=True):
         """Finish a chunked layer prefill pass: update `switch`'s resident bank from the
         layer-wide expert weights and release layer/prompt temporary buffers."""
-        active = self._prefill_active
-        self._prefill_active = None
-        if active is not None:
-            act_layer, projs, temp, seen_set = active
-            if ok and act_layer == switch.layer and seen_set:
-                seen_arr = np.array(sorted(seen_set), dtype=np.int64)
-                self._update_bank_after_prefill(switch, seen_arr, temp.experts, projs)
-            del active, projs, temp, seen_set
-        if switch.layer == self.moe_indices[-1]:
-            self._release_prefill_buffers()
-        else:
-            mx.clear_cache()
+        with self._prefill_lock:
+            with self._layer_locks[switch.layer]:
+                active = self._prefill_active
+                self._prefill_active = None
+                if active is not None:
+                    act_layer, projs, temp, seen_set = active
+                    if ok and act_layer == switch.layer and seen_set:
+                        seen_arr = np.array(sorted(seen_set), dtype=np.int64)
+                        self._update_bank_after_prefill(switch, seen_arr, temp.experts, projs)
+                    del active, projs, temp, seen_set
+                if getattr(self, '_stm', None) is not None:
+                    self._stm.layer_done(switch.layer)
+                if switch.layer == self.moe_indices[-1]:
+                    self._release_prefill_buffers()
+                else:
+                    mx.clear_cache()
 
     def _read_one(self, layer, expert, worker_slot):
         with self._stream_lock:
@@ -1079,36 +1421,85 @@ class Demand:
         return expert, out
 
     def compute(self, switch, x, indices, scores=None):
-        layer = switch.layer
         is_decode = not (x.ndim == 3 and x.shape[1] > DECODE_BLOCK_SIZE and indices.size >= 64)
-        if scores is None:
-            ids = np.array(indices).reshape(-1)
-            w_scores = np.ones_like(ids, dtype=np.float64)
+        if not is_decode or prefill.in_layer():
+            with self._prefill_lock:
+                with self._layer_locks[switch.layer]:
+                    return self._compute_locked(switch, x, indices, scores, is_decode=is_decode)
+        with self._layer_locks[switch.layer]:
+            res = self._compute_locked(switch, x, indices, scores, is_decode=is_decode, allow_prefill=False)
+        if isinstance(res, tuple) and len(res) == 2 and res[0] is _NEED_PREFILL:
+            with self._prefill_lock:
+                with self._layer_locks[switch.layer]:
+                    return self._compute_locked(
+                        switch, x, indices, scores, is_decode=is_decode, precomputed_needed=res[1],
+                    )
+        return res
+
+    def _compute_locked(self, switch, x, indices, scores=None, *, is_decode=True, allow_prefill=True, precomputed_needed=None):
+        from . import native_reads
+        layer = switch.layer
+        stm = getattr(self, '_stm', None)
+        if precomputed_needed is None:
+            if is_decode and stm is not None and (layer == self.moe_indices[0] or stm.pass_num == 0):
+                with self._seq_lock:
+                    self._pass_seq += 1
+                    pseq = self._pass_seq
+                stm.begin_pass(pseq, with_token=True)
+            if is_decode and layer == self.moe_indices[0]:
+                self._step_cpu()
+
+            host = self._host()
+            pre_stepped = False
+            if (is_decode and not prefill.in_layer() and stm is not None
+                    and stm.can_serve_reads() and not native_reads.checking()
+                    and host is None and not self._has_layer_inflight(layer)):
+                status, st_needed = stm.step_decode(
+                    layer, switch, indices, scores, self.weight[layer], DECAY,
+                )
+                if status == 0:
+                    out = expert_qmv.decode(switch, x, switch._local_indices(indices), scores if switch.weighs else None)
+                    if layer == self.moe_indices[-1]:
+                        self._finish_decode_step()
+                        out = stm.after(out)
+                        stm.end_pass()
+                    else:
+                        out = stm.after_layer(out)
+                    return out
+                needed = st_needed
+                pre_stepped = True
+
+            if not pre_stepped:
+                if scores is None:
+                    ids = np.array(indices).reshape(-1)
+                    w_scores = np.ones_like(ids, dtype=np.float64)
+                else:
+                    scores_f32 = scores.astype(mx.float32)
+                    mx.eval(indices, scores_f32)
+                    ids = np.array(indices, copy=False).reshape(-1)
+                    w_scores = np.array(scores_f32, copy=False).reshape(-1).astype(np.float64)
+
+                self.weight[layer] *= DECAY
+                np.add.at(self.weight[layer], ids, w_scores)
+
+                if prefill.in_layer() and self._prefill_active is not None:
+                    if self._prefill_active[0] == layer:
+                        self._mark_prefill()
+                        _, _, temp, seen_set = self._prefill_active
+                        seen_set.update(int(e) for e in np.unique(ids))
+                        y = expert_qmv.stock(temp, x, temp._local_indices(indices), scores if switch.weighs else None)
+                        mx.eval(y)
+                        return y
+                    self._prefill_active = None
+
+                needed = np.unique(ids)
         else:
-            scores_f32 = scores.astype(mx.float32)
-            mx.eval(indices, scores_f32)
-            ids = np.array(indices, copy=False).reshape(-1)
-            w_scores = np.array(scores_f32, copy=False).reshape(-1).astype(np.float64)
-
-        self.weight[layer] *= DECAY
-        np.add.at(self.weight[layer], ids, w_scores)
-
-        if self._prefill_active is not None:
-            if self._prefill_active[0] == layer and prefill.in_layer():
-                self._after_prefill = True
-                self._decode_steps = 0
-                _, _, temp, seen_set = self._prefill_active
-                seen_set.update(int(e) for e in np.unique(ids))
-                y = expert_qmv.stock(temp, x, temp._local_indices(indices), scores if switch.weighs else None)
-                mx.eval(y)
-                return y
-            self._prefill_active = None
-
-        needed = np.unique(ids)
+            needed = precomputed_needed
         if not is_decode or needed.size > self.slots:
+            if not allow_prefill:
+                return (_NEED_PREFILL, needed)
             if not is_decode:
-                self._after_prefill = True
-                self._decode_steps = 0
+                self._mark_prefill()
             if needed.size > self.slots:
                 cap = self._prefill_cap(layer)
                 in_layer_mode = prefill.in_layer() and self.num_experts <= cap
@@ -1128,7 +1519,8 @@ class Demand:
                         all_ids, self.num_experts, switch.activation, None,
                     )
                     self._prefill_active = (layer, projs, temp, set(int(e) for e in needed))
-                    self.prefill_layers += 1
+                    with self._seq_lock:
+                        self.prefill_layers += 1
                     y = expert_qmv.stock(temp, x, temp._local_indices(indices), scores if switch.weighs else None)
                     mx.eval(y)
                     return y
@@ -1184,22 +1576,30 @@ class Demand:
                         else:
                             del batch_projs
                         del temp
-                self.prefill_layers += 1
+                with self._seq_lock:
+                    self.prefill_layers += 1
 
                 self._update_bank_after_prefill(switch, needed, last_batch, last_projs)
                 del last_batch, last_projs
                 if layer == self.moe_indices[-1] and not prefill.in_layer():
                     self._release_prefill_buffers()
+                if is_decode and stm is not None:
+                    if layer == self.moe_indices[-1]:
+                        y = stm.after(y)
+                        stm.end_pass()
+                    else:
+                        y = stm.after_layer(y)
                 return y
 
         active_ids = needed
-        if is_decode and layer == self.moe_indices[0]:
-            self._step_cpu()
+        if is_decode and stm is not None:
+            stm.begin_layer(layer)
 
         present_mask = switch.route[active_ids] >= 0
-        self.hits += int(present_mask.sum())
         missing = active_ids[~present_mask]
-        self.misses += int(missing.size)
+        with self._seq_lock:
+            self.hits += int(present_mask.sum())
+            self.misses += int(missing.size)
 
         if missing.size:
             t0 = time.perf_counter()
@@ -1210,12 +1610,15 @@ class Demand:
                     layer, switch, x, indices, scores, ids, active_ids, present_mask, missing, host, in_host
                 )
                 if out is not None:
-                    self.read_s += time.perf_counter() - t0
+                    with self._seq_lock:
+                        self.read_s += time.perf_counter() - t0
                     if layer == self.moe_indices[-1]:
-                        self._decode_steps += 1
-                        if self._after_prefill or self._decode_steps % 64 == 0:
-                            self._after_prefill = False
-                            self._room_back()
+                        self._finish_decode_step()
+                        if stm is not None:
+                            out = stm.after(out)
+                            stm.end_pass()
+                    elif stm is not None:
+                        out = stm.after_layer(out)
                     return out
                 present_mask = switch.route[active_ids] >= 0
                 missing = active_ids[~present_mask]
@@ -1227,82 +1630,100 @@ class Demand:
                 free_mask[switch.route[active_ids[present_mask]]] = False
             cand = np.flatnonzero(free_mask)
             victims = cand[np.argsort(self.weight[layer][switch.experts[cand]], kind='stable')[:missing.size]]
-
-            self._drain_layer_inflight(layer)
-            written = []
-            ring = None
+            self._load_and_place(layer, switch, victims, in_host, missing[in_host.size:], in_pass=is_decode)
             if in_host.size:
-                ring, copied = self._stage_host_experts(layer, in_host)
-                written = switch.place_many(victims[:in_host.size], in_host, copied)
-            disk_victims = victims[in_host.size:]
-            disk_missing = missing[in_host.size:]
-            if disk_missing.size == 0:
-                if written:
-                    if is_decode:
-                        self._stage_inflight[ring] = (layer, written)
-                    else:
-                        mx.eval(written)
-                    del written
-            else:
-                if written:
-                    mx.eval(written)
-                    written.clear()
-                self._load_disk_missing(layer, switch, disk_victims, disk_missing)
-            if in_host.size:
-                self.host_served += int(in_host.size)
+                with self._seq_lock:
+                    self.host_served += int(in_host.size)
             elapsed = time.perf_counter() - t0
-            if is_decode:
-                self.read_s += elapsed
-            else:
-                self.prefill_read_s += elapsed
+            with self._seq_lock:
+                if is_decode:
+                    self.read_s += elapsed
+                else:
+                    self.prefill_read_s += elapsed
 
         local = switch._local_indices(indices)
         weights = scores if switch.weighs else None
         if is_decode:
             out = expert_qmv.decode(switch, x, local, weights)
             if layer == self.moe_indices[-1]:
-                self._decode_steps += 1
-                if self._after_prefill or self._decode_steps % 64 == 0:
-                    self._after_prefill = False
-                    self._room_back()
+                self._finish_decode_step()
+                if stm is not None:
+                    out = stm.after(out)
+                    stm.end_pass()
+            elif stm is not None:
+                out = stm.after_layer(out)
             return out
         out = expert_qmv.stock(switch, x, local, weights)
         if layer == self.moe_indices[-1]:
             self._room_back()
         return out
 
-    def summary(self):
-        self._flush_cpu_counts()
-        total = self.hits + self.misses
+    def summary(self, flush=None):
+        with self._cpu_status_lock:
+            eval_tid = self._cpu_eval_tid
+        if flush is None:
+            flush = (eval_tid is not None and threading.get_ident() == eval_tid)
+        if flush:
+            self._flush_cpu_counts()
+        with self._cpu_status_lock:
+            cpu = self._cpu
+            cpu_served = self.cpu_served
+            cpu_late = self.cpu_late
+            cpu_wait_ms = round(self.cpu_wait_ms, 2)
+            cpu_why = self._cpu_why
+            server_counts = cpu.server.counts() if (cpu is not None and cpu.server is not None) else None
+        with self._seq_lock:
+            hits = self.hits
+            misses = self.misses
+            prefill_layers = self.prefill_layers
+            prefill_read_s = self.prefill_read_s
+            read_s = self.read_s
+            host_served = self.host_served
+            trimmed = self.trimmed
+            native_reads = self.native_reads
+        total = hits + misses
         out = {
             'slots': self.slots,
             'num_experts': self.num_experts,
-            'hits': self.hits,
-            'misses': self.misses,
-            'hit_rate': round(self.hits / total, 4) if total else 1.0,
-            'prefill_layers': self.prefill_layers,
-            'prefill_read_s': round(self.prefill_read_s, 2),
-            'read_s': round(self.read_s, 2),
-            'host_served': self.host_served,
-            'trimmed': self.trimmed,
+            'hits': hits,
+            'misses': misses,
+            'hit_rate': round(hits / total, 4) if total else 1.0,
+            'prefill_layers': prefill_layers,
+            'prefill_read_s': round(prefill_read_s, 2),
+            'read_s': round(read_s, 2),
+            'host_served': host_served,
+            'trimmed': trimmed,
         }
-        if self._cpu is not None or self.cpu_served or self._cpu_why is not None:
-            out['cpu_served'] = self.cpu_served
-            out['cpu_late'] = self.cpu_late
-            out['cpu_wait_ms'] = round(self.cpu_wait_ms, 2)
-            if self._cpu is not None and self._cpu.server is not None:
-                c = self._cpu.server.counts()
-                out['cpu_requests'] = c['requests']
-                out['cpu_experts'] = c['experts']
-                out['cpu_failed'] = c['failed']
-                out['cpu_ms'] = round(c['compute_ns'] / 1e6, 2)
-            if self._cpu_why is not None:
-                out['cpu_off'] = self._cpu_why
+        if native_reads or self._native is not None:
+            out['native_reads'] = native_reads
+        if cpu is not None or cpu_served or cpu_why is not None:
+            out['cpu_served'] = cpu_served
+            out['cpu_late'] = cpu_late
+            out['cpu_wait_ms'] = cpu_wait_ms
+            if server_counts is not None:
+                out['cpu_requests'] = server_counts['requests']
+                out['cpu_experts'] = server_counts['experts']
+                out['cpu_failed'] = server_counts['failed']
+                out['cpu_ms'] = round(server_counts['compute_ns'] / 1e6, 2)
+            if cpu_why is not None:
+                out['cpu_off'] = cpu_why
+        stm = getattr(self, '_stm', None)
+        if stm is not None:
+            out['stm'] = stm.summary()
+        elif self._stm_why is not None:
+            from . import stm_core
+            m = stm_core.mode()
+            out['stm'] = {'mode': m, 'asked': m, 'started': False, 'serving': False, 'why': self._stm_why}
         return out
 
     def close(self):
         from . import cuda_ple
+        _LIVE.discard(self)
         self._close_cpu()
+        stm = getattr(self, '_stm', None)
+        if stm is not None:
+            stm.close()
+            self._stm = None
         self._prefill_active = None
         for _, np_view, adv in self._prefill_stage.values():
             if adv:
@@ -1354,3 +1775,6 @@ class Demand:
                 except Exception:
                     pass
         self._pool.shutdown(wait=True, cancel_futures=True)
+        if self._native is not None:
+            self._native.close()
+            self._native = None

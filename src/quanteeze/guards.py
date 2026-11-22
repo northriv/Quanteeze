@@ -241,6 +241,37 @@ class Readings:
                 rss = 0
         return max(0, total)
 
+    def others(self, least=1e9):
+        """`[(bytes, pid, name)]` of other processes holding at least `least` bytes, largest first."""
+        out = []
+        me = os.getpid()
+        if self._lib is not None:
+            n = self._lib.proc_listallpids(None, 0)
+            if n <= 0:
+                return []
+            pids = (ctypes.c_int * (n + 64))()
+            n = self._lib.proc_listallpids(pids, ctypes.sizeof(pids))
+            buf, name = ctypes.create_string_buffer(96), ctypes.create_string_buffer(256)
+            for pid in pids[:max(0, n)]:
+                if pid <= 0 or pid == me or self._lib.proc_pid_rusage(pid, 0, buf) != 0:
+                    continue
+                held = struct.unpack_from('<Q', buf.raw, 16 + 7 * 8)[0]
+                if held >= least:
+                    self._lib.proc_name(pid, name, 256)
+                    out.append((held, pid, name.value.decode(errors='replace') or '?'))
+        elif self._proc is not None:
+            for d in self._proc.iterdir():
+                if not d.name.isdigit() or int(d.name) == me:
+                    continue
+                try:
+                    fields = dict(line.split(':', 1) for line in (d / 'status').read_text().splitlines() if ':' in line)
+                except OSError:
+                    continue
+                kb = sum(int(fields[k].split()[0]) for k in ('VmRSS', 'VmSwap') if k in fields)
+                if kb * 1024 >= least:
+                    out.append((kb * 1024, int(d.name), fields.get('Name', '?').strip()))
+        return sorted(out, reverse=True)
+
     def memory_total(self):
         """Bytes of the machine's memory: hw.memsize; on Linux MemTotal, or the memory cgroup's
         limit where that is less."""
@@ -334,6 +365,125 @@ def recommended_budget(info=None, proc=None, cgroup=None):
     return int(total * share) if total else None
 
 
+HOLD_INTAKE = [False]            # critical system memory pressure (Keeper._system): intake takes one row at a time
+
+VMSTAT_KEYS = (
+    'compact_stall', 'compact_fail', 'pswpin', 'pswpout', 'pgmajfault',
+    'workingset_refault_file', 'pgsteal_direct', 'allocstall_normal', 'allocstall_movable',
+)
+
+
+def host_memory_state():
+    """Host memory telemetry dict on Linux (`/proc/meminfo`, `/proc/buddyinfo`, `/proc/vmstat`, PSI), else None."""
+    if not sys.platform.startswith('linux'):
+        return None
+    try:
+        info = {}
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            k, v = line.split(':', 1)
+            info[k] = int(v.split()[0]) * 1024
+        free_pages = large_pages = 0
+        for line in Path('/proc/buddyinfo').read_text().splitlines():
+            counts = [int(x) for x in line.split()[4:]]
+            for order, n in enumerate(counts):
+                free_pages += n << order
+                if order >= 9:
+                    large_pages += n << order
+        vm = {}
+        for line in Path('/proc/vmstat').read_text().splitlines():
+            k, _, v = line.partition(' ')
+            if k in VMSTAT_KEYS:
+                vm[k] = int(v)
+
+        def psi(kind):
+            try:
+                first = Path(f'/proc/pressure/{kind}').read_text().splitlines()[0]
+                return float(dict(f.split('=') for f in first.split()[1:])['avg10'])
+            except (OSError, KeyError, ValueError, IndexError):
+                return None
+
+        return dict(
+            free_gb=info.get('MemFree', 0) / 1e9,
+            available_gb=info.get('MemAvailable', 0) / 1e9,
+            swap_free_gb=info.get('SwapFree', 0) / 1e9,
+            swap_gb=info.get('SwapTotal', 0) / 1e9,
+            shmem_gb=info.get('Shmem', 0) / 1e9,
+            large_free_share=large_pages / free_pages if free_pages else 0.0,
+            memory_psi=psi('memory'),
+            io_psi=psi('io'),
+            **vm,
+        )
+    except (OSError, ValueError):
+        return None
+
+
+STRAIN = dict(memory_psi=10.0, io_psi=20.0, swapout_mb_s=4.0)
+STRAIN_POLLS = 2
+STRAIN_CALM = 3
+
+
+class Strain:
+    """Tracks Linux host memory strain using PSI, swapout rate, and available-memory floor."""
+
+    def __init__(self, marks=None, polls=STRAIN_POLLS, state=host_memory_state, clock=time.monotonic, floor_gb=None,
+                 calm=STRAIN_CALM):
+        self.marks, self.polls, self.state, self.clock = dict(marks or STRAIN), polls, state, clock
+        self.floor_gb, self.calm = floor_gb, calm
+        self.under = 0
+        self.last = None
+        self.over = 0
+        self.strained = False
+        self.times = 0
+        self.seconds = 0.0
+        self.since = None
+        self.worst = {}
+
+    def sample(self):
+        """Sample host memory state and return `(strained, rates_dict)` or None if unavailable."""
+        now, s = self.clock(), self.state()
+        if s is None:
+            return None
+        rates = {
+            'memory_psi': s.get('memory_psi') or 0.0,
+            'io_psi': s.get('io_psi') or 0.0,
+            'available_gb': round(s['available_gb'], 1),
+        }
+        if self.last is not None and now > self.last[0]:
+            dt, was = now - self.last[0], self.last[1]
+            rates['swapout_mb_s'] = round((s.get('pswpout', 0) - was.get('pswpout', 0)) * 4096 / 1e6 / dt, 2)
+            rates['allocstall_s'] = round(
+                (s.get('allocstall_normal', 0) + s.get('allocstall_movable', 0)
+                 - was.get('allocstall_normal', 0) - was.get('allocstall_movable', 0)) / dt,
+                1,
+            )
+        self.last = (now, s)
+        over = (
+            any(rates.get(k, 0.0) >= v for k, v in self.marks.items())
+            or (self.floor_gb is not None and s['available_gb'] < self.floor_gb)
+        )
+        self.over = self.over + 1 if over else 0
+        self.under = 0 if over else self.under + 1
+        became = not self.strained and self.over >= self.polls
+        if became:
+            self.strained, self.times, self.since = True, self.times + 1, now
+        elif self.strained and self.under >= self.calm:
+            self.strained = False
+            self.seconds += now - self.since
+            self.since = None
+        if self.strained:
+            for k in self.marks:
+                self.worst[k] = max(self.worst.get(k, 0.0), rates.get(k, 0.0))
+        rates['became'] = became
+        return self.strained, rates
+
+    def summary(self):
+        held = self.seconds + (self.clock() - self.since if self.since is not None else 0.0)
+        return (
+            f'the host strained {self.times} times, {held:.0f} s in all'
+            + (f' (at worst {", ".join(f"{k} {v:g}" for k, v in self.worst.items())})' if self.times else '')
+        )
+
+
 def _gb(n):
     return '?' if n is None else f'{n / 1e9:.1f}'
 
@@ -343,8 +493,10 @@ class Keeper:
 
     def __init__(self, limit, stop_at=None, swap_growth=8e9, disk_floor=20e9, idle_growth=4e9, step=4e9,
                  poll=2.0, readings=None, idle=lambda: False, shed=None, stop=None, exit=None, stacks=None,
-                 log=None):
+                 log=None, system=True, strain=None, relieve=None):
         self.readings = readings or Readings()
+        self.strain = strain
+        self.relieve = relieve
         self.limit, self.stop_at = limit, max(stop_at, limit) if stop_at is not None else None
         self.swap_growth, self.disk_floor, self.idle_growth, self.step, self.poll = \
             swap_growth, disk_floor, idle_growth, step, poll
@@ -358,13 +510,18 @@ class Keeper:
         self.stopped = None
         self.sheds = 0
         self.peak = 0
+        self.system = system
+        self.pressed = 1
+        self.pressings = 0
+        self._was_strained = False
+        HOLD_INTAKE[0] = False
         self._stop_event = None
         self._thread = None
 
     @classmethod
     def from_env(cls, **kwargs):
-        """A keeper set by QUANTEEZE_KEEP_GB, QUANTEEZE_KEEP_FREE_GB, QUANTEEZE_KEEP_SWAP_GB, and
-        QUANTEEZE_KEEP_DISK_GB."""
+        """A keeper set by QUANTEEZE_KEEP_GB, QUANTEEZE_KEEP_FREE_GB, QUANTEEZE_KEEP_SWAP_GB,
+        QUANTEEZE_KEEP_DISK_GB, QUANTEEZE_KEEP_PRESSURE, QUANTEEZE_KEEP_STRAIN, and QUANTEEZE_KEEP_CUT_GB."""
         value = (variables.get('QUANTEEZE_KEEP_GB') or 'auto').strip().lower()
         if value == 'off':
             return None
@@ -379,6 +536,9 @@ class Keeper:
         if not limit:
             return None
         free = variables.number('QUANTEEZE_KEEP_FREE_GB') * 1e9
+        kwargs.setdefault('system', not variables.off('QUANTEEZE_KEEP_PRESSURE'))
+        if 'strain' not in kwargs and sys.platform.startswith('linux') and not variables.off('QUANTEEZE_KEEP_STRAIN'):
+            kwargs['strain'] = Strain(floor_gb=variables.number('QUANTEEZE_KEEP_CUT_GB'))
         return cls(limit, stop_at=total - free if total else None,
                    swap_growth=variables.number('QUANTEEZE_KEEP_SWAP_GB') * 1e9,
                    disk_floor=variables.number('QUANTEEZE_KEEP_DISK_GB') * 1e9, **kwargs)
@@ -440,6 +600,10 @@ class Keeper:
             if self.stop is not None:
                 self.stop()
             return
+        if self.system:
+            self._system(held)
+        if self.strain is not None:
+            self._strained(held)
         if held > self.limit and not self.over:
             self.over, self.sheds = True, self.sheds + 1
             if self.shed is not None:
@@ -449,6 +613,48 @@ class Keeper:
                      + (f'; {_gb(after)} GB after' if after is not None else ''))
         elif held < 0.95 * self.limit:
             self.over = False
+
+    def _strained(self, held):
+        """Sample host strain, warn on transitions, and invoke `relieve(rates)` when provided."""
+        got = self.strain.sample()
+        if got is None:
+            return
+        strained, rates = got
+        if rates.pop('became', False):
+            self.log(
+                f'quanteeze: memory: WARNING host memory strain (QUANTEEZE_KEEP_STRAIN): '
+                f'{", ".join(f"{k} {v:g}" for k, v in rates.items())}; {self._holds(held)}'
+            )
+        if self.relieve is not None:
+            self.relieve(dict(rates, strained=strained))
+        if not strained and self._was_strained:
+            self.log(
+                f'quanteeze: memory: host memory strain eased: '
+                f'{", ".join(f"{k} {v:g}" for k, v in rates.items())}'
+            )
+        self._was_strained = strained
+
+    def _system(self, held):
+        """Act on system memory pressure regardless of process footprint."""
+        level = self.readings.pressure()
+        if level is None:
+            return
+        if level >= 2 and level > self.pressed:
+            self.pressings += 1
+            if self.shed is not None:
+                self.shed()
+            others = ', '.join(f'{name} [{pid}] {_gb(b)} GB' for b, pid, name in self.readings.others(2e9)[:5])
+            self.log(
+                f'quanteeze: memory: WARNING machine memory pressure is '
+                f'{"critical" if level >= 4 else "warning"}: {self._holds(held)}; '
+                f'MLX freed buffers released'
+                + ('; intake held to one prompt at a time' if level >= 4 else '')
+                + (f'; largest other processes: {others}' if others else '')
+            )
+        elif level == 1 and self.pressed > 1:
+            self.log(f'quanteeze: memory: machine memory pressure returned to normal: {self._holds(held)}')
+        HOLD_INTAKE[0] = level >= 4
+        self.pressed = level
 
     def start(self):
         import threading
@@ -473,6 +679,7 @@ class Keeper:
         return self
 
     def close(self):
+        HOLD_INTAKE[0] = False
         if self._stop_event is not None:
             self._stop_event.set()
         if self._thread is not None and self._thread.is_alive() and self._thread is not __import__('threading').current_thread():
@@ -486,7 +693,11 @@ class Keeper:
                 'stopped': self.stopped is not None}
 
     def summary(self):
-        return f'at most {_gb(self.peak)} GB held, over the limit {self.sheds} times'
+        return (
+            f'at most {_gb(self.peak)} GB held, over the limit {self.sheds} times'
+            + (f', machine memory pressure raised {self.pressings} times' if self.pressings else '')
+            + (f', {self.strain.summary()}' if self.strain is not None else '')
+        )
 
 
 DUTIES = {2: 0.85, 3: 0.5, 4: 0.25}     # thermal level -> the GPU's share of the time

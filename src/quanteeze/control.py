@@ -88,11 +88,13 @@ CHOICES = {
     'QUANTEEZE_BITS': ('1', '2', '3', '4', '8', 'mxfp4', 'q3_k', 'q2_k', 'iq2_xs', 'off'),
     'QUANTEEZE_LOAD_WHOLE': ('on', 'off'),
     'QUANTEEZE_APC_ENCRYPT': ('on', 'off'),
+    'QUANTEEZE_CONTEXT_COMPRESS': ('off', 'recent', 'similar', 'h2o', 'snapkv'),
+    'QUANTEEZE_CONTEXT_LAYERS': ('uniform', 'pyramid'),
     'QUANTEEZE_COMPACT': ('on', 'off'),
-    'QUANTEEZE_VISION_SSD': ('on', 'off'),
+    'QUANTEEZE_VISION_SSD': ('auto', 'on', 'off'),
     'QUANTEEZE_EMBED_SSD': ('on', 'off'),
     'QUANTEEZE_V41_READS_IMAGES': ('on', 'ssd', 'off'),
-    'QUANTEEZE_MTP': ('auto', 'on', 'off'),
+    'QUANTEEZE_MTP': ('auto', 'dflash2', 'on', 'off'),
     'QUANTEEZE_MTP_EXACT': ('distribution', 'bits'),
     'QUANTEEZE_NGRAM_SSD': ('auto', 'on', 'off'),
     'QUANTEEZE_NGRAM_ADVISE': ('on', 'off'),
@@ -110,14 +112,29 @@ CHOICES = {
     'QUANTEEZE_SIGMOID_ROUTER_KERNELS': ('on', 'off'),
     'QUANTEEZE_INDEXER_KERNEL': ('on', 'off'),
     'QUANTEEZE_CUDA_QMV': ('on', 'off'),
+    'QUANTEEZE_CUDA_QMV_ROWS': ('on', 'off'),
+    'QUANTEEZE_CUDA_ATTN_ROWS': ('on', 'off'),
     'QUANTEEZE_CUDA_DELTA': ('on', 'off'),
     'QUANTEEZE_CUDA_EXPERTS': ('on', 'off'),
     'QUANTEEZE_CUDA_ROUTER': ('on', 'off'),
     'QUANTEEZE_NUMPY_HUGE_PAGES': ('on', 'off'),
     'QUANTEEZE_CPU_EXPERTS': ('auto', 'on', 'off'),
+    'QUANTEEZE_DEMAND_READ_NATIVE': ('auto', 'on', 'off'),
     'QUANTEEZE_CPU_PRIORITY': ('auto', 'idle', 'nice', 'normal', 'wake'),
     'QUANTEEZE_HOST_EXPERTS_BY': ('auto', 'rows', 'layers'),
     'QUANTEEZE_PARALLEL': ('auto', 'layers', 'off'),
+    'QUANTEEZE_PARALLEL_CROSSING': ('refuse', 'raise'),
+    'QUANTEEZE_KEEP_PRESSURE': ('on', 'off'),
+    'QUANTEEZE_KEEP_STRAIN': ('on', 'off'),
+    'QUANTEEZE_REQUEST_LEASES': ('on', 'off'),
+    'QUANTEEZE_NATIVE': ('on', 'off'),
+    'QUANTEEZE_NGRAM_TOUCH_NATIVE': ('on', 'off'),
+    'QUANTEEZE_ENGRAM_HASHES_ON_HOST': ('on', 'off'),
+    'QUANTEEZE_V41_ATTENTION_NATIVE': ('auto', 'on', 'off', 'compare'),
+    'QUANTEEZE_DSPARK_NATIVE': ('auto', 'on', 'off'),
+    'QUANTEEZE_DEMAND_STM': ('auto', 'on', 'shadow', 'off'),
+    'QUANTEEZE_REQUEST_THREADS_ANY': ('on', 'off'),
+    'QUANTEEZE_REQUEST_THREADS_DRAFT_TOGETHER': ('on', 'off'),
 }
 
 _SOURCE = {}
@@ -275,6 +292,8 @@ def check(name, value):
         value.isdigit() and int(value) > 0
     ):
         return 'a positive whole number or auto'
+    if value and name == 'QUANTEEZE_REQUEST_THREADS' and not (value.isdigit() and int(value) > 0):
+        return 'a positive whole number'
     if value and name == 'QUANTEEZE_PROMPT_MOE_TOKENS' and value.lower() not in WORDS and not (
         value.isdigit() and int(value) > 0
     ):
@@ -372,11 +391,13 @@ def _checked(target):
             raise ValueError(str(e)) from None
 
 
-def switch_model(path, wait=0.2):
+def switch_model(path, wait=0.2, undo=None):
     """Serve the model at `path` from now on, in a thread: the requests that generate are held off
     (503, with the progress), the ones running finished, the model served let go and this one
     loaded (serve's loader: quanteeze's hooks, the settings read at a load); then every request
-    is served by it, whatever model it names.  Returns model_state()."""
+    is served by it, whatever model it names.  `undo`: `{name: value}` the caller changed for this
+    load, restored (and saved) if the async load fails while those keys are still unchanged.
+    Returns model_state()."""
     import threading
     target = Path(str(path)).expanduser()
     if not (target / 'config.json').is_file():
@@ -388,6 +409,7 @@ def switch_model(path, wait=0.2):
     target = str(target.resolve())
     _checked(target)
     _SWITCH.update(busy=True, state='waiting', error=None, target=target)
+    ours = {name: os.environ.get(name, '') for name in (undo or {})}
 
     def run():
         from . import progress
@@ -399,6 +421,11 @@ def switch_model(path, wait=0.2):
             _SWITCH.update(served=target, state='idle')
         except BaseException as e:
             _SWITCH.update(served=None, state='failed', error=f'{type(e).__name__}: {e}')
+            back = {n: v for n, v in (undo or {}).items() if os.environ.get(n, '') == ours[n]}
+            if back:
+                change(back)
+                print(f'quanteeze: the load of {target} failed: {", ".join(sorted(back))} set back to what it was',
+                      file=sys.stderr, flush=True)
             if progress.state()['loading']:
                 progress.end(_SWITCH['error'])
         finally:

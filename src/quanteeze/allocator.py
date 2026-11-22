@@ -87,14 +87,48 @@ def _api():
     cache_cap.restype = ctypes.c_size_t
     trim_fn.argtypes = []
     trim_fn.restype = None
+    aligned_alloc_fn = getattr(proc, 'kame_pool_aligned_alloc', None)
+    pool_free_fn = getattr(proc, 'kame_pool_free', None)
+    if aligned_alloc_fn is not None and pool_free_fn is not None:
+        aligned_alloc_fn.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+        aligned_alloc_fn.restype = ctypes.c_void_p
+        pool_free_fn.argtypes = [ctypes.c_void_p]
+        pool_free_fn.restype = None
+    else:
+        aligned_alloc_fn = pool_free_fn = None
     fns = {
         'reserved_bytes': reserved,
         'usable_size': usable,
         'large_cache_cap': cache_cap,
         'trim': trim_fn,
+        'aligned_alloc': aligned_alloc_fn,
+        'free': pool_free_fn,
     }
     _API_CACHE.update(pid=pid, fns=fns)
     return fns
+
+
+def host_alloc_addrs():
+    """Return `(alloc_addr, free_addr)` C function pointers for host block allocations.
+
+    Uses `kame_pool_aligned_alloc` / `kame_pool_free` when `kamepoolalloc` is active and exports
+    both, else `libc`'s `aligned_alloc` / `free`.
+    """
+    fns = _api()
+    if fns is not None and fns['aligned_alloc'] is not None and fns['free'] is not None:
+        return (
+            int(ctypes.cast(fns['aligned_alloc'], ctypes.c_void_p).value),
+            int(ctypes.cast(fns['free'], ctypes.c_void_p).value),
+        )
+    libc = ctypes.CDLL(None)
+    libc.aligned_alloc.restype = ctypes.c_void_p
+    libc.aligned_alloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+    libc.free.restype = None
+    libc.free.argtypes = [ctypes.c_void_p]
+    return (
+        int(ctypes.cast(libc.aligned_alloc, ctypes.c_void_p).value),
+        int(ctypes.cast(libc.free, ctypes.c_void_p).value),
+    )
 
 
 def active():

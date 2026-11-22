@@ -120,6 +120,7 @@ textarea { width: 100%; font: inherit; color: var(--ink); background: var(--page
 .live .k { font-size: 12px; color: var(--muted); }
 .live .v { font-weight: 600; font-variant-numeric: tabular-nums; }
 .live .note { font-size: 12px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.warnbox { border-radius: 8px; padding: 8px 12px; margin-top: 10px; font-size: 13px; background: var(--warn-bg); color: var(--warn); }
 #phases { font-variant-numeric: tabular-nums; }
 .mono { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
 </style>
@@ -155,6 +156,7 @@ textarea { width: 100%; font: inherit; color: var(--ink); background: var(--page
       <div class="meter" id="now-meter" hidden><div id="now-bar"></div></div>
       <div id="now-msg" class="note"></div>
       <div id="live" class="livegrid"></div>
+      <div id="stm-warn"></div>
       <div id="phases" class="list" style="margin-top:8px"></div>
     </section>
 
@@ -371,8 +373,11 @@ function renderNow() {
   if (s.model_type) parts.push(s.model_type);
   if (s.bits) parts.push(`${fmtBits(s.bits)} experts` + (s.stock_bits && s.bits !== s.stock_bits ? ` (lowered from ${s.stock_bits}-bit${typeof s.bits === 'number' || !isNaN(s.bits) ? ' by least squares' : ''})` : ''));
   else if (MODEL.bits) parts.push(`${fmtBits(MODEL.bits)} uniform requested`);
-  if (s.mode === 'on_demand') parts.push(`streaming on demand from SSD (${s.experts_gb ?? '?'} of ${s.total_experts_gb ?? '?'} GB kept in memory)`);
-  else if (s.mode === 'in_memory') parts.push('all weights in memory');
+  const dStm = LIVE && LIVE.demand && LIVE.demand.stm;
+  if (s.mode === 'on_demand') {
+    parts.push(`streaming on demand from SSD (${s.experts_gb ?? '?'} of ${s.total_experts_gb ?? '?'} GB kept in memory)`);
+    if (dStm && dStm.serving === true) parts.push('C++ STM');
+  } else if (s.mode === 'in_memory') parts.push('all weights in memory');
   $('now-how').textContent = parts.join(' · ');
 
   const p = MODEL.progress, busy = MODEL.state === 'waiting' || MODEL.state === 'loading';
@@ -394,6 +399,7 @@ function renderNow() {
   }
 
   const grid = $('live'); grid.replaceChildren();
+  const warnBox = $('stm-warn');
   if (LIVE) {
     const mem = LIVE.memory || {};
     if (mem.active_gb != null) {
@@ -413,18 +419,28 @@ function renderNow() {
 
     if (LIVE.demand) {
       const d = LIVE.demand;
+      const dstm = d.stm;
       const total = (d.hits || 0) + (d.misses || 0);
       const hitVal = d.hit_rate != null ? `${pct(d.hit_rate)} in memory`
         : total ? `${pct((d.hits || 0) / total)} in memory` : 'ready';
+      const dTitle = !dstm ? 'On-demand SSD'
+        : dstm.serving === true ? 'On-demand SSD (C++)'
+        : dstm.mode === 'shadow' ? 'On-demand SSD (STM shadow)'
+        : dstm.serving === false ? 'On-demand SSD (Python)'
+        : 'On-demand SSD';
       const dNote = [`${d.slots || '?'}${d.num_experts ? `/${d.num_experts}` : ''} slots/layer`,
+        dstm && dstm.serving === true ? `${(dstm.landed || 0).toLocaleString()} landed` : null,
         `${(d.misses || 0).toLocaleString()} misses`,
         d.read_s != null ? `${fmt(d.read_s, 1)} s read` : null].filter(Boolean).join(' · ');
-      grid.append(tile('On-demand SSD', hitVal, dNote));
+      grid.append(tile(dTitle, hitVal, dNote));
     }
+    warnBox.replaceChildren(...(dStm && (dStm.asked || dStm.mode) === 'on' && dStm.serving === false && dStm.why
+      ? [el('div', {class: 'warnbox'}, `C++ STM on-demand engine is not active (QUANTEEZE_DEMAND_STM=on): ${dStm.why}. Python on-demand streaming is serving instead.`)]
+      : []));
     if (LIVE.mtp) {
       const m = LIVE.mtp;
       if (typeof m === 'object') {
-        grid.append(tile('MTP', m.acceptance == null ? 'no rounds yet' : `${pct(m.acceptance)} accepted`,
+        grid.append(tile(m.label || 'MTP', m.acceptance == null ? 'no rounds yet' : `${pct(m.acceptance)} accepted`,
           `${m.tokens_a_round != null ? fmt(m.tokens_a_round, 2) : '–'} tokens a round · ${(m.rounds || 0).toLocaleString()} rounds`));
       } else {
         grid.append(tile('MTP', String(m), null));
@@ -444,6 +460,8 @@ function renderNow() {
       }
     }
     renderPhases(LIVE.requests);
+  } else {
+    warnBox.replaceChildren();
   }
 }
 
@@ -560,6 +578,7 @@ $('start-btn').addEventListener('click', async () => {
 // ---------------------------------------------------------------- presets
 const GROUP_TITLES = {
   memory: 'Memory reserve',
+  wired: 'Wired memory',
   ngram: 'PLE n-gram table',
   mtp: 'MTP speculative decoding',
   heat: 'Thermal throttle',
@@ -762,6 +781,7 @@ function renderConnect(c) {
     ['OpenAI base URL', c.openai],
     ['Anthropic base URL', c.anthropic],
     ['Claude Code', c.claude_code],
+    ...(c.codex ? [['Codex CLI', c.codex]] : []),
     ['curl', c.curl],
   ];
   for (const [label, val] of rows) {
@@ -884,6 +904,9 @@ init();
     'no throttle': '減速なし',
     'nominal': '平常', 'fair': 'やや高い', 'serious': '高い', 'critical': '危険', 'sleeping': 'スリープ',
     'On-demand SSD': 'オンデマンド SSD',
+    'On-demand SSD (C++)': 'オンデマンド SSD (C++)',
+    'On-demand SSD (Python)': 'オンデマンド SSD (Python)',
+    'On-demand SSD (STM shadow)': 'オンデマンド SSD (STM shadow)',
     'MTP': 'MTP 投機デコード',
     'no rounds yet': 'まだラウンドなし',
     'Requests': 'リクエスト数',
@@ -918,11 +941,18 @@ init();
     'Memory, PLE, MTP & heat': 'メモリ・PLE・MTP・発熱',
     'Saved at once; settings marked as load-time take effect the next time a model loads.': 'すぐに保存されます（読み込み時設定は次回モデル読み込みから有効）。',
     'Memory reserve': 'メモリ確保枠',
+    'Wired memory': 'メモリの固定',
     'PLE n-gram table': 'PLE n-gram 表',
     'MTP speculative decoding': 'MTP 投機デコード',
     'Thermal throttle': '発熱による減速',
     'Roomy': 'ゆったり', 'Standard': '標準', 'Most experts': 'エキスパート最大',
     'Quiet': '静か', 'Full speed': '全速', 'Auto': '自動', 'SSD': 'SSD', 'Off': 'オフ', 'On': 'オン', 'On (exact)': 'オン（完全一致）',
+    "the default: MLX's memory wired only while it generates, as mlx-vlm wires it":
+      '既定：MLX のメモリを固定するのは、生成している間だけです（mlx-vlm がもともと固定します）',
+    'wired from the load on, up to the working set Metal recommends (what mlx-vlm wires while it generates): less of the model compressed before the first request. macOS still lets it go within 30 s of the GPU falling idle, so the idle model is not kept from the compressor; while it loads, other apps have less room':
+      '読み込みの始めから、Metal が勧める作業領域まで固定します（mlx-vlm が生成の間に固定する量と同じ）。最初の要求までに圧縮されるモデルが減ります。GPU が止まると macOS は 30 秒のうちに固定を外すので、何もしていない間の圧縮は防げません。読み込みの間は、ほかのアプリの余裕が減ります',
+    "Only Metal wires memory (the Mac's memory, shared with the GPU): a GPU's own memory is not compressed or paged by the system, and here neither choice does anything.":
+      'メモリを固定できるのは Metal（GPU と共有する Mac のメモリ）だけです。GPU が自分のメモリを持つ機械では、そのメモリを OS が圧縮したり追い出したりしないので、ここではどちらを選んでも何もしません。',
     'Custom value set in settings': '詳細設定ページで個別に指定中',
     'Connect an app': 'アプリをつなぐ',
     'Listening on localhost only (start with --host 0.0.0.0 to reach from other devices on your LAN).': 'localhost のみで待ち受け中（LAN 内の他端末から接続するには --host 0.0.0.0 を付けて起動）。',
@@ -965,6 +995,8 @@ init();
       'モデル本体と確保枠を除き、エキスパートに使えるメモリ余裕：$1 GB。'],
     [/^Not answered: (.+)$/, '応答エラー：$1'],
     [/^Could not start: (.+)$/, '起動できませんでした：$1'],
+    [/^C\+\+ STM on-demand engine is not active \(QUANTEEZE_DEMAND_STM=on\): (.+)\. Python on-demand streaming is serving instead\.$/,
+      'C++ STM オンデマンドエンジンは有効になっていません（QUANTEEZE_DEMAND_STM=on）：$1。Python 版のオンデマンド配信で動作しています。'],
   ];
 
   const FRAGMENTS = [
@@ -974,6 +1006,10 @@ init();
     [/(\d+)-bit experts/, '$1ビット・エキスパート'],
     [/(MXFP4|Q3_K|Q2_K|IQ2_XS) experts/, '$1 エキスパート'],
     [/streaming on demand from SSD \((.+?) of (.+?) GB kept in memory\)/, 'SSD オンデマンド配信（$2 GB 中 $1 GB をメモリ保持）'],
+    [' slots/layer', ' スロット/層'],
+    [/([0-9,]+) landed/, 'C++配置 $1'],
+    [/([0-9,]+) misses/, 'ミス $1'],
+    [/([0-9.]+) s read/, '読込 $1 秒'],
     ['opening the checkpoint', 'チェックポイントを開いています'],
     ['reading the weights', '重みを読み込んでいます'],
     ['quantizing the experts', 'エキスパートを量子化しています'],

@@ -6,11 +6,11 @@ the prompt's `token_ids` and whose data sections hold unencrypted KV / recurrent
 tensors.  `install()` wraps `mlx_vlm.apc` so that when `QUANTEEZE_APC_ENCRYPT` is `on`:
 
 1. Every disk shard (`shard_<32-hex>.safetensors`) and exact checkpoint
-   (`exact_<32-hex>.safetensors`) is serialized in memory (`io.BytesIO`, never writing
-   plaintext bytes to temporary files) and sealed with `AES-256-GCM` under a 256-bit
-   convergent key derived from the prompt's own token chain, `extra_hash`, and the active
-   quantization / precision configuration (`QUANTEEZE_BITS`, and
-   `serve._precision()`).
+   (`exact_<32-hex>.safetensors`) is streamed in `PIECE`-sized chunks directly through a
+   streaming `AES-256-GCM` cipher (never materializing full checkpoints in memory or hitting
+   one-shot 2 GiB AEAD limits) under a 256-bit convergent key derived from the prompt's own
+   token chain, `extra_hash`, and the active quantization / precision configuration
+   (`QUANTEEZE_BITS`, and `serve._precision()`).
 2. Block shards and trimmable dense checkpoints seal each `block_size` slice under its
    own chained prefix key `K_i`, so a request sharing only an earlier prefix derives keys
    for and decrypts only that shared prefix without being able to decrypt later blocks.
@@ -29,6 +29,8 @@ import io
 import json
 import logging
 import os
+import struct
+import sys
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -37,6 +39,7 @@ from typing import Any, Iterable, Optional, Sequence, Tuple
 import mlx.core as mx
 import numpy as np
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mlx_vlm import apc as _apc
 
@@ -47,10 +50,25 @@ logger = logging.getLogger(__name__)
 MAGIC = b'QZAPC01\x00'
 NONCE_BYTES = 12
 TAG_BYTES = 16
+PIECE = 64 << 20
 MAX_ENVELOPE_BYTES = 4 * 1024 * 1024
 CHAIN_KEY_CAP = 65536
 UNLOCK_CAP = 512
 SENTINEL_TENSOR = '__qz_empty_sentinel__'
+_DTYPES = {
+    mx.bfloat16: 'BF16',
+    mx.float16: 'F16',
+    mx.float32: 'F32',
+    mx.int64: 'I64',
+    mx.int32: 'I32',
+    mx.int16: 'I16',
+    mx.int8: 'I8',
+    mx.uint64: 'U64',
+    mx.uint32: 'U32',
+    mx.uint16: 'U16',
+    mx.uint8: 'U8',
+    mx.bool_: 'BOOL',
+}
 
 ON = [True]
 PRECISION = [None]
@@ -70,6 +88,86 @@ _UNLOCK: OrderedDict[Tuple[int, int], tuple] = OrderedDict()
 
 _MEM_SAFES = threading.local()
 
+_GATHERS: dict[int, tuple] = {}
+_GATHERS_LOCK = threading.Lock()
+_MINE = threading.local()
+
+WROTE = {'bytes': 0, 'refused': 0, 'said': False}
+_WROTE_LOCK = threading.Lock()
+
+
+def write_cap() -> Optional[float]:
+    """Return `QUANTEEZE_APC_DISK_WRITE_GB` in bytes, or None when unbounded."""
+    raw = variables.get('QUANTEEZE_APC_DISK_WRITE_GB')
+    return None if raw in (None, '', 'off') else float(raw) * 1e9
+
+
+def over_cap() -> bool:
+    """Return True once bytes written by this process reach `write_cap()`."""
+    cap = write_cap()
+    with _WROTE_LOCK:
+        if cap is None or WROTE['bytes'] < cap:
+            return False
+        WROTE['refused'] += 1
+        said, WROTE['said'] = WROTE['said'], True
+    if not said:
+        logger.warning(
+            'APC disk: %.1f GB written, QUANTEEZE_APC_DISK_WRITE_GB=%g: no new checkpoints/shards written',
+            WROTE['bytes'] / 1e9,
+            cap / 1e9,
+        )
+        print(
+            f'quanteeze: APC disk wrote {WROTE["bytes"] / 1e9:.1f} GB '
+            f'(QUANTEEZE_APC_DISK_WRITE_GB={cap / 1e9:g}): skipping further writes',
+            file=sys.stderr,
+            flush=True,
+        )
+    return True
+
+
+def _record_wrote(path: Path) -> int:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    if size:
+        with _WROTE_LOCK:
+            WROTE['bytes'] += size
+    return size
+
+
+def gathered(array, source, indices, axis: int) -> None:
+    """Register lazy `mx.take(source, indices, axis)` view `array` for streaming serialization."""
+    with _GATHERS_LOCK:
+        _GATHERS[id(array)] = (array, source, np.asarray(indices, np.int32), int(axis))
+    mine = getattr(_MINE, 'ids', None)
+    if mine is None:
+        mine = _MINE.ids = set()
+    mine.add(id(array))
+
+
+def gather_of(array):
+    """Return `(source, indices, axis)` if `array` is a registered lazy gather view, else None."""
+    with _GATHERS_LOCK:
+        got = _GATHERS.get(id(array))
+    return got[1:] if got is not None and got[0] is array else None
+
+
+def forget(arrays=None, everyone: bool = False) -> None:
+    """Drop lazy gather registrations for `arrays`, current thread (`arrays is None`), or all threads."""
+    with _GATHERS_LOCK:
+        if everyone:
+            _GATHERS.clear()
+            _MINE.ids = set()
+        elif arrays is None:
+            for k in getattr(_MINE, 'ids', ()):
+                _GATHERS.pop(k, None)
+            _MINE.ids = set()
+        else:
+            for a in arrays:
+                if a is not None and _GATHERS.get(id(a), (None,))[0] is a:
+                    del _GATHERS[id(a)]
+
 
 def use_precision(precision) -> None:
     """Register `precision()`, text describing the active model precision, mixed into every key."""
@@ -85,10 +183,14 @@ def clear_runtime_keys() -> None:
 
 
 def summary() -> str:
+    extra = (
+        f", {WROTE['bytes'] / 1e9:.1f} GB written ({WROTE['refused']} refused)"
+        if WROTE['refused'] else ''
+    )
     return (
         f"{STATS['writes']} sealed writes, {STATS['hits']} decrypted hits, "
         f"{STATS['rejected']} rejected, {STATS['pruned']} pruned, "
-        f"{STATS['purged_plaintext']} unsealed purged"
+        f"{STATS['purged_plaintext']} unsealed purged{extra}"
     )
 
 
@@ -275,6 +377,149 @@ def _load_arrays_from_safetensors_bytes(raw: bytes) -> Optional[Tuple[dict[str, 
     return out, metadata
 
 
+def _bytes(a: mx.array) -> memoryview:
+    """Return `a`'s C-order bytes as a flat `uint8` `memoryview`."""
+    if a.dtype in (mx.bfloat16, mx.float16):
+        a = a.view(mx.uint16)
+    return memoryview(np.ascontiguousarray(np.array(a)).reshape(-1).view(np.uint8))
+
+
+def _pieces(a: mx.array, limit: int = PIECE):
+    """Yield `a`'s C-order bytes in slices of at most `limit` bytes without materializing large copies."""
+    gather = gather_of(a)
+    if gather is not None:
+        source, indices, axis = gather
+        per = int(np.prod(source.shape[axis + 1 :], dtype=np.int64)) * source.itemsize
+        step = max(1, limit // max(per, 1))
+        for lead in np.ndindex(*source.shape[:axis]):
+            part = source[lead] if lead else source
+            for i in range(0, indices.size, step):
+                yield _bytes(mx.take(part, mx.array(indices[i : i + step]), axis=0))
+        return
+    if a.ndim == 0 or a.size == 0 or a.nbytes <= limit:
+        yield _bytes(a)
+        return
+    row = a.nbytes // a.shape[0]
+    if row > limit and a.ndim > 1:
+        for i in range(a.shape[0]):
+            yield from _pieces(a[i], limit)
+        return
+    step = max(1, limit // max(row, 1))
+    for i in range(0, a.shape[0], step):
+        yield _bytes(a[i : i + step])
+
+
+def _prepare_safetensors_record(
+    arrays: dict[str, mx.array],
+    metadata: dict[str, str],
+) -> Tuple[list[str], dict[str, mx.array], dict, bytes, int]:
+    """Prepare safetensors header preamble and tensor byte layout without building a monolithic buffer."""
+    work_arrays = dict(arrays)
+    work_meta = {str(k): str(v) for k, v in metadata.items()}
+    empty_specs = _apc._extract_empty_tensor_specs(work_arrays)
+    if empty_specs:
+        work_meta[_apc._EMPTY_TENSORS_METADATA] = json.dumps(
+            empty_specs, separators=(',', ':'), sort_keys=True
+        )
+    if not work_arrays:
+        work_arrays[SENTINEL_TENSOR] = mx.zeros((1,), dtype=mx.uint8)
+
+    names = list(work_arrays)
+    header: dict[str, Any] = {}
+    offset = 0
+    for name in names:
+        arr = work_arrays[name]
+        nbytes = int(arr.nbytes)
+        header[name] = {
+            'dtype': _DTYPES[arr.dtype],
+            'shape': [int(d) for d in arr.shape],
+            'data_offsets': [offset, offset + nbytes],
+        }
+        offset += nbytes
+    header['__metadata__'] = work_meta
+    text = json.dumps(header, separators=(',', ':')).encode('utf-8')
+    text += b' ' * (-len(text) % 8)
+    preamble = struct.pack('<Q', len(text)) + text
+    return names, work_arrays, header, preamble, len(preamble) + offset
+
+
+def _write_atomic(path: Path, write_fn) -> None:
+    """Create parent dirs (`0o700`), stream to a `0o600` temp file, and atomically replace `path`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+
+    tag = f'{os.getpid()}-{threading.get_ident()}'
+    tmp = path.parent / f'{path.stem}.{tag}{_apc.DiskBlockStore.SUFFIX}'
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            f = os.fdopen(fd, 'wb')
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            write_fn(f)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _write_sealed_records(
+    path: Path,
+    envelope: dict,
+    record_specs: Sequence[Tuple[dict[str, mx.array], dict[str, str], bytes]],
+    *,
+    limit: int = PIECE,
+) -> dict:
+    """Stream safetensors records through AES-256-GCM in `limit`-byte chunks and atomically seal `path`."""
+    prepared = []
+    records = []
+    cursor = 0
+    for arrays, metadata, key in record_specs:
+        names, work_arrays, header, preamble, plain_len = _prepare_safetensors_record(arrays, metadata)
+        rec_len = NONCE_BYTES + plain_len + TAG_BYTES
+        records.append([cursor, rec_len])
+        cursor += rec_len
+        prepared.append((names, work_arrays, header, preamble, key))
+
+    env = dict(envelope)
+    env['records'] = records
+    header_bytes = json.dumps(env, separators=(',', ':'), sort_keys=True).encode('utf-8')
+    prefix_bytes = MAGIC + len(header_bytes).to_bytes(4, 'little') + header_bytes
+
+    def _stream(f) -> None:
+        f.write(prefix_bytes)
+        for idx, (names, work_arrays, header, preamble, key) in enumerate(prepared):
+            nonce = os.urandom(NONCE_BYTES)
+            enc = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
+            enc.authenticate_additional_data(prefix_bytes + f':rec:{idx}'.encode('ascii'))
+            f.write(nonce)
+            f.write(enc.update(preamble))
+            for name in names:
+                expected = header[name]['data_offsets'][1] - header[name]['data_offsets'][0]
+                written = 0
+                for piece in _pieces(work_arrays[name], limit):
+                    f.write(enc.update(piece))
+                    written += piece.nbytes
+                if written != expected:
+                    raise ValueError(f'{name}: {written} bytes written for {header[name]["shape"]}')
+            f.write(enc.finalize())
+            f.write(enc.tag)
+
+    _write_atomic(path, _stream)
+    return env
+
+
 def _write_sealed_file(
     path: Path,
     envelope: dict,
@@ -298,35 +543,12 @@ def _write_sealed_file(
         ct = AESGCM(key).encrypt(nonce, plaintext, aad)
         blobs.append(nonce + ct)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
+    def _write(f) -> None:
+        f.write(prefix_bytes)
+        for blob in blobs:
+            f.write(blob)
 
-    tag = f'{os.getpid()}-{threading.get_ident()}'
-    tmp = path.parent / f'{path.stem}.{tag}{_apc.DiskBlockStore.SUFFIX}'
-    try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            f = os.fdopen(fd, 'wb')
-        except BaseException:
-            os.close(fd)
-            raise
-        with f:
-            f.write(prefix_bytes)
-            for blob in blobs:
-                f.write(blob)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, path)
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+    _write_atomic(path, _write)
     return env
 
 
@@ -381,6 +603,161 @@ def _decrypt_record(
     except (InvalidTag, ValueError):
         STATS['rejected'] += 1
         return None
+
+
+def _decrypt_record_tensors(
+    f,
+    prefix_bytes: bytes,
+    data_start: int,
+    records: list,
+    idx: int,
+    key: bytes,
+    *,
+    limit: int = PIECE,
+) -> Optional[Tuple[dict, dict, int, dict[Tuple[int, int], mx.array]]]:
+    """Stream-decrypt one record in `limit`-byte chunks and materialize each tensor before verifying the GCM tag."""
+    if not 0 <= idx < len(records):
+        return None
+    try:
+        rel_off, rec_len = int(records[idx][0]), int(records[idx][1])
+    except (IndexError, TypeError, ValueError):
+        return None
+    if rel_off < 0 or rec_len < NONCE_BYTES + TAG_BYTES:
+        return None
+    ct_len = rec_len - NONCE_BYTES - TAG_BYTES
+    try:
+        f.seek(data_start + rel_off)
+        nonce = f.read(NONCE_BYTES)
+        if len(nonce) != NONCE_BYTES:
+            STATS['rejected'] += 1
+            return None
+        f.seek(data_start + rel_off + NONCE_BYTES + ct_len)
+        tag = f.read(TAG_BYTES)
+        if len(tag) != TAG_BYTES:
+            STATS['rejected'] += 1
+            return None
+        f.seek(data_start + rel_off + NONCE_BYTES)
+    except OSError:
+        return None
+
+    dec = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+    dec.authenticate_additional_data(prefix_bytes + f':rec:{idx}'.encode('ascii'))
+    left = ct_len
+    pending = bytearray()
+
+    def take(n: int) -> np.ndarray:
+        nonlocal left
+        out = np.empty(n, np.uint8)
+        have = min(n, len(pending))
+        if have:
+            out[:have] = np.frombuffer(bytes(pending[:have]), np.uint8)
+            del pending[:have]
+        while have < n:
+            if left <= 0:
+                raise ValueError('short ciphertext')
+            chunk = f.read(min(limit, left))
+            if not chunk:
+                raise ValueError('short ciphertext')
+            left -= len(chunk)
+            piece = dec.update(chunk)
+            use = min(len(piece), n - have)
+            if use:
+                out[have : have + use] = np.frombuffer(piece, np.uint8, count=use)
+            if use < len(piece):
+                pending.extend(piece[use:])
+            have += use
+        return out
+
+    try:
+        header_size = int.from_bytes(take(8).tobytes(), 'little')
+        if header_size <= 0 or header_size > min(64 * 1024 * 1024, left + len(pending)):
+            raise ValueError('invalid safetensors header size')
+        header = json.loads(take(header_size).tobytes())
+        if not isinstance(header, dict):
+            raise ValueError('invalid safetensors header')
+        metadata = dict(header.pop('__metadata__', {}) or {})
+        spans = sorted(
+            (tuple(int(x) for x in entry['data_offsets']), name)
+            for name, entry in header.items()
+            if isinstance(entry, dict) and 'data_offsets' in entry
+        )
+        tensors: dict[Tuple[int, int], mx.array] = {}
+        at = 0
+        for (begin, end), name in spans:
+            if begin < at or end < begin:
+                raise ValueError('invalid tensor data_offsets')
+            if begin > at:
+                take(begin - at)
+            data = take(end - begin)
+            if name != SENTINEL_TENSOR and end > begin:
+                arr = _apc._mlx_array_from_safetensors_bytes(data, header[name])
+                if arr is None:
+                    raise ValueError(f'failed to decode tensor {name}')
+                tensors[(begin, end)] = arr
+            del data
+            at = end
+        header.pop(SENTINEL_TENSOR, None)
+        while left > 0:
+            chunk = f.read(min(limit, left))
+            if not chunk:
+                raise ValueError('short ciphertext')
+            left -= len(chunk)
+            dec.update(chunk)
+        dec.finalize()
+    except OSError:
+        return None
+    except (InvalidTag, UnicodeDecodeError, ValueError, KeyError, TypeError):
+        STATS['rejected'] += 1
+        return None
+
+    return header, metadata, 8 + header_size, tensors
+
+
+def _decrypt_record_arrays(
+    f,
+    prefix_bytes: bytes,
+    data_start: int,
+    records: list,
+    idx: int,
+    key: bytes,
+    *,
+    limit: int = PIECE,
+) -> Optional[Tuple[dict[str, mx.array], dict]]:
+    """Stream-decrypt one record into restored `{name: mx.array}` and `metadata`."""
+    got = _decrypt_record_tensors(f, prefix_bytes, data_start, records, idx, key, limit=limit)
+    if got is None:
+        return None
+    header, metadata, _st_data_start, tensors = got
+    tensor_entries = _apc._restore_empty_tensor_entries(dict(header), metadata)
+    if tensor_entries is None:
+        STATS['rejected'] += 1
+        return None
+    out: dict[str, mx.array] = {}
+    for name, entry in tensor_entries.items():
+        if name == SENTINEL_TENSOR:
+            continue
+        if entry.get(_apc._EMPTY_TENSOR_MARKER) is True:
+            try:
+                out[name] = mx.zeros(tuple(entry['shape']), dtype=entry['mlx_dtype'])
+            except (KeyError, TypeError, ValueError):
+                STATS['rejected'] += 1
+                return None
+            continue
+        bounds = _apc._safetensors_tensor_bounds(entry)
+        if bounds is None:
+            STATS['rejected'] += 1
+            return None
+        start, end, _ = bounds
+        arr = (
+            _apc._mlx_array_from_safetensors_bytes(b'', entry)
+            if start == end
+            else tensors.get((start, end))
+        )
+        if arr is None:
+            STATS['rejected'] += 1
+            return None
+        out[name] = arr
+    return out, metadata
 
 
 def _query_block_chain(
@@ -491,6 +868,10 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 return None
             start, end, _ = bounds
             raw = mem_map[path][3]
+            if isinstance(raw, dict):
+                if start == end:
+                    return _apc._mlx_array_from_safetensors_bytes(b'', entry)
+                return raw.get((start, end))
             if data_start + end > len(raw):
                 return None
             return _apc._mlx_array_from_safetensors_bytes(
@@ -724,6 +1105,8 @@ def install(store_cls=None, manager_cls=None) -> bool:
         synchronous: bool = False,
     ) -> bool:
         if not ON[0]:
+            if over_cap():
+                return False
             return orig_save_exact(
                 self,
                 cache_hash,
@@ -754,6 +1137,8 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 return True
             with self._write_lock:
                 _drop_corrupt_shard(self, existing_path)
+        if over_cap():
+            return False
         bs = max(1, int(getattr(self, '_quanteeze_block_size', _apc.DEFAULT_BLOCK_SIZE)))
         trimmable = (
             _apc._dense_checkpoint_trimmable(prompt_cache, n_toks)
@@ -793,7 +1178,13 @@ def install(store_cls=None, manager_cls=None) -> bool:
         with self._index_lock:
             seal_info = self._quanteeze_pending_exact.pop(id(snapshot), None)
         if not ON[0] or seal_info is None:
-            return orig_write_exact(self, path, snapshot)
+            if over_cap():
+                return []
+            res = orig_write_exact(self, path, snapshot)
+            _record_wrote(path)
+            return res
+        if over_cap():
+            return []
         if not self._ensure_dir():
             raise OSError(f'APC disk cache directory unavailable: {self.dir}')
         (
@@ -822,8 +1213,7 @@ def install(store_cls=None, manager_cls=None) -> bool:
             for i, c in enumerate(snapshot.prompt_cache):
                 if not self._snapshot_exact_cache_entry(c, f'c{i}', arrays, metadata):
                     raise ValueError(f'unsupported exact-cache entry at index {i}')
-            plain = _safetensors_dumps(arrays, metadata)
-            env = _write_sealed_file(
+            env = _write_sealed_records(
                 path,
                 {
                     'kind': 'exact_v1',
@@ -832,7 +1222,7 @@ def install(store_cls=None, manager_cls=None) -> bool:
                     'token_count': len(snapshot.token_ids),
                     'segment_index': 0,
                 },
-                [(plain, exact_key)],
+                [(arrays, metadata, exact_key)],
             )
         else:
             n_full = len(snapshot.token_ids) // bs
@@ -843,7 +1233,7 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 for c in snapshot.prompt_cache
             ]
             steps_csv = ','.join(str(st) for st in steps)
-            records_to_seal: list[Tuple[bytes, bytes]] = []
+            records_to_seal: list[Tuple[dict[str, mx.array], dict[str, str], bytes]] = []
             for b_idx in range(n_full):
                 s, e = b_idx * bs, (b_idx + 1) * bs
                 chunk = snapshot.token_ids[s:e]
@@ -857,7 +1247,7 @@ def install(store_cls=None, manager_cls=None) -> bool:
                     'num_entries': str(n_entries),
                     'steps': steps_csv,
                 }
-                records_to_seal.append((_safetensors_dumps(blk_arrays, blk_meta), block_keys[b_idx]))
+                records_to_seal.append((blk_arrays, blk_meta, block_keys[b_idx]))
             if rem > 0:
                 s, e = n_full * bs, len(snapshot.token_ids)
                 tail_tokens = snapshot.token_ids[s:e]
@@ -871,8 +1261,8 @@ def install(store_cls=None, manager_cls=None) -> bool:
                     'num_entries': str(n_entries),
                     'steps': steps_csv,
                 }
-                records_to_seal.append((_safetensors_dumps(tail_arrays, tail_meta), exact_key))
-            env = _write_sealed_file(
+                records_to_seal.append((tail_arrays, tail_meta, exact_key))
+            env = _write_sealed_records(
                 path,
                 {
                     'kind': 'exact_trim_v1',
@@ -887,10 +1277,9 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 records_to_seal,
             )
 
-        try:
-            self._disk_bytes += path.stat().st_size
-        except OSError:
-            pass
+        written_size = _record_wrote(path)
+        if written_size:
+            self._disk_bytes += written_size
         with self._index_lock:
             self._exact_index[int(loc_int)] = path
             _store_envelopes(self)[path] = env
@@ -1073,22 +1462,18 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 return None
             try:
                 with open(path, 'rb') as f:
-                    plain = _decrypt_record(f, prefix_bytes, data_start, records, 0, grant[1])
+                    got = _decrypt_record_tensors(f, prefix_bytes, data_start, records, 0, grant[1])
             except OSError:
                 return None
-            if plain is None:
+            if got is None:
                 _drop_corrupt_shard(self, path)
                 return None
-            st_parsed = _parse_safetensors_bytes(plain)
-            if st_parsed is None:
-                _drop_corrupt_shard(self, path)
-                return None
-            header, metadata, st_data_start = st_parsed
+            header, metadata, st_data_start, tensors = got
             active = getattr(_MEM_SAFES, 'active', None)
             if active is None:
                 active = {}
                 _MEM_SAFES.active = active
-            active[path] = (header, metadata, st_data_start, plain)
+            active[path] = (header, metadata, st_data_start, tensors)
             try:
                 loaded = self._load_exact_cache_file(
                     path, min_capacity_tokens=min_capacity_tokens, prefix_len=prefix_len
@@ -1115,11 +1500,7 @@ def install(store_cls=None, manager_cls=None) -> bool:
             try:
                 with open(path, 'rb') as f:
                     for r_idx, r_key in enumerate(needed_keys):
-                        plain = _decrypt_record(f, prefix_bytes, data_start, records, r_idx, r_key)
-                        if plain is None:
-                            _drop_corrupt_shard(self, path)
-                            return None
-                        part = _load_arrays_from_safetensors_bytes(plain)
+                        part = _decrypt_record_arrays(f, prefix_bytes, data_start, records, r_idx, r_key)
                         if part is None:
                             _drop_corrupt_shard(self, path)
                             return None
@@ -1194,9 +1575,11 @@ def install(store_cls=None, manager_cls=None) -> bool:
         block_size: int,
     ) -> None:
         if not ON[0]:
+            if over_cap():
+                return None
             return orig_save_blocks(self, blocks, layer_keys, layer_values, block_size)
-        if not blocks or not layer_keys or not layer_values:
-            return
+        if not blocks or not layer_keys or not layer_values or over_cap():
+            return None
         salt = _precision_salt()
         for b in blocks:
             key = _get_chain_key(int(b.block_hash))
@@ -1223,9 +1606,13 @@ def install(store_cls=None, manager_cls=None) -> bool:
 
     def _write_layer_major_snapshot(self, path: Path, snapshot) -> list[int]:
         if not ON[0]:
-            return orig_write_blocks(self, path, snapshot)
+            if over_cap():
+                return []
+            res = orig_write_blocks(self, path, snapshot)
+            _record_wrote(path)
+            return res
         blocks = snapshot.blocks
-        if not blocks:
+        if not blocks or over_cap():
             return []
         if len(snapshot.layer_keys) != len(snapshot.layer_values):
             raise ValueError('layer-major disk snapshot has mismatched K/V layers')
@@ -1234,7 +1621,7 @@ def install(store_cls=None, manager_cls=None) -> bool:
 
         bs = int(snapshot.block_size)
         num_layers = len(snapshot.layer_keys)
-        records_to_seal: list[Tuple[bytes, bytes]] = []
+        records_to_seal: list[Tuple[dict[str, mx.array], dict[str, str], bytes]] = []
         locators: list[int] = []
         for b in blocks:
             src_idx = int(b.source_block_idx)
@@ -1257,10 +1644,10 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 key = _get_chain_key(int(b.block_hash))
             if key is None:
                 raise ValueError('missing convergent key for APC disk block')
-            records_to_seal.append((_safetensors_dumps(blk_arrays, blk_meta), key))
+            records_to_seal.append((blk_arrays, blk_meta, key))
             locators.append(int(b.block_hash))
 
-        env = _write_sealed_file(
+        env = _write_sealed_records(
             path,
             {
                 'kind': 'blocks_v1',
@@ -1271,10 +1658,9 @@ def install(store_cls=None, manager_cls=None) -> bool:
             },
             records_to_seal,
         )
-        try:
-            self._disk_bytes += path.stat().st_size
-        except OSError:
-            pass
+        written_size = _record_wrote(path)
+        if written_size:
+            self._disk_bytes += written_size
         with self._index_lock:
             for idx, loc in enumerate(locators):
                 self._index[loc] = (path, idx)
@@ -1324,11 +1710,7 @@ def install(store_cls=None, manager_cls=None) -> bool:
             try:
                 with open(shard_path, 'rb') as f:
                     for block_idx, key in items:
-                        plain = _decrypt_record(f, prefix_bytes, data_start, records, block_idx, key)
-                        if plain is None:
-                            _drop_corrupt_shard(self, shard_path)
-                            return None
-                        part = _load_arrays_from_safetensors_bytes(plain)
+                        part = _decrypt_record_arrays(f, prefix_bytes, data_start, records, block_idx, key)
                         if part is None:
                             _drop_corrupt_shard(self, shard_path)
                             return None

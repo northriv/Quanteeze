@@ -37,8 +37,16 @@ from . import cuda_kernels
 
 CHECKS = 3
 ON = [True]                     # QUANTEEZE_CUDA_QMV
-STATS = dict(served=0, checked=0, mismatched=0)
-CHOICE = {}                     # (K, N, group size): whether it matched MLX's
+CHECKS = 3
+ON = [True]                     # QUANTEEZE_CUDA_QMV
+ROWS_ON = [True]                # QUANTEEZE_CUDA_QMV_ROWS: a call of 2 to ROWS_MOST rows through qmv_rows()
+ROWS = ROWS_ON
+ROWS_MOST = 7                   # MLX 0.32.4 computes up to 7 rows as one-row qmvs; 8 and more by its qmm
+BITS = (4, 8)                   # bits computes() takes (qz_qmv4_row(s), qz_qmv8_row(s))
+ROWS_LEAST = {4: 1 << 21, 8: 1 << 22}   # minimum weights * (rows - 1) for qmv_rows()
+ONE_LEAST = [1 << 24]           # minimum weights for one-row 8-bit qmv() (None: leave to MLX)
+STATS = dict(served=0, rows=0, checked=0, mismatched=0)
+CHOICE = {}                     # (K, N, group size[, bits, rows]): whether it matched MLX's
 CHECKED = {}
 SAID = []
 _ORIGINAL = []                  # mx.quantized_matmul as MLX gave it
@@ -187,7 +195,7 @@ __device__ __forceinline__ float qz_qmv4_row_ahead(const __nv_bfloat16* x, const
 // 256, each weight dequantized in bfloat16 (exactly to bfloat16, then w * scale and + bias rounded
 // each), and multiply-adds them as float32 into its 8 float32 sums; the sums added in order, the
 // warp's cg::reduced.
-template <int K, int GS>
+template <int K, int GS, bool STREAM = false>
 __device__ __forceinline__ float qz_qmv8_row(const __nv_bfloat16* x, const uint32_t* w, const __nv_bfloat16* scales,
                                              const __nv_bfloat16* biases, int row) {
   auto warp = cooperative_groups::tiled_partition<32>(cooperative_groups::this_thread_block());
@@ -204,7 +212,8 @@ __device__ __forceinline__ float qz_qmv8_row(const __nv_bfloat16* x, const uint3
     acc[i] = 0.0f;
   }
   auto tile = [&](int idx) {
-    const uint2 ww = *reinterpret_cast<const uint2*>(wr + idx);
+    const uint2* wp = reinterpret_cast<const uint2*>(wr + idx);
+    const uint2 ww = STREAM ? __ldcs(wp) : *wp;
     const uint4 xv = *reinterpret_cast<const uint4*>(x + idx);
     const uint32_t xs[4] = {xv.x, xv.y, xv.z, xv.w};
     const __nv_bfloat162 s2 = __bfloat162bfloat162(scales[idx / GS]);
@@ -238,6 +247,144 @@ __device__ __forceinline__ float qz_qmv8_row(const __nv_bfloat16* x, const uint3
   }
   return cooperative_groups::reduce(warp, sum, cooperative_groups::plus<float>{});
 }
+
+// qz_qmv4_row for R rows of x (row r at x + r * K) through the same weight row: each step's weights
+// dequantized once, then multiply-added into every row's own sums in the one-row order.
+template <int K, int GS, int R>
+__device__ __forceinline__ void qz_qmv4_rows(const __nv_bfloat16* x, const uint32_t* w, const __nv_bfloat16* scales,
+                                             const __nv_bfloat16* biases, int row, float (&out)[R]) {
+  auto warp = cooperative_groups::tiled_partition<32>(cooperative_groups::this_thread_block());
+  constexpr int per_warp = 512;
+  constexpr int ITERS = K / per_warp;
+  constexpr int rest = K % per_warp;
+  const uint32_t* wr = w + static_cast<int64_t>(row) * (K / 8);
+  scales += static_cast<int64_t>(row) * (K / GS);
+  biases += static_cast<int64_t>(row) * (K / GS);
+  const int lane = warp.thread_rank();
+  __nv_bfloat162 acc[R][8];
+#pragma unroll
+  for (int t = 0; t < R; ++t) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      acc[t][i] = __float2bfloat162_rn(0.0f);
+    }
+  }
+  const uint32_t magic_bits = 0x43004300u;
+  const __nv_bfloat162 magic = *reinterpret_cast<const __nv_bfloat162*>(&magic_bits);
+  auto step = [&](int idx) {
+    const uint2 ww = *reinterpret_cast<const uint2*>(wr + idx / 8);
+    const __nv_bfloat162 s2 = __bfloat162bfloat162(scales[idx / GS]);
+    const __nv_bfloat162 b2 = __bfloat162bfloat162(biases[idx / GS]);
+    __nv_bfloat162 wd[8];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const uint32_t v = j ? ww.y : ww.x;
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        uint32_t bits = qz_nibbles(v, p) | magic_bits;
+        __nv_bfloat162 q = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&bits), magic);
+        wd[j * 4 + p] = __hadd2(__hmul2(q, s2), b2);
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < R; ++t) {
+      const uint4 xa = *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(t) * K + idx);
+      const uint4 xb = *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(t) * K + idx + 8);
+      const uint32_t xs[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const __nv_bfloat162 xv = *reinterpret_cast<const __nv_bfloat162*>(&xs[i]);
+        acc[t][i] = __hfma2(xv, wd[i], acc[t][i]);
+      }
+    }
+  };
+#pragma unroll
+  for (int r = 0; r < ITERS; ++r) {
+    step(lane * 16 + r * per_warp);
+  }
+  if constexpr (rest != 0) {
+    int idx = lane * 16 + K - rest;
+    if (idx < K) {
+      step(idx);
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < R; ++t) {
+    float sum{0};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      sum += __low2float(acc[t][i]);
+      sum += __high2float(acc[t][i]);
+    }
+    out[t] = cooperative_groups::reduce(warp, sum, cooperative_groups::plus<float>{});
+  }
+}
+
+// qz_qmv8_row for R rows of x (row r at x + r * K) through the same weight row.
+template <int K, int GS, int R>
+__device__ __forceinline__ void qz_qmv8_rows(const __nv_bfloat16* x, const uint32_t* w, const __nv_bfloat16* scales,
+                                             const __nv_bfloat16* biases, int row, float (&out)[R]) {
+  auto warp = cooperative_groups::tiled_partition<32>(cooperative_groups::this_thread_block());
+  constexpr int per_warp = 256;
+  constexpr int ITERS = K / per_warp;
+  constexpr int rest = K % per_warp;
+  const uint8_t* wr = reinterpret_cast<const uint8_t*>(w) + static_cast<int64_t>(row) * K;
+  scales += static_cast<int64_t>(row) * (K / GS);
+  biases += static_cast<int64_t>(row) * (K / GS);
+  const int lane = warp.thread_rank();
+  float acc[R][8];
+#pragma unroll
+  for (int t = 0; t < R; ++t) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      acc[t][i] = 0.0f;
+    }
+  }
+  auto tile = [&](int idx) {
+    const uint2 ww = *reinterpret_cast<const uint2*>(wr + idx);
+    const __nv_bfloat162 s2 = __bfloat162bfloat162(scales[idx / GS]);
+    const __nv_bfloat162 b2 = __bfloat162bfloat162(biases[idx / GS]);
+    float2 wf[4];
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      const uint32_t v = (p < 2 ? ww.x : ww.y) >> (16 * (p & 1));
+      const float f0 = __uint_as_float(0x4B000000u | (v & 0xFFu)) - 8388608.0f;
+      const float f1 = __uint_as_float(0x4B000000u | ((v >> 8) & 0xFFu)) - 8388608.0f;
+      const __nv_bfloat162 wd = __hadd2(__hmul2(__floats2bfloat162_rn(f0, f1), s2), b2);
+      wf[p] = __bfloat1622float2(wd);
+    }
+#pragma unroll
+    for (int t = 0; t < R; ++t) {
+      const uint4 xv = *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(t) * K + idx);
+      const uint32_t xs[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const float2 xf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xs[p]));
+        acc[t][2 * p] = __fmaf_rn(xf.x, wf[p].x, acc[t][2 * p]);
+        acc[t][2 * p + 1] = __fmaf_rn(xf.y, wf[p].y, acc[t][2 * p + 1]);
+      }
+    }
+  };
+#pragma unroll
+  for (int r = 0; r < ITERS; ++r) {
+    tile(lane * 8 + r * per_warp);
+  }
+  if constexpr (rest != 0) {
+    int idx = lane * 8 + K - rest;
+    if (idx < K) {
+      tile(idx);
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < R; ++t) {
+    float sum{0};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      sum += acc[t][i];
+    }
+    out[t] = cooperative_groups::reduce(warp, sum, cooperative_groups::plus<float>{});
+  }
+}
 """
 
 # A warp a row, 8 rows a block, as MLX's qmv launches it.
@@ -253,51 +400,134 @@ SOURCE = r"""
     }
 """
 
+ROWS_SOURCE = r"""
+    auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+    int row = blockIdx.x * 8 + warp.meta_group_rank();
+    if (row >= N_OUT) {
+      return;
+    }
+    float sums[R];
+    if constexpr (BITS == 8) {
+      qz_qmv8_rows<K_IN, GS, R>(x, w, scales, biases, row, sums);
+    } else {
+      qz_qmv4_rows<K_IN, GS, R>(x, w, scales, biases, row, sums);
+    }
+    if (warp.thread_rank() == 0) {
+#pragma unroll
+      for (int t = 0; t < R; ++t) {
+        y[static_cast<int64_t>(t) * N_OUT + row] = __float2bfloat16_rn(sums[t]);
+      }
+    }
+"""
+
 
 @lru_cache(maxsize=None)
-def _kernel():
+def _kernel(bits=4):
+    if bits == 8:
+        return mx.fast.cuda_kernel(
+            name='quanteeze_qmv8',
+            input_names=['x', 'w', 'scales', 'biases'],
+            output_names=['y'],
+            source=SOURCE.replace('qz_qmv4_row<K_IN, GS>', 'qz_qmv8_row<K_IN, GS, true>'),
+            header=HEADER,
+        )
     return mx.fast.cuda_kernel(name='quanteeze_qmv4', input_names=['x', 'w', 'scales', 'biases'],
                                output_names=['y'], source=SOURCE, header=HEADER)
 
 
-def qmv(x, w, scales, biases, group_size):
-    """mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size, bits=4) of one row x."""
+def qmv(x, w, scales, biases, group_size, bits=4):
+    """mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size, bits) of one row x (4 or 8 bits)."""
     n, k = w.shape[0], x.shape[-1]
-    return _kernel()(inputs=[x, w, scales, biases],
-                     template=[('GS', int(group_size)), ('N_OUT', n), ('K_IN', k)],
-                     grid=(32 * -(-n // 8), 8, 1), threadgroup=(32, 8, 1), output_shapes=[(*x.shape[:-1], n)],
-                     output_dtypes=[x.dtype])[0]
+    return _kernel(int(bits))(
+        inputs=[x, w, scales, biases],
+        template=[('GS', int(group_size)), ('N_OUT', n), ('K_IN', k)],
+        grid=(32 * -(-n // 8), 8, 1),
+        threadgroup=(32, 8, 1),
+        output_shapes=[(*x.shape[:-1], n)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+@lru_cache(maxsize=None)
+def _rows_kernel():
+    return mx.fast.cuda_kernel(name='quanteeze_qmv_rows', input_names=['x', 'w', 'scales', 'biases'],
+                               output_names=['y'], source=ROWS_SOURCE, header=HEADER)
+
+
+def qmv_rows(x, w, scales, biases, group_size, bits):
+    """mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size, bits) of 2 to ROWS_MOST rows."""
+    n, k = w.shape[0], x.shape[-1]
+    rows = x.size // k
+    return _rows_kernel()(
+        inputs=[x, w, scales, biases],
+        template=[('GS', int(group_size)), ('N_OUT', n), ('K_IN', k), ('R', rows), ('BITS', int(bits))],
+        grid=(32 * -(-n // 8), 8, 1),
+        threadgroup=(32, 8, 1),
+        output_shapes=[(*x.shape[:-1], n)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+def computes(x, w, scales, biases, transpose, group_size, bits, mode):
+    """Whether qz_qmv4_row (4 bits) or qz_qmv8_row (8 bits) computes each row of this call."""
+    return (transpose is True and mode == 'affine' and bits in BITS and biases is not None
+            and group_size in (32, 64, 128) and x.dtype == mx.bfloat16 and scales.dtype == mx.bfloat16
+            and biases.dtype == mx.bfloat16 and w.ndim == 2 and w.dtype == mx.uint32 and x.ndim >= 1
+            and x.shape[-1] == scales.shape[-1] * group_size == w.shape[-1] * 32 // bits
+            and scales.shape[0] == w.shape[0] and biases.shape == scales.shape)
+
+
+def one_row(x, w, scales, biases, transpose, group_size, bits, mode):
+    """Whether qz_qmv4_row or qz_qmv8_row computes this call of one row."""
+    return x.ndim >= 1 and x.size == x.shape[-1] and computes(x, w, scales, biases, transpose, group_size, bits, mode)
 
 
 def takes(x, w, scales, biases, transpose, group_size, bits, mode):
     """Whether qmv() computes this call as MLX's qmv does: one row of bfloat16, an affine 4-bit
     projection with biases in groups of 32, 64 or 128, the weights a matrix."""
-    return (transpose is True and mode == 'affine' and bits == 4 and biases is not None
-            and group_size in (32, 64, 128) and x.dtype == mx.bfloat16 and scales.dtype == mx.bfloat16
-            and biases.dtype == mx.bfloat16 and w.ndim == 2 and w.dtype == mx.uint32
-            and x.ndim >= 1 and x.size == x.shape[-1]
-            and x.shape[-1] == scales.shape[-1] * group_size == w.shape[-1] * 8
-            and scales.shape[0] == w.shape[0] and biases.shape == scales.shape)
+    return bits == 4 and one_row(x, w, scales, biases, transpose, group_size, bits, mode)
+
+
+def takes8(x, w, scales, biases, transpose, group_size, bits, mode):
+    """Whether qmv(..., bits=8) computes this one-row affine 8-bit call (at least ONE_LEAST weights)."""
+    return (bits == 8 and ONE_LEAST[0] is not None and w.ndim == 2 and w.shape[0] * w.shape[-1] * 4 >= ONE_LEAST[0]
+            and one_row(x, w, scales, biases, transpose, group_size, bits, mode))
+
+
+def takes_rows(x, w, scales, biases, transpose, group_size, bits, mode):
+    """Whether qmv_rows() computes this call: 2 to ROWS_MOST rows through an affine 4- or 8-bit projection."""
+    return (computes(x, w, scales, biases, transpose, group_size, bits, mode) and x.shape[-1] > 0
+            and 1 < x.size // x.shape[-1] <= ROWS_MOST)
 
 
 def quantized_matmul(x, w, scales, biases=None, transpose=True, group_size=None, bits=None, mode='affine', *,
                      stream=None):
-    """mx.quantized_matmul, a decode's one-row call through qmv() where its shape matched."""
+    """mx.quantized_matmul: one-row calls (4/8-bit) through qmv() and 2..ROWS_MOST rows through qmv_rows()."""
     def theirs():
         return _ORIGINAL[0](x, w, scales, biases, transpose, group_size, bits, mode, stream=stream)
-    if not ON[0] or stream is not None or not takes(x, w, scales, biases, transpose, group_size, bits, mode):
+    if not ON[0] or stream is not None:
         return theirs()
-    return _served((x.shape[-1], w.shape[0], int(group_size)), lambda: qmv(x, w, scales, biases, group_size), theirs)
+    if takes(x, w, scales, biases, transpose, group_size, bits, mode):
+        return _served((x.shape[-1], w.shape[0], int(group_size)), lambda: qmv(x, w, scales, biases, group_size), theirs)
+    if takes8(x, w, scales, biases, transpose, group_size, bits, mode):
+        return _served((x.shape[-1], w.shape[0], int(group_size), 8),
+                       lambda: qmv(x, w, scales, biases, group_size, 8), theirs)
+    if (ROWS_ON[0] and takes_rows(x, w, scales, biases, transpose, group_size, bits, mode)
+            and w.shape[0] * x.shape[-1] * (x.size // x.shape[-1] - 1) >= ROWS_LEAST[bits]):
+        rows = x.size // x.shape[-1]
+        return _served((x.shape[-1], w.shape[0], int(group_size), int(bits), rows),
+                       lambda: qmv_rows(x, w, scales, biases, group_size, bits), theirs, 'rows')
+    return theirs()
 
 
-def _served(key, mine, theirs):
+def _served(key, mine, theirs, counted='served'):
     """mine() where this shape matched theirs() bit for bit the first CHECKS times it was met, else
     theirs(); a call being traced into a compiled graph (whose values cannot be read) theirs() until
     the checks are made outside one."""
     choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
     if choice is not None and seen >= CHECKS:
         if choice:
-            STATS['served'] += 1
+            STATS[counted] += 1
             return mine()
         return theirs()
     want = theirs()

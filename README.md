@@ -1,14 +1,22 @@
 # Quanteeze
 
-Fast MLX inference server for large Mixture-of-Experts (MoE) and dense language/vision-language models on **Apple Silicon (Metal)** and **NVIDIA GPUs (CUDA)**.
+[![License: GPL-2.0 OR PolyForm-Shield](https://img.shields.io/badge/License-GPL--2.0_OR_PolyForm--Shield-blue.svg)](#ライセンスlicense)
+[![GitHub](https://img.shields.io/badge/GitHub-northriv%2FQuanteeze-181717?logo=github)](https://github.com/northriv/Quanteeze)
+[![Python 3.12+ | C++20](https://img.shields.io/badge/Python_3.12%2B_%7C_C%2B%2B-20-3776AB)]()
+[![Platform: macOS (Metal) | Linux (CUDA)](https://img.shields.io/badge/platform-macOS_(Metal)_%7C_Linux_(CUDA)-lightgrey)]()
+[![kamestm: arXiv 2608.12024](https://img.shields.io/badge/kamestm-arXiv%3A2608.12024-b31b1b.svg)](https://arxiv.org/abs/2608.12024)
 
-Apple Silicon Mac や NVIDIA GPU 搭載の Linux マシンで、巨大な MoE（Mixture-of-Experts）や VLM/LLM モデルをそのまま、または手軽に省メモリ化して配信できる MLX 推論サーバーです。均一な低ビット量子化や自動 SSD / ホスト RAM ストリーミング、内蔵ブラウザ UI、さらに **OpenAI 互換 API** と **Anthropic Messages API（Claude Code 対応）** を標準で備えています。
+Fast MLX inference server for large Mixture-of-Experts (MoE) and dense language/vision-language models on **Apple Silicon (Metal)** and **NVIDIA GPUs (CUDA)**, powered by uniform low-bit quantization, on-demand SSD / host-RAM streaming via the lock-free C++20 [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) STM engine and [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) pool allocator, and verified Metal/CUDA decode kernels.
+
+Apple Silicon Mac や NVIDIA GPU 搭載の Linux マシンで、巨大な MoE（Mixture-of-Experts）や VLM/LLM モデルをそのまま、または手軽に省メモリ化して配信できる MLX 推論サーバーです。均一な低ビット量子化や、形式検証済みのロックフリー C++20 STM（[`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm)）および 4 階層プールアロケータ（[`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)）による自動 SSD / ホスト RAM ストリーミング、内蔵ブラウザ UI、さらに **OpenAI 互換 API（Responses API / Codex CLI 対応）** と **Anthropic Messages API（Claude Code 対応）** を標準で備えています。
+
+[クイックスタート（macOS）](#はじめて試す方へクイックスタート) · [アプリ接続（Claude Code / Codex / KAME）](#7-claude-codecodex-cli-や他のアプリからつなぐ) · [Linux（NVIDIA GPU）](#linuxnvidia-gpuのクイックスタート) · [実機ベンチマーク](#実機での動作速度例--experts-gguf) · [主な特徴・仕組み](#主な特徴仕組み) · [対応モデル](#対応モデルアーキテクチャ) · [環境変数リファレンス](#主な環境変数設定リファレンス) · [引用（Citing）](#引用citing) · [ライセンス](#ライセンスlicense)
 
 ---
 
 ## はじめて試す方へ（クイックスタート）
 
-ここでは、インストールからブラウザ UI での確認、Claude Code などのアプリからの接続までを順番に説明します。
+ここでは、インストールからブラウザ UI での確認、Claude Code・Codex CLI・KAME などのアプリからの接続までを順番に説明します。
 
 ### 1. 必要なもの
 
@@ -20,7 +28,21 @@ Apple Silicon Mac や NVIDIA GPU 搭載の Linux マシンで、巨大な MoE（
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-> **補足（任意）**：C++17 コンパイラ（Mac の Xcode Command Line Tools の `clang++`、または Linux の `g++`）が入っている環境では、初回起動時に同梱の省メモリ・ロックフリーアロケータ [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) を自動ビルドして有効にします。未導入の場合は標準の `malloc` に自動でフォールバックするため、事前インストールは必須ではありません。
+> **補足（任意・C++20 コンパイラ）**：C++20 コンパイラ（Mac の Xcode Command Line Tools の `clang++`、または Linux の `g++` 10 以上）が入っている環境では、初回起動時に同梱のロックフリー・ロックレス 4 階層アロケータ [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)（`QUANTEEZE_ALLOCATOR=auto`）と C++20 ネイティブ拡張群（`QUANTEEZE_NATIVE=on`：[`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) ベースの STM オンデマンドエンジン `stm_core`、ロックフリー `pread` リーダー `native_reads`、および Linux x86-64 AVX2/AVX-512 環境の CPU エキスパート計算 `cpu_experts`）を自動でビルド・有効化します。コンパイラが無い場合は標準の `malloc` と純 Python 実装へ静かにフォールバックするため、事前インストールは必須ではありません。
+
+macOS の Unified Memory 環境では、Metal が 1 プロセスに推奨する作業領域（`max_recommended_working_set_size`）から `QUANTEEZE_MEMORY_RESERVE`（既定 `0.3`）を差し引いた残りにエキスパートが収まるかどうかで、「全重みをメモリに保持」と「SSD からオンデマンド読込」を自動で切り替えます。
+
+| Mac の構成例 | 搭載メモリ | Metal 推奨作業領域の目安 |
+|---|---|---|
+| Mac mini / MacBook Pro (M5 Pro) | 48 GB | 約 40.2 GB |
+| Mac Studio (M5 Ultra) | 96 GB | 約 83.5 GB |
+| MacBook Pro (M5 Max) | 128 GB | 約 115.4 GB |
+
+手元の Mac の推奨作業領域は次のコマンドで確認できます：
+
+```bash
+.venv/bin/python -c "import mlx.core as mx; print(round(mx.device_info()['max_recommended_working_set_size'] / 1e9, 1), 'GB')"
+```
 
 ### 2. 取得とインストール（Mac）
 
@@ -32,7 +54,7 @@ cd ~/Quanteeze
 uv sync
 ```
 
-`pip` を使う場合は Python 3.12 以上の仮想環境で `pip install -e .` を実行します。Linux（NVIDIA GPU）の手順は少し異なるため、[Linux（NVIDIA GPU）のクイックスタート](#linuxnvidia-gpuのクイックスタート) を見てください。
+`pip` を使う場合は Python 3.12 以上の仮想環境で `pip install -e .` を実行します。なお `pyproject.toml` ではカーネルのビット一致検証と C++ 拡張 ABI の安定性のため、`mlx==0.32.4`・`mlx-lm==0.32.2`・`mlx-vlm==0.7.9`・`nanobind==3.1.0` を厳密に固定しています。Linux（NVIDIA GPU）の手順は少し異なるため、[Linux（NVIDIA GPU）のクイックスタート](#linuxnvidia-gpuのクイックスタート) を見てください。
 
 ### 3. モデル：LM Studio や Hugging Face のフォルダがそのまま使えます
 
@@ -75,19 +97,20 @@ Web UI は上から順番に使っていきます。ブラウザの言語設定�
 2. **ルーティング・エキスパートの精度**（Routed expert precision）
    MoE モデルを選ぶと、元の精度や均一量子化（**4・3・2・1 ビット（最小二乗）**、**MXFP4 / Q3_K / Q2_K / IQ2_XS**）ごとに、エキスパートが使う容量と **メモリに収まる**（fits in memory）/ **SSD からオンデマンド読込**（streams from SSD）が表示されます。
    - **迷ったときの選び方**：まずは **メモリに収まる**（fits in memory）と表示される選択肢の中で一番ビット数の高いものを選ぶのがおすすめです（元の精度のままでも収まる場合は **元の精度** でそのまま高速に動きます）。メモリに入りきらないモデルを試したい場合は **SSD からオンデマンド読込** でもそのまま動きます。
-   - 選んだら **このモデルを配信**（Serve this model）を押します。読み込みの進捗や現在のメモリ・発熱・速度は、画面一番上の **いま配信中**（Serving now）にリアルタイムで表示されます。
+   - 選んだら **このモデルを配信**（Serve this model）を押します。読み込みの進捗や現在のメモリ・発熱・速度は、画面一番上の **いま配信中**（Serving now）にリアルタイムで表示されます（C++20 [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) エンジンでオンデマンド配信している場合は **`C++ STM`** のバッジも表示されます）。
 3. **質問してみる**（Try a prompt）
    ブラウザからそのままモデルに質問を送って、応答・生成速度（`tok/s`）・**思考の内容**（Its thinking）を確認できます（`Cmd+Enter` / `Ctrl+Enter` でも送信できます）。
 4. **メモリ・PLE・MTP・発熱**（Memory, PLE, MTP & heat）
    よく使う設定をワンクリックで切り替えられます。
-   - **メモリ確保枠**（Memory reserve）：**ゆったり** / **標準** / **Most for experts**
+   - **メモリ確保枠**（Memory reserve）：**ゆったり** / **標準** / **エキスパート最大**（Most experts）
+   - **メモリの固定**（Wired memory、macOS Metal のみ）：**オフ**（既定、生成中のみ固定） / **自動**（`QUANTEEZE_WIRED_GB=auto`：モデル読み込み時から Metal 推奨作業領域までワイヤード固定し、初回リクエスト前のメモリ圧縮を抑制。GPU アイドル時は約 30 秒で macOS が解放）
    - **PLE n-gram 表**（PLE n-gram table）：**自動** / **SSD** / **Memory**
    - **MTP 投機デコード**（MTP speculative decoding）：**自動** / **オン（完全一致）** / **On (fast)** / **オフ**
    - **発熱による減速**（Thermal throttle、macOS のみ）：**静か** / **標準** / **全速**
 5. **アプリをつなぐ**（Connect an app）
-   OpenAI 互換 URL・Anthropic 互換 URL・Claude Code 用コマンド・`curl` 例が表示され、**コピー**（Copy）ボタンでそのままコピーできます。
+   OpenAI 互換 URL・Anthropic 互換 URL・Claude Code / Codex CLI 用コマンド・`curl` 例が表示され、**コピー**（Copy）ボタンでそのままコピーできます。
 
-### 7. Claude Code や他のアプリからつなぐ
+### 7. Claude Code・Codex CLI や他のアプリからつなぐ
 
 サーバーは **OpenAI 互換 API** と **Anthropic 互換 API** の両方を同じポートで待ち受けています。
 
@@ -95,7 +118,7 @@ Web UI は上から順番に使っていきます。ブラウザの言語設定�
 |---|---|---|
 | OpenAI Chat Completions（`/v1/chat/completions`） | `http://127.0.0.1:8765/v1` | OpenAI SDK、KAME、各種 OpenAI 互換アプリ |
 | Anthropic Messages（`/v1/messages`） | `http://127.0.0.1:8765` | Claude Code、Anthropic SDK |
-| OpenAI Responses（`/v1/responses`） | `http://127.0.0.1:8765/v1` | Responses API 対応クライアント |
+| OpenAI Responses（`/v1/responses`） | `http://127.0.0.1:8765/v1` | Codex CLI、Responses API 対応クライアント |
 
 - **モデル名と API キーは何でも構いません**：クライアント側で `local` や `claude-...` などどんな名前を指定しても、現在 Web UI（または起動オプション）で配信中のモデルが応答します。API キーも `--api-key` を付けて起動しない限り任意の文字列で通ります。
 - **思考を使うエージェントでは `--enable-thinking` を付けて起動します**（付けない場合、クライアントが明示指定しない限り既定の思考モードはオフになります）。
@@ -114,6 +137,40 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8765 ANTHROPIC_AUTH_TOKEN=local claude
 
 > README のクイックスタートに従って Quanteeze を起動して。モデルは LM Studio や Hugging Face キャッシュにあるものを使い、無ければダウンロード前にサイズを教えて。起動したら、Web UI の `#token=` 付き URL を `#token=` まで含めてそのまま教えて。
 
+**Codex（OpenAI Codex CLI・デスクトップアプリ）**
+
+`~/.codex/config.toml` に Responses API（`/v1/responses`）のプロバイダ設定とプロファイルを足します（`requires_openai_auth = false` が既定／明示により OpenAI ログイン不要で動作し、ChatGPT OAuth トークンがローカル／LAN サーバーへ誤送信されるのも防げます）。
+
+```toml
+[model_providers.quanteeze]
+name = "Quanteeze"
+base_url = "http://127.0.0.1:8765/v1"
+wire_api = "responses"
+requires_openai_auth = false
+stream_idle_timeout_ms = 7200000   # 長いプロンプトの読み込みや思考で切れないように（既定は 5 分）
+
+[profiles.local]
+model_provider = "quanteeze"
+model = "local"
+```
+
+- **CLI**：`codex --profile local` で、このサーバーを使います。
+- **デスクトップアプリ**：ファイルの先頭（最初の `[...]` より前）に次の 2 行を書くと、このサーバーを使います（既存の `model = ...` の行があればコメントアウトし、元に戻すときはこの 2 行を消します）。
+
+  ```toml
+  model_provider = "quanteeze"
+  model = "local"
+  ```
+
+- `--api-key` を付けて起動したときは、`[model_providers.quanteeze]` に `env_key = "MLX_VLM_SERVER_API_KEY"` などを足し、Codex を起動するシェルの環境変数にキーを入れてください。
+
+`config.toml` を書き換えずに CLI をワンライナーで起動する場合（Web UI の **アプリをつなぐ** からもコピーできます）：
+
+```bash
+codex -c model_provider="quanteeze" -c model="local" \
+  -c 'model_providers.quanteeze={name="Quanteeze",base_url="http://127.0.0.1:8765/v1",wire_api="responses",requires_openai_auth=false,stream_idle_timeout_ms=7200000}'
+```
+
 **Python（OpenAI SDK）**
 
 ```python
@@ -127,14 +184,17 @@ r = client.chat.completions.create(
 print(r.choices[0].message.content)
 ```
 
-**KAME（pydantic AI エージェント）**
+**[KAME](https://github.com/northriv/KAME)（pydantic AI エージェント）**
 
-`~/.kame_pyai.env` に次の 2 行を書くだけで接続できます（`local:` の後ろの名前は何でも構いません）。
+物性測定エージェント [KAME](https://github.com/northriv/KAME) は pydantic AI の `OpenAIChatModel`（`/v1/chat/completions`）で接続します。`~/.kame_pyai.env` に次の 2 行を書くだけで接続できます（`local:` の後ろの名前は何でも構いません）。
 
 ```bash
 KAME_PYAI_MODEL=local:quanteeze
 KAME_PYAI_LOCAL_URL=http://127.0.0.1:8765/v1
 ```
+
+- 思考付きでツール呼び出しを行う KAME エージェントには `--enable-thinking` 付きでの起動を推奨します（Quanteeze は既定の `MLX_VLM_MAX_TOKENS` を `32768` に引き上げて長い思考後のツール呼び出し途中切れを防ぎ、`quanteeze.toolcalls` / `quanteeze.reask` で未閉じ・不正なツール呼び出しも自動補正します）。
+- KAME をヘッドレス Docker（`kame-headless` イメージ）で動かす場合も、コンテナ内で動くのは KAME 本体と MCP サーバーだけで、pydantic AI エージェントはホストの Mac/Linux 上から `127.0.0.1:8765` へ直接接続します。モデルへの要求はコンテナを通らないため `--host 0.0.0.0` は不要です。
 
 **curl**
 
@@ -151,14 +211,14 @@ curl http://127.0.0.1:8765/v1/chat/completions \
 
 ### Linux（NVIDIA GPU）のクイックスタート
 
-Linux + NVIDIA GPU 環境でもそのまま動きます。MoE エキスパートが GPU の VRAM に入りきらない場合、Quanteeze は空いている**メインメモリ（ホスト RAM）**にエキスパートや PLE / Engram テーブル（PLE はピン留め対応）を自動キャッシュし（統合メモリ型 CUDA GPU や `/dev/shm` 上では重複確保を自動回避）、PCIe 経由で GPU に転送しながら推論できます。また `g++` が利用可能な AVX2 / AVX-512 ホストでは、`QUANTEEZE_CPU_EXPERTS=auto`（既定）により 1 トークンデコード時のホスト RAM 常駐ミスを GPU 常駐エキスパートと並行して GPU と同一 NUMA ノードの CPU 側（`cpuset` 内での自動譲歩＋バッチジョブ時は通常優先度）で自動計算します。また複数の GPU がある場合は `QUANTEEZE_PARALLEL=auto` で `qwen4_exp`・`glm5_next`・`deepseek_v41` を自動的にレイヤー並列で分割配信します。
+Linux + NVIDIA GPU 環境でもそのまま動きます。MoE エキスパートが GPU の VRAM に入りきらない場合、Quanteeze は空いている**メインメモリ（ホスト RAM）**にエキスパートや PLE / Engram テーブル（PLE はピン留め対応）を自動キャッシュし（統合メモリ型 CUDA GPU や `/dev/shm` 上では重複確保を自動回避）、PCIe 経由で GPU に転送しながら推論できます。また `g++` が利用可能な AVX2 / AVX-512 ホストでは、`QUANTEEZE_CPU_EXPERTS=auto`（既定）により 1〜8 リクエスト同時デコード時のホスト RAM 常駐ミスを GPU 常駐エキスパートと並行して GPU と同一 NUMA ノードの CPU 側（`cpuset` 内での自動譲歩＋バッチジョブ時は通常優先度）で自動計算します。また SSD からのオンデマンド読み込みではロックフリー・GIL フリーな C++ `pread` リーダー（`QUANTEEZE_DEMAND_READ_NATIVE=auto`）が並列実行します。さらに複数の GPU がある場合は `QUANTEEZE_PARALLEL=auto` で `qwen4_exp`・`glm5_next`・`deepseek_v41` を自動的にレイヤー並列で分割配信します。
 
 **1. 必要なもの**
 
 - **NVIDIA GPU** と CUDA 12 以上（CUDA 13 も選択可）に対応したドライバ（`nvidia-smi` 右上の CUDA Version で確認）
 - モデルを置く **SSD の空き容量** と、なるべく余裕のある **メインメモリ**
 - **[uv](https://docs.astral.sh/uv/)**：`curl -LsSf https://astral.sh/uv/install.sh | sh`
-- **（任意）`g++`**：初回起動時に同梱の [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) を自動ビルドしたい場合（例：Ubuntu/Debian なら `sudo apt install g++`）
+- **（任意）C++20 対応 `g++`（`g++` 10 以上）**：初回起動時に同梱の [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) と C++20 拡張群（[`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) ベースの STM オンデマンドエンジン `stm_core`、`native_reads`、AVX2/AVX-512 `cpu_experts`）を自動ビルドしたい場合（例：Ubuntu/Debian なら `sudo apt install g++`）
 
 **2. 取得とインストール**
 
@@ -274,7 +334,11 @@ Apple Silicon MacBook Pro（128 GB Unified Memory / M5 Max / 内蔵 SSD）で、
   - Unsloth 等の量子化済み混合精度 GGUF（層・射影ごとに異なる `IQ1_S` / `IQ1_M` / `IQ2_XXS` / `IQ2_XS` / `IQ2_S` / `IQ3_XXS` / `IQ4_XS` / `IQ4_NL` / `MXFP4` / `Q2_K`〜`Q6_K` / `Q4_0`〜`Q8_0` 等が混在するビルド）にも対応し、MLX 形式へ変換せず ggml 生ブロックのままメモリ保持・SSD オンデマンド読み込み（`QUANTEEZE_FROM_SSD_GB`）・CUDA 環境でのホスト RAM キャッシュ（`QUANTEEZE_HOST_EXPERTS_GB`）に対応し、Metal / CUDA 融合カーネル（`gguf_qmv`）で直接実行できます。
 - **メモリ保持とオンデマンド SSD / ホスト RAM ストリーミングの自動切り替え**
   - 利用可能な作業領域（`QUANTEEZE_MEMORY_RESERVE` を差し引いた余裕）にエキスパートが収まる場合はすべてメモリに保持します。
-  - 収まらない場合は自動で **オンデマンド SSD ストリーミング**（`QUANTEEZE_FROM_SSD_GB`）へ切り替わり、メモリ内 LRU スロットバンク、省メモリな 1 レイヤーずつのプリフィル（`QUANTEEZE_PREFILL_LAYERS`、`QUANTEEZE_DEMAND_PROMPT_GB`）、および CUDA 環境でのホスト RAM キャッシュ（`QUANTEEZE_HOST_EXPERTS_GB`）を組み合わせて実行します。
+  - 収まらない場合は自動で **オンデマンド SSD ストリーミング**（`QUANTEEZE_FROM_SSD_GB`）へ切り替わり、メモリ内 LRU スロットバンク、省メモリな 1 レイヤーずつのプリフィル（`QUANTEEZE_PREFILL_LAYERS`、`QUANTEEZE_DEMAND_PROMPT_GB`、`QUANTEEZE_PROMPT_MOE_TOKENS`）、および CUDA 環境でのホスト RAM キャッシュ（`QUANTEEZE_HOST_EXPERTS_GB`）を組み合わせて実行します。
+- **ロックフリー C++20 STM オンデマンド配信エンジンと並行リクエスト調停（[`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm)、`QUANTEEZE_DEMAND_STM=auto`）**
+  - [KAME](https://github.com/northriv/KAME) の TLA+ / GenMC（RC11）形式検証済みロックフリー Software Transactional Memory（`Transactional::Node` / `Snapshot` / `Transaction`、タグ付きポインタ CAS 参照カウント `atomic_shared_ptr` / `local_shared_ptr`、および macOS `__ulock_wait` / Linux `futex` による mutex レス待機 `XWaitCell` — [arXiv:2608.12024](https://arxiv.org/abs/2608.12024)）を搭載しています。
+  - レイヤーごとのスロット配置表、GPU 実行中パスのスロット保護リース、およびロックフリー C++ `pread` プール（`native_reads`、`QUANTEEZE_DEMAND_READ_NATIVE=auto`）による非同期 SSD ランダーを、Python GIL を握らず **O(1) スナップショット読み取り＋CAS コミット** で制御します。
+  - `QUANTEEZE_REQUEST_THREADS` > 1 で複数リクエストを専用ワーカー＋独立 MLX ストリームで並行実行する際は、STM `TurnNode`（`QUANTEEZE_PROMPT_DECODE_TURNS=on`）がプロンプト処理とデコード間の GPU ターンを最古到着順に調停しつつデコード同士は自由にオーバーラップさせ、競合時はプリフィルを `QUANTEEZE_PROMPT_CONTENDED_TOKENS`（既定 `512`）トークン窓へ分割します。
 - **PLE・Engram・Vision・トークン埋め込みの SSD オフロード（`QUANTEEZE_COMPACT`）**
   - **PLE / Engram テーブル（`QUANTEEZE_NGRAM_SSD`）**：数十 GB 規模の Per-Layer Embedding や DeepSeek V4.1 Engram テーブルを `madvise(MADV_WILLNEED)`、マルチスレッド先読み、クロスレイヤー非同期プリフェッチ、または CUDA ピン留めホストメモリを用いて行単位で参照します。
   - **Vision tower・トークン埋め込み（`QUANTEEZE_VISION_SSD`、`QUANTEEZE_EMBED_SSD`）**：画像エンコード時だけ Vision ブロックを `mmap` で順次読み込み、非共有トークン埋め込みも行単位で `mmap` 参照することで、マルチモーダル機能を保ったまま 1〜1.5 GB のメモリをエキスパート用に空けます。
@@ -285,11 +349,12 @@ Apple Silicon MacBook Pro（128 GB Unified Memory / M5 Max / 内蔵 SSD）で、
   - チェックポイント付属の MTP ヘッドや DeepSeek V4.1 の信頼度ゲート付き DSpark ヘッドで複数トークンを先読みし、1 トークンずつのデコードとビット一致する `QUANTEEZE_MTP_EXACT=bits`、またはより高速な `distribution` モードで検証します。
 - **マルチ GPU レイヤー並列（`QUANTEEZE_PARALLEL`）**
   - 単一 GPU に収まらないチェックポイント（`qwen4_exp`・`glm5_next`・`deepseek_v41`）を、`QUANTEEZE_BITS` や `--experts-gguf` のサイズ縮減および実際の GPU 空き VRAM に応じて複数 GPU へ自動でレイヤー分割します（`QUANTEEZE_PARALLEL=auto`）。
-- **省 RSS・ロックフリーのホストプールアロケータ（[kamepoolalloc](https://github.com/northriv/kamepoolalloc)、`QUANTEEZE_ALLOCATOR`）**
-  - 同梱の [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)（`rss-zero-loss` ブランチ）を macOS（`DYLD_INSERT_LIBRARIES`）および Linux（`LD_PRELOAD`）で自動ビルド・プリロードします。
-  - 小〜中サイズのホスト割り当て（`16 B .. 32 KiB`）をロックフリーなスレッドごとのフリーリストから遅延 1 ページ確保で供給して未接触ページの RSS 上昇を抑え、SSD 読み込み用の一時スライスバッファ（`32 KiB .. 32 MiB`）を再利用して `mmap`/`munmap` のオーバーヘッドを減らし、モデル切り替えやメモリ回収時に自動でトリムします。
-- **運用向けガード機構**
-  - メモリ上限キーパー（`QUANTEEZE_KEEP_GB`）、CUDA 未使用プール解放（`QUANTEEZE_GPU_FREE_GB`）、メモリ残量を考慮したバッチ受入制御（`QUANTEEZE_ADMIT_SHARE`、`QUANTEEZE_ADMIT_AHEAD`）、AES-256-GCM 暗号化プレフィックスキャッシュ（`QUANTEEZE_APC_ENCRYPT`）、macOS 発熱スロットリング（`QUANTEEZE_THROTTLE_AT`）、繰り返しループ停止（`QUANTEEZE_LOOPS`）、DSML ツール呼び出し検証と自動再試行（`QUANTEEZE_REASK`）。
+- **省 RSS・ロックフリー 4 階層ホストプールアロケータ（[`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)、`QUANTEEZE_ALLOCATOR=auto`）**
+  - 同梱の [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)（v1.4.0 / `rss-zero-loss`、TLA+ / GenMC 形式検証済み）を macOS（Mach-O `__DATA,__interpose` + `DYLD_INSERT_LIBRARIES`）および Linux（ELF strong symbols + `LD_PRELOAD`）で自動ビルド・プリロードします。
+  - **4 階層設計**：スレッドごとのバケット群（`1 B .. 32 KiB`）・専用チャンク（`32 KiB .. 4 MiB`）・L1/L2 リサイクルキャッシュ付き大規模 `mmap`（`4 .. 32 MiB`）・超大規模 `mmap`（`> 32 MiB`）を一つの解放パスで扱い、`kamestm` と共通の `atomic_smart_ptr.h` により終了スレッドの孤立チャンクもロックフリー回収します。
+  - オンデマンド L1 バンド開通・ページ単位の遅延プレフィルにより未接触ページの RSS 上昇を抑え、SSD 読み込み用の一時スライスバッファを再利用して `mmap`/`munmap` のオーバーヘッドを削減し、モデル切り替えやメモリ回収時に自動でトリムします。
+- **運用・実行ガード機構**
+  - MLX コマンドバッファサイズ（`MLX_MAX_OPS_PER_BUFFER`、`MLX_MAX_MB_PER_BUFFER`）および NVIDIA GPU ごとの CUDA Graph / PTX キャッシュ（`MLX_PTX_CACHE_DIR`）の自動設定、macOS Metal ワイヤードメモリ固定（`QUANTEEZE_WIRED_GB`）、メモリ上限キーパー（`QUANTEEZE_KEEP_GB`）、CUDA 未使用プール解放（`QUANTEEZE_GPU_FREE_GB`）、メモリ残量を考慮したバッチ受入制御（`QUANTEEZE_ADMIT_SHARE`、`QUANTEEZE_ADMIT_AHEAD`）、AES-256-GCM 暗号化プレフィックスキャッシュ（`QUANTEEZE_APC_ENCRYPT`）、macOS 発熱スロットリング（`QUANTEEZE_THROTTLE_AT`）、繰り返しループ停止（`QUANTEEZE_LOOPS`）、DSML ツール呼び出し検証と自動再試行（`QUANTEEZE_REASK`）。
 
 ---
 
@@ -325,16 +390,21 @@ uv run python -m quanteeze.variables --markdown
 | `QUANTEEZE_FROM_SSD_GB` | 未設定 | エキスパートを SSD からオンデマンド読み込みし、メモリに保持する容量 GB（`auto` は空き容量に合わせる）。 |
 | `QUANTEEZE_LOAD_WHOLE` | 未設定 | `on` で空き容量に関わらず全重みをメモリへ読み込む。 |
 | `QUANTEEZE_HOST_EXPERTS_GB` | `auto` | CUDA 環境でホスト RAM に保持するエキスパート容量 GB（MLX safetensors / `--experts-gguf` 両対応）。統合メモリ型 GPU や `/dev/shm` 上では自動無効化。 |
-| `QUANTEEZE_CPU_EXPERTS` | `auto` | `HostCopy` 常駐の 1 トークンデコードミスを PCIe 転送せず CPU で並行計算する（`auto` / `on` / `off`、`cpuset` 内の他プロセス負荷に応じて自動譲歩）。 |
+| `QUANTEEZE_CPU_EXPERTS` | `auto` | `HostCopy` 常駐のデコード（`B=1..8`）ミスを PCIe 転送せず CPU で並行計算する（`auto` / `on` / `off`、`cpuset` 内の他プロセス負荷に応じて自動譲歩）。 |
 | `QUANTEEZE_PREFILL_LAYERS` | `16384` | SSD ストリーミング時、この長さ以下のプロンプトを 1 レイヤーずつプリフィル処理する。 |
+| `QUANTEEZE_PROMPT_MOE_TOKENS` | `2048` | CUDA の 1 レイヤーずつプリフィル時、ビット一致検証済みの 512 トークン塊を MoE パスあたりこのトークン数までまとめて実行する（`off` または `0` で無効）。 |
 | `QUANTEEZE_DEMAND_PROMPT_GB` | `2` | オンデマンドプリフィル時に一時的な GPU メモリへまとめて読むエキスパートの上限 GB。 |
 | `QUANTEEZE_READ_THREADS` | `auto` | オンデマンド読込に使うスレッド数（`auto`: ローカル SSD では 4、Lustre/GPFS/NFS 等では 16）。 |
+| `QUANTEEZE_DEMAND_READ_NATIVE` | `auto` | オンデマンド SSD 読込のロックフリー C++ `pread` プール（`auto`: 自動ビルド＋バイト一致照合 / `off`: Python プール）。 |
+| `QUANTEEZE_DEMAND_STM` | `auto` | 同梱 [`kamestm`](src/quanteeze/vendor/kamepoolalloc/README.md) ベースの C++20 STM 配置・パスリーストラッキング・ランダーエンジン（`auto`: macOS / CUDA の対応環境で有効化し非対応時は静かに Python へフォールバック / `on` / `shadow` / `off`）。 |
+| `QUANTEEZE_NATIVE` | `on` | C++20 nanobind ネイティブ拡張を自動コンパイル・読み込みする（`off` で純 Python フォールバック、キャッシュ先は `QUANTEEZE_CACHE_DIR` 既定 `~/.cache/quanteeze`）。 |
 
 ### メモリ・オフロード・ハードウェア保護
 
 | 変数 | 既定値 | 説明 |
 |---|---|---|
-| `QUANTEEZE_ALLOCATOR` | `auto` | 同梱 [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)（`rss-zero-loss`）の自動ビルド・プリロード（`auto` / `on` / `off`）。 |
+| `QUANTEEZE_ALLOCATOR` | `auto` | 同梱 [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)（v1.4.0 / `rss-zero-loss`）の自動ビルド・プリロード（`auto` / `on` / `off`）。 |
+| `QUANTEEZE_WIRED_GB` | `0` | モデル読み込み時から MLX メモリをワイヤード固定する上限 GB（`0` / `off`: 生成中のみ mlx-vlm が固定、`auto`: Metal 推奨作業領域をロード時から固定。Metal 環境専用）。 |
 | `QUANTEEZE_MEMORY_RESERVE` | `0.3` | KV キャッシュや推論用バッファのために GPU/Metal 作業領域から差し引いておく割合。 |
 | `QUANTEEZE_CPU_THREADS` | `auto` | CPU エキスパート計算のワーカースレッド数（`auto`: GPU 直結 NUMA ノードの物理コア数から予約コアを除き上限 24 で各物理コアに固定）。 |
 | `QUANTEEZE_CPU_PRIORITY` | `auto` | CPU エキスパートワーカーの優先度（`auto`: SLURM/PBS 等バッチジョブ時は `normal`・それ以外は `idle`、`idle` / `nice` / `normal` / `wake`）。 |
@@ -343,7 +413,7 @@ uv run python -m quanteeze.variables --markdown
 | `QUANTEEZE_COMPACT` | `off` | `on` で `NGRAM_SSD=on`、`VISION_SSD=on`、`EMBED_SSD=on`、`V41_READS_IMAGES=ssd`、`MTP=off` を一括有効化しエキスパート用メモリを最大化（`QUANTEEZE_COMPACT_KEEP` で個別に除外可能）。 |
 | `QUANTEEZE_NGRAM_SSD` | `auto` | PLE / Engram n-gram テーブルの SSD 行単位ストリーミング（`auto` / `on` / `off`）。 |
 | `QUANTEEZE_HOST_NGRAM_GB` | `auto` | CUDA 環境でホスト RAM に常駐させる n-gram テーブル容量 GB。 |
-| `QUANTEEZE_VISION_SSD` | `off` | 画像エンコード時のみ Vision tower を `mmap` でブロック単位に読み込む。 |
+| `QUANTEEZE_VISION_SSD` | `auto` | 画像エンコード時のみ Vision tower を `mmap` でブロック単位に読み込む（`auto`: 全エキスパートが入り切らない時のみ SSD ストリーミング、ネットワーク FS 上では保持 / `on` / `off`）。 |
 | `QUANTEEZE_EMBED_SSD` | `off` | 非共有トークン埋め込みを `mmap` で行単位に読み込む。 |
 | `QUANTEEZE_APC_ENCRYPT` | `on` | ディスク上のプレフィックスキャッシュ（APC）を AES-256-GCM で暗号化保護する（`on` / `off`）。 |
 | `QUANTEEZE_KEEP_GB` | `auto` | メモリキーパーが維持するサーバー総メモリ上限 GB（`off` で無効）。 |
@@ -363,6 +433,9 @@ uv run python -m quanteeze.variables --markdown
 | `QUANTEEZE_LOOPS` | `on` | 繰り返しループに陥った生成を自動検出して停止する。 |
 | `QUANTEEZE_REASK` | `2` | DSML ツール呼び出しが不正な場合に `temperature=1.0` で自動再試行する回数。 |
 | `QUANTEEZE_CONTROL_TOKEN` | 自動生成 | Web UI / 管理 API 用トークン（既定は `~/.quanteeze/control-token` を使用、設定保存先は `QUANTEEZE_SETTINGS` の `~/.quanteeze/settings.json`）。 |
+| `QUANTEEZE_REQUEST_THREADS` | `1` | リクエストごとに専用ワーカー＋独立 MLX ストリームで並行実行する最大スレッド数（`QUANTEEZE_REQUEST_THREADS_ANY` / `QUANTEEZE_REQUEST_THREADS_DRAFT_TOGETHER` で細部制御）。 |
+| `QUANTEEZE_PROMPT_DECODE_TURNS` | `on` | `QUANTEEZE_REQUEST_THREADS` > 1 かつ C++ STM 稼働時、プロンプト処理とデコード間の GPU ターンを最古到着順に調停しつつデコード同士を重ねて実行する（`off` で調停なし）。 |
+| `QUANTEEZE_PROMPT_CONTENDED_TOKENS` | `512` | プリフィルチャンクの最大トークン数（常時）および `QUANTEEZE_PROMPT_DECODE_TURNS` 有効時の競合 MoE 窓サイズ。 |
 
 ---
 
@@ -378,6 +451,47 @@ uv run --extra cuda pytest
 
 ---
 
+## 引用（Citing）
+
+Quanteeze は物性測定プラットフォーム **[KAME](https://github.com/northriv/KAME)** から切り出された、形式検証済みロックフリー Software Transactional Memory ライブラリ **[`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm)**（`Transactional::Node` / `Snapshot` / `Transaction`・`atomic_shared_ptr`・`XWaitCell`）および 4 階層ロックフリー・プールアロケータ **[`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)** を組み込んでいます。
+
+- **`kamestm`（Lock-Free Software Transactional Memory）**：  
+  K. Kitagawa, *"Formally Verified Lock-Free Software Transactional Memory for Scientific Measurement"*, [arXiv:2608.12024](https://arxiv.org/abs/2608.12024) (2026), DOI: [`10.48550/arXiv.2608.12024`](https://doi.org/10.48550/arXiv.2608.12024) ([`northriv/KAME/kamestm`](https://github.com/northriv/KAME/tree/master/kamestm))
+- **`kamepoolalloc`（Four-Tier Lock-Free Pool Allocator）**：  
+  K. Kitagawa, *"`kamepoolalloc`: A Lock-Free, Per-Thread, Four-Tier Pool Allocator"* ([`northriv/kamepoolalloc`](https://github.com/northriv/kamepoolalloc) · [`northriv/KAME/kamepoolalloc`](https://github.com/northriv/KAME/tree/master/kamepoolalloc))
+- **KAME**：  
+  *"KAME: AI-Assisted Automation Program for Physical Property Measurements"* ([`northriv/KAME`](https://github.com/northriv/KAME))
+
+```bibtex
+@misc{kitagawa2026kamestm,
+  title         = {Formally Verified Lock-Free Software Transactional Memory
+                   for Scientific Measurement},
+  author        = {Kitagawa, Kentaro},
+  year          = {2026},
+  eprint        = {2608.12024},
+  archivePrefix = {arXiv},
+  primaryClass  = {cond-mat.other},
+  doi           = {10.48550/arXiv.2608.12024},
+  url           = {https://arxiv.org/abs/2608.12024}
+}
+
+@misc{kitagawa2026kamepoolalloc,
+  title        = {kamepoolalloc: A Lock-Free, Per-Thread, Four-Tier Pool Allocator},
+  author       = {Kitagawa, Kentaro},
+  year         = {2026},
+  howpublished = {\url{https://github.com/northriv/kamepoolalloc}}
+}
+
+@misc{kitagawa2026quanteeze,
+  title        = {Quanteeze: Fast Uniform Quantization and On-Demand {MoE} Serving on {Apple} Silicon and {CUDA}},
+  author       = {Kitagawa, Kentaro},
+  year         = {2026},
+  howpublished = {\url{https://github.com/northriv/Quanteeze}}
+}
+```
+
+---
+
 ## ライセンス（License）
 
 Copyright (C) 2026 Kentaro Kitagawa.
@@ -387,7 +501,9 @@ Quanteeze is dual-licensed under your choice of either:
 - **GNU General Public License, version 2 only** (`GPL-2.0-only`) — see [LICENSE-GPL-2.0](LICENSE-GPL-2.0), OR
 - **PolyForm Shield License 1.0.0** (`LicenseRef-PolyForm-Shield-1.0.0`) — see [LICENSE-POLYFORM-SHIELD](LICENSE-POLYFORM-SHIELD).
 
-See [LICENSE](LICENSE) for full details. Third-party components under `src/quanteeze/vendor/deepseek_v4/`, `src/quanteeze/vendor/deepseek_v41/`, and `src/quanteeze/iq_grids.py` retain their original MIT License notices. Bundled [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) sources under `src/quanteeze/vendor/kamepoolalloc/` (Copyright (C) 2002–2026 Kentaro Kitagawa) are dual-licensed under `Apache-2.0 OR GPL-2.0-or-later`.
+See [LICENSE](LICENSE) for full details. Third-party components under `src/quanteeze/vendor/deepseek_v4/`, `src/quanteeze/vendor/deepseek_v41/`, and `src/quanteeze/iq_grids.py` retain their original MIT License notices. Bundled [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) and [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) sources under [`src/quanteeze/vendor/kamepoolalloc/`](src/quanteeze/vendor/kamepoolalloc/README.md) (Copyright (C) 2002–2026 Kentaro Kitagawa) are dual-licensed under `Apache-2.0 OR GPL-2.0-or-later` (see [`LICENSE-APACHE-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0) and [`LICENSE-GPL-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0)).
+
+Quanteeze distributes no model weights; users are responsible for complying with each model's own license (including any MaaS / service-offering terms when binding beyond `127.0.0.1` via `--host`).
 
 ---
 

@@ -87,6 +87,8 @@ class Admission:
         maximum tokens each may generate."""
         if pending <= 0 or free_rows <= 0:
             return 0
+        if guards.HOLD_INTAKE[0]:
+            return 0 if busy else 1
         most = min(self.most, pending, free_rows)
         if self.per_token is None:
             n, tokens = 0, 0
@@ -184,6 +186,8 @@ def install(generator_cls, admission):
     step_next = generator_cls._next
 
     def _next(self, **kwargs):
+        if self.__dict__.get('_quanteeze_worker'):
+            return step_next(self, **kwargs)
         own = self.__dict__.setdefault('_quanteeze_rows', self.prefill_batch_size)
         pending = len(self._unprocessed_sequences)
         now = _decoding(self._generation_batch) if self._prompt_batch is None else None

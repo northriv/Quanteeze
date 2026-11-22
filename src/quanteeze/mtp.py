@@ -28,16 +28,21 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from . import requant
+from . import requant, variables
 
 ACTIVE = [None]                       # (drafter, kind) once enabled
 CHUNK = 32                            # experts lowered at a time
-BLOCKS = {'glm5_next': 2,             # QUANTEEZE_MTP_BLOCK=auto: the block a round, by the target's model type
-          'qwen4_exp': 2,
-          'deepseek_v41': 6}          # DSpark: up to five drafts, as many as its confidence gate keeps
+BLOCKS = {'glm5_next': 2,             # QUANTEEZE_MTP_BLOCK=auto: the block a round, by the target's model type;
+          'deepseek_v41': 6}          # Flash-Next (qwen4_exp) leaves runtime_block_size unset for adaptive depth (4 / DFlash2: 5)
+OVERRIDE_BLOCK = [None]               # runtime draft_block_size override when requested block > configured depth
+DFLASH2_REPOS = {
+    'qwen4_exp': 'incoai/Qwen3.8-Flash-Next-DFlash2',
+    'qwen3_5': 'z-lab/Qwen3.8-27B-DFlash2',
+}
 VERIFIED = ('glm5_next', 'qwen4_exp',
             'deepseek_v41')
-SLOWER_IN_MEMORY = ('qwen4_exp',)     # not enabled under auto once every expert is in memory
+SLOWER_IN_MEMORY = ()                 # not enabled under auto once every expert is in memory
+SLOWER_IN_MEMORY_CUDA = ('qwen4_exp',)   # not enabled on CUDA once every expert is in memory
 SLOWER_IN_MEMORY_WHY = ('its rounds cost more than the tokens they win with every expert in memory; '
                         'on demand from SSD, where the reads wait, it drafts')
 GATHER_MS = 2000                      # requests gathered before a drafting batch starts (MLX_VLM_SPEC_BATCH_COALESCE_MS
@@ -82,8 +87,85 @@ def auto(path, kind):
 
 
 def pays_in_memory(kind):
-    """Whether QUANTEEZE_MTP=auto drafts for model type `kind` once every expert is in memory."""
-    return kind not in SLOWER_IN_MEMORY
+    """Whether QUANTEEZE_MTP=auto drafts for model type `kind` once every expert is in memory:
+    not those of SLOWER_IN_MEMORY, nor on CUDA those of SLOWER_IN_MEMORY_CUDA."""
+    if kind in SLOWER_IN_MEMORY:
+        return False
+    return mx.metal.is_available() or kind not in SLOWER_IN_MEMORY_CUDA
+
+
+def _local_external(repo):
+    """Return local checkpoint path for `repo` if present in model roots or HF cache, else `repo`."""
+    from . import home
+    expanded = Path(repo).expanduser()
+    if expanded.is_dir():
+        return str(expanded.resolve())
+    for root in home.model_roots():
+        candidate = root / repo
+        if candidate.is_dir() and (candidate / 'config.json').is_file() and any(candidate.glob('*.safetensors')):
+            return str(candidate)
+    snap = home.hub() / f'models--{repo.replace("/", "--")}' / 'snapshots'
+    if snap.is_dir():
+        snaps = sorted(
+            (p.parent for p in snap.glob('*/config.json') if any(p.parent.glob('*.safetensors'))),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if snaps:
+            return str(snaps[-1])
+    return repo
+
+
+def resolve_external(path, kind):
+    """Return external drafter source (`repo` or path) for `QUANTEEZE_DRAFTER` / `QUANTEEZE_MTP=dflash2`, else None."""
+    del path
+    explicit = (variables.get('QUANTEEZE_DRAFTER') or '').strip()
+    if explicit and explicit.lower() not in ('off', 'none'):
+        target = DFLASH2_REPOS.get(kind) if explicit.lower() == 'dflash2' else explicit
+        return None if not target else _local_external(target)
+    mode = (variables.get('QUANTEEZE_MTP') or 'auto').strip().lower()
+    if mode == 'dflash2':
+        target = DFLASH2_REPOS.get(kind)
+        return None if not target else _local_external(target)
+    return None
+
+
+def _quantize_dense_drafter(drafter, bits):
+    """Quantize dense Linear/Embedding projections of a standalone drafter to `max(4, bits)` when unquantized."""
+    import mlx.nn as nn
+    if bits is None or switches(drafter):
+        return
+    if any(getattr(m, 'bits', None) is not None for _, m in drafter.named_modules()):
+        return
+    eff_bits = max(4, int(bits))
+    nn.quantize(
+        drafter,
+        group_size=64,
+        bits=eff_bits,
+        class_predicate=lambda p, m: (
+            hasattr(m, 'to_quantized')
+            and getattr(m, 'weight', None) is not None
+            and m.weight.ndim == 2
+            and m.weight.shape[-1] % 64 == 0
+        ),
+    )
+
+
+def load_external(source, bits=2, target_model=None):
+    """Load an external DFlash/DFlash2/MTP drafter checkpoint `source` and pair it for speculative serving."""
+    from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
+    drafter, kind = load_drafter(str(source))
+    if hasattr(drafter, 'candidate_selector'):
+        # DFlash2DraftModel inherits DFlashDraftModel.draft_block_greedy, which bypasses CandidateSelector.select.
+        object.__setattr__(drafter, 'draft_block_greedy', drafter.draft_block)
+    if target_model is not None:
+        validate_drafter_compatibility(target_model, drafter, kind)
+    if switches(drafter) and bits is not None:
+        lower(drafter, bits)
+    else:
+        _quantize_dense_drafter(drafter, bits)
+    mx.eval(drafter.parameters())
+    filter_caches(drafter)
+    return drafter, kind
 
 
 def load(path, bits=2):
@@ -184,10 +266,36 @@ def filter_caches(drafter):
 
 
 def set_block(drafter, block):
-    """Every round verifies `block` tokens, the bonus and block - 1 drafts, as far as the drafter's
-    configured depth allows (mlx-vlm's runtime_block_size; a server's --draft-block-size still
-    goes first)."""
-    drafter.config.runtime_block_size = int(block)
+    """Set target verify block length for `drafter`, returning the effective block length used at runtime.
+
+    For `DFlash`/`DFlash2`/`DSpark` drafters, clamps `runtime_block_size` to `[2, config.block_size]`.
+    For autoregressive MTP drafters whose `block` exceeds `config.block_size` (e.g., `block=4` on 1-layer
+    `Qwen4ExpMTPDraftModel` whose `config.block_size == 2`), keeps `runtime_block_size = None` and passes
+    `block` through `OVERRIDE_BLOCK` (`_get_draft_block_size_from_env`) so `mlx_vlm` uses it as an upper
+    bound instead of clamping to `min(config.block_size, runtime_block_size)`.
+    """
+    want = int(block)
+    cfg = getattr(drafter, 'config', None)
+    configured = getattr(cfg, 'block_size', None)
+    mtype = str(getattr(cfg, 'model_type', '')).lower()
+    is_block_drafter = (
+        'dflash' in mtype
+        or 'dspark' in mtype
+        or hasattr(drafter, 'candidate_selector')
+        or hasattr(cfg, 'target_layer_ids')
+    )
+    if is_block_drafter:
+        eff = max(2, want) if configured is None else max(2, min(want, int(configured)))
+        cfg.runtime_block_size = eff
+        OVERRIDE_BLOCK[0] = None
+        return eff
+    if configured is not None and want > int(configured):
+        OVERRIDE_BLOCK[0] = want
+        cfg.runtime_block_size = None
+        return want
+    OVERRIDE_BLOCK[0] = None
+    cfg.runtime_block_size = want
+    return want
 
 
 def block_for(setting, model_type):
@@ -264,10 +372,12 @@ def install(generator_cls):
     import os
     import time
 
+    from mlx_vlm import server as _server
     from mlx_vlm.server import generation
 
     from . import stream
     timeout, coalesce = generation.get_token_queue_timeout, generation.get_speculative_batch_coalesce_s
+    block_fn = getattr(generation, '_get_draft_block_size_from_env', None)
 
     def token_queue_timeout():
         return WAIT_S if ACTIVE[0] is not None else timeout()
@@ -277,10 +387,22 @@ def install(generator_cls):
             return coalesce()
         burst = _COMING['burst']
         return GATHER_MS / 1000 if burst is not None and time.monotonic() - burst <= BURST_S else 0.0
+
+    def draft_block_size():
+        env = block_fn() if callable(block_fn) else None
+        if env is not None:
+            return env
+        return OVERRIDE_BLOCK[0] if ACTIVE[0] is not None else None
+
     if not getattr(timeout, 'quanteeze', False):                  # once, however often installed
         token_queue_timeout.quanteeze = True
         generation.get_token_queue_timeout = token_queue_timeout
         generation.get_speculative_batch_coalesce_s = speculative_batch_coalesce_s
+    if callable(block_fn) and not getattr(block_fn, 'quanteeze', False):
+        draft_block_size.quanteeze = True
+        generation._get_draft_block_size_from_env = draft_block_size
+        if hasattr(_server, '_get_draft_block_size_from_env'):
+            _server._get_draft_block_size_from_env = draft_block_size
     for name, at in (('draft_model', 0), ('draft_kind', 1)):
         own = '_quanteeze_' + name
 
@@ -331,6 +453,20 @@ def enable(drafter, kind='mtp'):
 
 def disable():
     ACTIVE[0] = None
+    OVERRIDE_BLOCK[0] = None
+
+
+def label_of(drafter):
+    """Short UI/log label for `drafter` ('DFlash2', 'DSpark', or 'MTP')."""
+    from . import dspark
+    if isinstance(drafter, dspark.Drafter):
+        return 'DSpark'
+    name = type(drafter).__name__
+    if 'DFlash2' in name:
+        return 'DFlash2'
+    if 'DFlash' in name:
+        return 'DFlash'
+    return 'MTP'
 
 
 def summary(drafter):
@@ -338,7 +474,7 @@ def summary(drafter):
     rounds = int(getattr(drafter, 'speculative_total_rounds', 0))
     drafted = int(getattr(drafter, 'speculative_total_drafted', 0))
     accepted = float(getattr(drafter, 'speculative_total_accepted', 0.0))
-    return dict(rounds=rounds, drafted=drafted, accepted=int(round(accepted)),
+    return dict(label=label_of(drafter), rounds=rounds, drafted=drafted, accepted=int(round(accepted)),
                 acceptance=round(accepted / drafted, 4) if drafted else None,
                 tokens_a_round=round(1 + accepted / rounds, 3) if rounds else None)
 
@@ -515,7 +651,15 @@ def gate_said(drafter):
 
 
 def bits_of(drafter):
-    """The routed experts' bits."""
+    """The routed experts' bits (or dense quantized bits / floating dtype when dense)."""
     bits = sorted({getattr(s, p).bits for s in switches(drafter) for p in ('gate_proj', 'up_proj', 'down_proj')})
-    return str(bits[0]) if bits else '?'
+    if bits:
+        return str(bits[0])
+    qbits = sorted({int(m.bits) for _, m in drafter.named_modules() if getattr(m, 'bits', None) is not None})
+    if qbits:
+        return '/'.join(str(b) for b in qbits)
+    for _, arr in _leaves(drafter.parameters()):
+        if mx.issubdtype(arr.dtype, mx.floating):
+            return {mx.bfloat16: 'bf16', mx.float16: 'fp16', mx.float32: 'fp32'}.get(arr.dtype, str(arr.dtype))
+    return '?'
 

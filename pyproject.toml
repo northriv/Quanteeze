@@ -12,6 +12,7 @@ dependencies = [
     "mlx==0.32.4",
     "mlx-lm==0.32.2",
     "mlx-vlm==0.7.9",
+    "nanobind==3.1.0",
     "numpy>=2",
 ]
 

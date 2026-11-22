@@ -23,11 +23,13 @@ from mlx_vlm.models.deepseek_v41.language import (Compressor, DeepseekV41Block, 
                                                    make_identity_pre_mix)
 from mlx_vlm.models.deepseek_v41.fakequant import fake_quant_fp8_ue8m0
 
+from .. import per_thread
 
 
-def images_mode():
-    """`QUANTEEZE_V41_READS_IMAGES`: `'on'`, `'ssd'`, or `'off'`.  When `'on'` and
-    `QUANTEEZE_VISION_SSD=on`, returns `'ssd'`."""
+
+def images_mode(path=None, model=None):
+    """`QUANTEEZE_V41_READS_IMAGES`: `'on'`, `'ssd'`, or `'off'`.  When `'on'`, follows
+    `QUANTEEZE_VISION_SSD` (`auto` -> `'ssd'` when `path`/`model` is tight on local storage)."""
     from .. import variables, vision_ssd
     raw = (variables.get('QUANTEEZE_V41_READS_IMAGES') or 'on').strip().lower()
     if raw in ('0', 'false', 'no', 'off'):
@@ -35,7 +37,7 @@ def images_mode():
     if raw == 'ssd':
         return 'ssd'
     if raw in ('1', 'true', 'yes', 'on'):
-        return 'ssd' if vision_ssd.enabled() else 'on'
+        return 'ssd' if vision_ssd.enabled(path, model=model) else 'on'
     raise ValueError(f'QUANTEEZE_V41_READS_IMAGES: on, ssd, or off, not {raw}')
 
 
@@ -49,14 +51,27 @@ def prepare(model, path):
     as it is (quanteeze.dspark reads it), the language model given the taps its drafter reads
     (speculative()).  The token embedding is read from the checkpoint a row at a time
     (ssd_embedding()), and the vision tower let go (no_vision()) where QUANTEEZE_V41_READS_IMAGES
-    is off or streamed block by block from SSD where `images_mode() == 'ssd'`.  Returns whether it changed anything."""
+    is off or streamed block by block from SSD where `images_mode(path, model=model) == 'ssd'`.
+    Returns whether it changed anything."""
     from mlx_vlm.models.switch_layers import SwitchLinear
     from .. import q2_experts
     speculative(model)                                  # the DSpark drafter's taps, inert without it
     done = bf16_head(model)                             # first: its float32 (2.6 GB) freed before fp8_projections
     done = fp8_projections(model, path) > 0 or done
     done = ssd_embedding(model, path) or done
-    mode_img = images_mode()
+    blocks = [(i, layer.ffn) for i, layer in enumerate(getattr(model, 'language_model', model).layers)
+              if isinstance(getattr(layer, 'ffn', None), DeepseekV41MoE)]
+    if blocks and isinstance(blocks[0][1].switch_mlp.gate_proj, SwitchLinear):
+        try:
+            mode = q2_experts.Checkpoint(path).mode(blocks[0][0], 'gate_proj')
+        except Exception:
+            mode = None
+        if mode == 'mxfp4':
+            nn.quantize(model, group_size=32, bits=4, mode='mxfp4',
+                        class_predicate=lambda p, m: hasattr(m, 'to_quantized') and 'switch_mlp' in p
+                        and 'mtp' not in p.split('.'))
+            done = True
+    mode_img = images_mode(path, model=model)
     if mode_img == 'off':
         done = no_vision(model) or done
     else:
@@ -65,20 +80,7 @@ def prepare(model, path):
         vision_block_by_block()
         if mode_img == 'ssd':
             done = (vision_from_ssd(model, path) > 0) or done
-    blocks = [(i, layer.ffn) for i, layer in enumerate(getattr(model, 'language_model', model).layers)
-              if isinstance(getattr(layer, 'ffn', None), DeepseekV41MoE)]
-    if not blocks or not isinstance(blocks[0][1].switch_mlp.gate_proj, SwitchLinear):
-        return done
-    try:
-        mode = q2_experts.Checkpoint(path).mode(blocks[0][0], 'gate_proj')
-    except Exception:
-        return done
-    if mode != 'mxfp4':
-        return done
-    nn.quantize(model, group_size=32, bits=4, mode='mxfp4',
-                class_predicate=lambda p, m: hasattr(m, 'to_quantized') and 'switch_mlp' in p
-                and 'mtp' not in p.split('.'))
-    return True
+    return done
 
 
 HEAD_ROWS = 8                   # rows of logits a call reads the head once for, in BF16Head's kernel:
@@ -608,7 +610,6 @@ class RowGate(DeepseekV41MoEGate):
 
 
 _BOUND = threading.local()       # the positions a compression source's call rotates stay below this
-_WINDOWS = {}                    # (start, tokens, window): what _window_part indexes by, made once a pass
 
 
 def _window_indices(start_pos, seqlen, win):
@@ -617,11 +618,12 @@ def _window_indices(start_pos, seqlen, win):
     of its last min(seqlen, win) tokens), and the mask of the positions each query sees -- the
     values mlx-vlm's _window_part makes with arange in each of the 40 layers, made here once a
     pass and shared by them (35 graph nodes a layer were 4 on a decode)."""
+    windows = per_thread.PASS.memo.setdefault('v41_windows', {})
     key = (start_pos, seqlen, win)
-    got = _WINDOWS.get(key)
+    got = windows.get(key)
     if got is None:
-        if len(_WINDOWS) > 16:
-            _WINDOWS.clear()
+        if len(windows) > 16:
+            windows.clear()
         import numpy as np
         base, end = max(0, start_pos - win + 1), start_pos + seqlen
         history = mx.array(np.arange(base, start_pos, dtype=np.int32) % win) if start_pos else None
@@ -634,7 +636,7 @@ def _window_indices(start_pos, seqlen, win):
             at += n
         positions, queries = np.arange(base, end), np.arange(start_pos, end)
         valid = (positions[None, :] <= queries[:, None]) & (positions[None, :] > queries[:, None] - win)
-        got = _WINDOWS[key] = (history, writes, mx.array(valid[None, None]))
+        got = windows[key] = (history, writes, mx.array(valid[None, None]))
     return got
 
 
@@ -898,6 +900,11 @@ def _attention(self, cache, x):
     if not _verifying(x):
         if not self.compress_ratio and x.shape[1] > ATTENTION_PIECE:
             return _window_attention(self, cache, x)
+        if x.shape[1] <= ATTENTION_PIECE and type(self)._window_part is _window_part:
+            from .. import v41_attention
+            y = v41_attention.attend(self, cache, x, _window_indices)
+            if y is not None:
+                return y
         return _ATTENTION[0](self, cache, x)
     start_pos = cache.offset
     batch, seqlen = x.shape[0], x.shape[1]
@@ -927,7 +934,7 @@ def _attention(self, cache, x):
     return self.wo_b(fake_quant_fp8_ue8m0(out))
 
 
-VERIFYING = [False]             # within a verify pass (SpecLanguageModel, speculative_verify=True)
+VERIFYING = per_thread.Field('exact')  # within a verify pass (SpecLanguageModel, speculative_verify=True)
 
 
 class ExactLinear(nn.QuantizedLinear):
@@ -1034,13 +1041,15 @@ def install(model):
     The MTP head's blocks are left alone."""
     from mlx_vlm.models.deepseek_v41 import language
 
-    from .. import cuda_v41, expert_qmv, prefill
+    from .. import cuda_engram, cuda_kernels, cuda_v41, expert_qmv, prefill
     prefill.split(DeepseekV41Block, _before_moe, _from_moe)
     v41_blocks = [m for n, m in model.named_modules() if type(m) is DeepseekV41Block and 'mtp' not in n.split('.')]
     lm = getattr(model, 'language_model', model)
     split_in_one = cuda_v41.choose(v41_blocks, lm.config) if hasattr(lm, 'config') else False
     cuda_v41.install_fp8()
     cuda_v41.install_prepost()
+    if cuda_kernels.available():
+        cuda_engram.install()
     language.hc_mix_coeffs = hc_mix_kernel if split_in_one else hc_mix_rows   # DeepseekV41Block.hc_mixes reads it by name
     expert_qmv.ROWS[0] = EXPERT_ROWS
     if _COMPRESS_PART[0] is None:
@@ -1086,8 +1095,24 @@ class SpecCompressor(Compressor):
 
 def _host_ids(engram):
     """Whether `engram`'s offloaded embedding accepts host `np.ndarray` row IDs (`QUANTEEZE_ENGRAM_IDS_ONCE`)."""
-    from .. import variables
-    return getattr(getattr(engram, 'embed', None), '_arrays', None) is not None and not variables.off('QUANTEEZE_ENGRAM_IDS_ONCE')
+    from .. import cuda_engram, cuda_kernels, cuda_ple, variables
+    embed = getattr(engram, 'embed', None)
+    if getattr(embed, '_arrays', None) is None or variables.off('QUANTEEZE_ENGRAM_IDS_ONCE'):
+        return False
+    if cuda_ple.ON[0] and cuda_kernels.available() and cuda_engram._table(embed) is not None:
+        return False
+    return True
+
+
+def _one_row(entry, seqlen):
+    """Single unpadded cache row backing a pass of `seqlen` tokens, or None if batched/padded."""
+    rows = getattr(entry, 'rows', None)
+    if rows is None:
+        return entry
+    if len(rows) != 1:
+        return None
+    bounds = getattr(entry, '_bounds', None)
+    return rows[0] if bounds is not None and tuple(bounds(0, seqlen)) == (0, seqlen) else None
 
 
 def _engram_ahead(lm, hashes, now, ids=None):
@@ -1097,9 +1122,11 @@ def _engram_ahead(lm, hashes, now, ids=None):
         return
     for j in range(now + 1, len(lm.layers)):
         nxt = getattr(lm.layers[j], 'engram', None)
-        if nxt is not None and getattr(getattr(nxt, 'embed', None), '_arrays', None) is not None:
-            row_ids = ids[:, :, nxt.layer_hash_index, :] if ids is not None else np.asarray(hashes[:, :, nxt.layer_hash_index, :])
-            ngram_prefetch.ahead(nxt.embed, row_ids)
+        arrays = getattr(getattr(nxt, 'embed', None), '_arrays', None)
+        if isinstance(arrays, dict):
+            if any(isinstance(a, np.memmap) for a in arrays.values()):
+                row_ids = ids[:, :, nxt.layer_hash_index, :] if ids is not None else np.asarray(hashes[:, :, nxt.layer_hash_index, :])
+                ngram_prefetch.ahead(nxt.embed, row_ids)
             return
 
 
@@ -1119,33 +1146,46 @@ class SpecLanguageModel(LanguageModel):
 
     def __call__(self, input_ids=None, inputs_embeds=None, cache=None, image_mask=None, engram_hashes=None,
                  inputs=None, n_to_process=None, capture_layer_ids=None, speculative_verify=False, **kwargs):
-        object.__setattr__(self, '_quanteeze_entry', weakref.ref(cache[0]) if cache else None)
+        per_thread.PASS.entries[id(self)] = weakref.ref(cache[0]) if cache else None
         entry = cache[0] if cache else DeepseekV41Cache(len(self.layers))
         if input_ids is None:
             input_ids = inputs
-        if image_mask is None and input_ids is not None and not getattr(self, '_quanteeze_text', False):
+        image_from_ids = image_mask is None and input_ids is not None and not getattr(self, '_quanteeze_text', False)
+        if image_from_ids:
             image_mask = input_ids == self.config.image_token_id
         engram_mask = None if image_mask is None else ~image_mask
         h = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         batch, seqlen = h.shape[0], h.shape[1]
         state = self._snapshot(entry, seqlen) if speculative_verify else None
         h = mx.broadcast_to(h[..., None, :], (batch, seqlen, self.config.hc_mult, self.config.hidden_size))
+        host_hashes = None
         if engram_hashes is None and input_ids is not None:
             self._ensure_engram_hash()
             if self.engram_hash is not None:
+                own = _one_row(entry, seqlen)
+                before = getattr(own, 'engram', None) if own is not None else None
                 engram_hashes = entry.map(lambda row, ids, mask: self.engram_hash(ids, row.offset, row, token_mask=mask),
                                           input_ids, engram_mask)
+                if own is not None and (image_mask is None or image_from_ids):
+                    from .. import engram_host
+                    host_hashes = engram_host.pass_hashes(
+                        self.engram_hash, own, input_ids, before, engram_hashes,
+                        self.config.image_token_id if image_from_ids else None,
+                    )
         capture = set(capture_layer_ids or ())
         captured = []
         pre_mix = make_identity_pre_mix(batch, seqlen, self.config.hc_mult)
+        per_thread.PASS.verify = bool(speculative_verify)
         VERIFYING[0] = bool(speculative_verify) and EXACT[0]    # its projections as decodes (ExactLinear)
         one_decode = seqlen == 1 and not speculative_verify
-        host_engram_ids = None
+        host_engram_ids = host_hashes
+        if one_decode and host_engram_ids is not None:
+            _engram_ahead(self, engram_hashes, -1, host_engram_ids)
         try:
             for i, layer in enumerate(self.layers):
-                if layer.engram is not None and engram_hashes is not None:
+                if layer.engram is not None and (engram_hashes is not None or host_engram_ids is not None):
                     idx = layer.engram.layer_hash_index
-                    if one_decode and _host_ids(layer.engram):
+                    if (host_engram_ids is not None or one_decode) and _host_ids(layer.engram):
                         if host_engram_ids is None:
                             host_engram_ids = np.asarray(engram_hashes)
                         h = layer.engram(h, host_engram_ids[:, :, idx, :], engram_mask)
@@ -1158,7 +1198,7 @@ class SpecLanguageModel(LanguageModel):
                     captured.append(tail.astype(mx.float32).mean(axis=2).astype(h.dtype))
                 h, pre_mix = layer(h, pre_mix, image_mask, entry)
         finally:
-            VERIFYING[0] = False
+            VERIFYING[0] = per_thread.PASS.verify = False
             for row, _ in state or ():
                 row._quanteeze_spec = None
         h = DeepseekV41Block.hc_pre(h, pre_mix)
@@ -1182,7 +1222,7 @@ class SpecLanguageModel(LanguageModel):
 
     def entry(self):
         """The cache entry of the last pass, while it lives (a drafter reads the offset there)."""
-        ref = getattr(self, '_quanteeze_entry', None)
+        ref = per_thread.PASS.entries.get(id(self))
         return None if ref is None else ref()
 
     @staticmethod
