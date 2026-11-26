@@ -6,6 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>quanteeze</title>
+<link rel="icon" type="image/png" href="/quanteeze/icon.png">
 <!-- quanteeze.home serves this page through quanteeze.control; it holds no secret: the token comes in the URL's fragment. -->
 <style>
 :root {
@@ -62,6 +63,15 @@
   --good: #0ca30c;
 }
 * { box-sizing: border-box; }
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-logo { height: 42px; width: auto; display: block; }
+.brand-logo-dark { display: none; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .brand-logo-light { display: none; }
+  :root:not([data-theme="light"]) .brand-logo-dark { display: block; }
+}
+:root[data-theme="dark"] .brand-logo-light { display: none; }
+:root[data-theme="dark"] .brand-logo-dark { display: block; }
 body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
 main { max-width: 980px; margin: 0 auto; padding: 24px 16px 80px; }
 h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
@@ -129,8 +139,11 @@ textarea { width: 100%; font: inherit; color: var(--ink); background: var(--page
 <main>
   <div class="bar">
     <div class="grow">
-      <h1>quanteeze</h1>
-      <div class="sub">Choose a model and its expert precision on <span class="here">this Mac</span>.</div>
+      <div class="brand">
+        <img class="brand-logo brand-logo-light" src="/quanteeze/logo-light.png" alt="Quanteeze">
+        <img class="brand-logo brand-logo-dark" src="/quanteeze/logo-dark.png" alt="Quanteeze">
+      </div>
+      <div class="sub" style="margin-top:4px">Choose a model and its expert precision on <span class="here">this Mac</span>.</div>
     </div>
     <a href="#" id="lang-switch" lang="ja">日本語</a>
     <a href="/quanteeze/settings">Every setting →</a>

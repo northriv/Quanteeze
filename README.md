@@ -1,4 +1,10 @@
-# Quanteeze
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/quanteeze-logo-dark-transparent.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/quanteeze-logo-transparent.png">
+    <img alt="Quanteeze" src="docs/images/quanteeze-logo-transparent.png" width="340">
+  </picture>
+</h1>
 
 [![License: GPL-2.0 OR PolyForm-Shield](https://img.shields.io/badge/License-GPL--2.0_OR_PolyForm--Shield-blue.svg)](#license)
 [![GitHub](https://img.shields.io/badge/GitHub-northriv%2FQuanteeze-181717?logo=github)](https://github.com/northriv/Quanteeze)

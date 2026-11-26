@@ -40,6 +40,10 @@ for commercial purposes must omit src/quanteeze/vendor/nemotron_image/ (and
 not use the optional Nemotron-Labs-Image integration); the rest of Quanteeze
 is unaffected. No model weights are distributed in this repository.
 
+The Quanteeze logo assets under docs/images/ and src/quanteeze/assets/
+incorporate lettering set in Montserrat Black, licensed under the SIL Open
+Font License, Version 1.1 — see docs/images/Montserrat-OFL.txt.
+
 Portions of the Metal and CUDA kernel ports in src/quanteeze/verify_qmv.py,
 src/quanteeze/expert_qmv.py, src/quanteeze/linear_attn.py, and
 src/quanteeze/cuda_qmv.py are adapted from Apple MLX

@@ -183,6 +183,29 @@ def test_control_and_home_pages_and_presets(tmp_path, monkeypatch):
     assert 'quanteeze settings' in control.PAGE.read_text(encoding='utf-8')
     assert 'quanteeze' in control.HOME.read_text(encoding='utf-8')
 
+    import asyncio
+
+    async def noop(scope, receive, send):
+        raise AssertionError('unexpected fallthrough')
+
+    async def recv():
+        return {'type': 'http.request', 'body': b'', 'more_body': False}
+
+    mw = control.Middleware(noop, 'secret-token-for-test-only-0123456789')
+    for route, (fname, kind) in control.ASSET_ROUTES.items():
+        asset = control.ASSETS / fname
+        assert asset.is_file()
+        assert asset.read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+        sent = []
+
+        async def send(msg):
+            sent.append(msg)
+
+        asyncio.run(mw({'type': 'http', 'method': 'GET', 'path': route, 'headers': []}, recv, send))
+        assert sent[0]['status'] == 200
+        assert (b'content-type', kind) in sent[0]['headers']
+        assert sent[1]['body'].startswith(b'\x89PNG\r\n\x1a\n')
+
 
 def test_phases_and_live_status():
     """`phases` tracks reading, thinking, answering, tok/s, TTFT, and request counts; `home.live` returns them."""

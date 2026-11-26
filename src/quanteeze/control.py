@@ -82,6 +82,12 @@ GUARDED = {
 TOKEN_FILE = Path.home() / '.quanteeze' / 'control-token'
 PAGE = Path(__file__).with_name('control.html')
 HOME = Path(__file__).with_name('home.html')
+ASSETS = Path(__file__).with_name('assets')
+ASSET_ROUTES = {
+    '/quanteeze/icon.png': ('quanteeze-icon-512.png', b'image/png'),
+    '/quanteeze/logo-light.png': ('quanteeze-logo-transparent.png', b'image/png'),
+    '/quanteeze/logo-dark.png': ('quanteeze-logo-dark-transparent.png', b'image/png'),
+}
 LONGEST = 4096
 WORDS = ('auto', 'off')
 OWN = ('QUANTEEZE_CONTROL_TOKEN', 'QUANTEEZE_SETTINGS', 'QUANTEEZE_APC_DISK_SECRET')
@@ -605,6 +611,9 @@ class Middleware:
             return await _reply(send, 200, self.page.read_bytes(), b'text/html; charset=utf-8')
         if method == 'GET' and path in (HOME_PATH, HOME_PATH.rstrip('/')):
             return await _reply(send, 200, HOME.read_bytes(), b'text/html; charset=utf-8')
+        if method == 'GET' and path in ASSET_ROUTES:
+            fname, kind = ASSET_ROUTES[path]
+            return await _reply(send, 200, (ASSETS / fname).read_bytes(), kind)
         if method == 'POST' and path in GENERATING:
             return await self._generate(scope, receive, send)
         if (method, path) not in GUARDED:

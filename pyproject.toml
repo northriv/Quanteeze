@@ -69,6 +69,7 @@ testpaths = ["tests"]
 source-include = [
     "README.ja.md",
     "CITATION.cff",
+    "docs/images/**",
     "tests/**",
     "bench/**",
     "scripts/**",

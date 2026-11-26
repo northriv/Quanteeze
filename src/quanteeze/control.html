@@ -6,6 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>quanteeze settings</title>
+<link rel="icon" type="image/png" href="/quanteeze/icon.png">
 <!-- quanteeze.control serves this page; it holds no secret: the token comes in the URL's fragment. -->
 <style>
 :root {
@@ -59,6 +60,8 @@
   --good: #0ca30c;
 }
 * { box-sizing: border-box; }
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-icon { width: 32px; height: 32px; display: block; }
 body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
 main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 96px; }
 h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
@@ -100,7 +103,10 @@ label { color: var(--ink-2); }
 <main>
   <div class="bar">
     <div style="flex:1">
-      <h1>quanteeze settings</h1>
+      <div class="brand">
+        <img class="brand-icon" src="/quanteeze/icon.png" alt="">
+        <h1>quanteeze settings</h1>
+      </div>
       <div class="sub">The QUANTEEZE_* variables this server reads: a change is set at once and saved, and takes effect when the server next reads it.</div>
     </div>
     <a href="/quanteeze/">← Overview</a>
