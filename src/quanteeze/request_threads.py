@@ -176,14 +176,46 @@ def _decode_turn(prompting):
 
 
 def together_ok():
-    """Return True if concurrent request execution is currently safe to overlap."""
+    """Return True if concurrent request execution is currently safe to overlap (why_alone found nothing)."""
+    return why_alone() is None
+
+
+def why_alone():
+    """Why requests may not run at once now (together_ok's conditions, in words for the home page: state), or None."""
     from . import demand, kernel_checks, parallel
-    if parallel.size() > 1 or not kernel_checks.shared():
-        return False
+    if parallel.size() > 1:
+        return 'the model is split over several GPUs'
+    if not kernel_checks.shared():
+        return 'the C++ extension is not in use (QUANTEEZE_NATIVE=off, or it did not build)'
     live = list(demand._LIVE)
     if not live:
-        return bool(WHOLE[0] or _any())
-    return all(d._stm is not None and d._stm.started for d in live)
+        if WHOLE[0] or _any():
+            return None
+        return "the model is not loaded whole (its experts are a GGUF's)"
+    for d in live:
+        if d._stm is None:
+            why = getattr(d, '_stm_why', None)
+            return 'the C++ STM does not serve the on-demand reads' + (f' ({why})' if why else '')
+        if not d._stm.started:
+            return "the C++ STM starts at the first request's pass"
+    return None
+
+
+def state():
+    """For the home page (home.live): requests at once as set now ('set') and as the model's load read them
+    ('loaded': None before a load's loop began), why they go one at a time where they do (why_alone, or a drafter
+    that drafts with its request alone: drafts_alone), and the counts so far (STATS)."""
+    from . import mtp
+    set_now = max(1, variables.integer('QUANTEEZE_REQUEST_THREADS'))
+    loaded = _LOADED['threads']
+    why = None
+    if (loaded or set_now) > 1:
+        why = why_alone()
+        drafter = mtp.ACTIVE[0]
+        if why is None and drafter is not None and drafter[1] != 'dflash':
+            why = f'a drafter other than DFlash ({mtp.name(drafter[0])}) drafts with its request alone'
+    return {'set': set_now, 'loaded': loaded, 'why_alone': why, 'running': running(),
+            **{k: STATS[k] for k in ('together', 'alone', 'most_at_once')}}
 
 
 def drafts_alone(generator):

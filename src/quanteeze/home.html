@@ -236,6 +236,18 @@ textarea { width: 100%; font: inherit; color: var(--ink); background: var(--page
     </section>
 
     <section class="card">
+      <h2>Requests at once</h2>
+      <div class="bar">
+        <label for="request-threads">Requests served at once, at most</label><input type="text" id="request-threads" inputmode="numeric" style="width:5em" placeholder="1">
+        <button id="save-request-threads">Save</button>
+        <button id="request-threads-reload" hidden>Reload the model now</button>
+        <span id="request-threads-msg" class="note grow"></span>
+      </div>
+      <div id="request-threads-now" class="note" style="margin-top:8px"></div>
+      <p class="note">Above 1, each request runs on a thread of its own: its prompt, then its decode, while the others compute beside it (one prompt at a time). They run together only with the model loaded whole, or read on demand under the C++ STM; otherwise one at a time. 1: mlx-vlm's own loop, which takes several requests' rows in one pass. Read when the model is loaded (QUANTEEZE_REQUEST_THREADS).</p>
+    </section>
+
+    <section class="card">
       <h2>Connect an app</h2>
       <p class="note" id="connect-note"></p>
       <div id="connect-rows" class="list" style="margin-top:10px"></div>
@@ -401,6 +413,7 @@ function renderNow() {
     if (dStm && dStm.serving === true) parts.push('C++ STM');
   } else if (s.mode === 'in_memory') parts.push('all weights in memory');
   $('now-how').textContent = parts.join(' · ');
+  showRequestThreads(LIVE && LIVE.request_threads);
 
   const p = MODEL.progress, busy = MODEL.state === 'waiting' || MODEL.state === 'loading' || MODEL.state === 'unloading';
   $('start-btn').disabled = busy;
@@ -644,6 +657,7 @@ const GROUP_TITLES = {
 
 function renderPresets() {
   if (!PRESETS) return;
+  renderRequestThreads();
   const box = $('presets'); box.replaceChildren();
   const picked = CATALOG && CATALOG.models && CATALOG.models.find(x => x.path === pickedModel);
   const offered = (picked && picked.mtp && picked.mtp.drafters) || [];
@@ -972,6 +986,52 @@ function renderConnect(c) {
   }
 }
 
+// ---------------------------------------------------------------- requests at once (QUANTEEZE_REQUEST_THREADS)
+function renderRequestThreads() {
+  if (PRESETS && document.activeElement !== $('request-threads')) $('request-threads').value = PRESETS.request_threads || '';
+}
+function showRequestThreads(R) {              // home.live's request_threads: as the load read them, and why apart
+  const box = $('request-threads-now');
+  if (!R) { box.replaceChildren(); return; }
+  const lines = [];
+  if (R.loaded != null && R.loaded !== R.set) lines.push(`The model was loaded with ${R.loaded}; ${R.set} takes effect when it is next loaded.`);
+  const n = R.loaded ?? R.set;
+  if (n > 1 && R.why_alone) lines.push(`Up to ${n} at once, but one at a time now: ${R.why_alone}.`);
+  else if (n > 1) lines.push(`Up to ${n} at once.`);
+  else lines.push('One loop for every request (mlx-vlm’s).');
+  if (n > 1) lines.push(`Now ${R.running} running; at most ${R.most_at_once} at once so far.`);
+  box.className = 'note' + (n > 1 && R.why_alone ? ' err' : '');
+  box.replaceChildren(...lines.flatMap((s, i) => i ? [el('br'), s] : [s]));
+}
+$('save-request-threads').addEventListener('click', async () => {
+  const msg = $('request-threads-msg'), n = $('request-threads').value.trim();
+  if (n && !(/^\d+$/.test(n) && +n >= 1)) { msg.className = 'note err grow'; msg.textContent = 'A whole number, 1 or more.'; return; }
+  try {
+    const out = await call('PATCH', '/v1/quanteeze/settings', {values: {QUANTEEZE_REQUEST_THREADS: n}});
+    const bad = Object.entries(out.rejected || {});
+    const served = MODEL && MODEL.model;
+    msg.className = 'note grow ' + (bad.length ? 'err' : 'ok');
+    msg.textContent = bad.length ? bad.map(([, why]) => why).join('; ')
+      : served ? 'Saved. It takes effect when the model is next loaded.' : 'Saved. It takes effect when a model is loaded.';
+    $('request-threads-reload').hidden = !!bad.length || !served;
+    PRESETS = await call('GET', '/v1/quanteeze/home/presets');
+    renderRequestThreads();
+  } catch (e) { msg.className = 'note err grow'; msg.textContent = e.message; }
+});
+$('request-threads-reload').addEventListener('click', async () => {
+  if (!MODEL || !MODEL.model) return;
+  if (!confirm(`Load ${shortPath(MODEL.model)} again now, with the new number?`)) return;
+  const msg = $('request-threads-msg');
+  try {
+    MODEL = await call('POST', '/v1/quanteeze/model', {path: MODEL.model});
+    wasBusy = true;
+    $('request-threads-reload').hidden = true;
+    msg.textContent = 'Loading again…';
+    renderNow();
+    schedulePoll(800);
+  } catch (e) { msg.textContent = `Not loaded: ${e.message}`; }
+});
+
 // ---------------------------------------------------------------- init & adaptive live polling
 async function pollOnce() {
   if ($('app').hidden) return;
@@ -1135,6 +1195,15 @@ init();
     '(empty reply)': '（空の応答）',
     'Memory, PLE, MTP & heat': 'メモリ・PLE・MTP・発熱',
     'Saved at once; settings marked as load-time take effect the next time a model loads.': 'すぐに保存されます（読み込み時設定は次回モデル読み込みから有効）。',
+    'Requests at once': '同時に処理する要求', 'Requests served at once, at most': '同時に処理する要求の数（上限）', 'Save': '保存',
+    'Reload the model now': '今すぐモデルを読み込み直す',
+    "Above 1, each request runs on a thread of its own: its prompt, then its decode, while the others compute beside it (one prompt at a time). They run together only with the model loaded whole, or read on demand under the C++ STM; otherwise one at a time. 1: mlx-vlm's own loop, which takes several requests' rows in one pass. Read when the model is loaded (QUANTEEZE_REQUEST_THREADS).":
+      '2 以上では、要求を 1 本ずつ別のスレッドで処理します。プロンプト、続いてデコードを、ほかの要求の計算と並べて進めます（プロンプトは一度に 1 本）。同時に進むのは、モデルを丸ごと読み込んだときか、C++ の STM のもとでオンデマンドに読むときだけで、それ以外では 1 本ずつになります。1 では、mlx-vlm のループが、いくつかの要求の行を 1 回のパスでまとめて処理します。モデルを読み込むときに読みます（QUANTEEZE_REQUEST_THREADS）。',
+    'One loop for every request (mlx-vlm’s).': 'すべての要求を 1 つのループで処理しています（mlx-vlm のもの）。',
+    'A whole number, 1 or more.': '1 以上の整数を入れてください。',
+    'Loading again…': '読み込み直しています…',
+    'Saved. It takes effect when the model is next loaded.': '保存しました。次にモデルを読み込んだときから効きます。',
+    'Saved. It takes effect when a model is loaded.': '保存しました。モデルを読み込んだときから効きます。',
     'Memory reserve': 'メモリ確保枠',
     'more memory kept for long conversations and other apps (reserve 0.45)':
       '長い会話やほかのアプリのために、メモリを多めに空けておきます（確保枠 0.45）',
@@ -1211,7 +1280,20 @@ init();
     'No model loads until it ends.': '終わるまで、モデルは読み込めません。',
   };
 
+  const ALONE_JA = {                           // request_threads.why_alone's reasons
+    'the model is split over several GPUs': 'モデルを複数の GPU に分けています',
+    'the C++ extension is not in use (QUANTEEZE_NATIVE=off, or it did not build)': 'C++ の拡張を使っていません（QUANTEEZE_NATIVE=off か、作れなかった）',
+    "the model is not loaded whole (its experts are a GGUF's)": 'モデルを丸ごと読み込んでいません（エキスパートが GGUF のもの）',
+    'the C++ STM does not serve the on-demand reads': 'オンデマンドの読み込みを C++ の STM が受け持っていません',
+    "the C++ STM starts at the first request's pass": 'C++ の STM は最初の要求のパスで動き始めます',
+  };
   const PATTERNS = [
+    [/^The model was loaded with (\d+); (\d+) takes effect when it is next loaded\.$/, 'いまのモデルは $1 で読み込まれています。$2 は次に読み込んだときから効きます。'],
+    [/^Up to (\d+) at once, but one at a time now: (.+)\.$/, (m, n, why) => `最大 ${n} 本を同時に処理する設定ですが、いまは 1 本ずつです。理由：${ALONE_JA[why] || why
+      .replace(/^the C\+\+ STM does not serve the on-demand reads \((.+)\)$/, 'オンデマンドの読み込みを C++ の STM が受け持っていません（$1）')
+      .replace(/^a drafter other than DFlash \((.+)\) drafts with its request alone$/, 'DFlash 以外のドラフタ（$1）は、要求 1 本ずつで下書きします')}。`],
+    [/^Up to (\d+) at once\.$/, '最大 $1 本を同時に処理します。'],
+    [/^Now (\d+) running; at most (\d+) at once so far\.$/, 'いま $1 本を処理中。これまでの最大は同時に $2 本です。'],
     [/^(.+) tokens · (.+) tokens\/s · first token after (.+) s$/, '$1 トークン · $2 tok/s · 最初のトークンまで $3 秒'],
     [/^(.+) tokens · (.+) tokens\/s generating · first token after (.+) s(?: \((.+) prompt tokens read\))? · (.+) s in all$/,
       (m, tok, tps, ttft, pr, tot) => `${tok} トークン · 生成 ${tps} tok/s · 最初のトークンまで ${ttft} 秒${pr ? `（プロンプト ${pr} トークン読込）` : ''} · 合計 ${tot} 秒`],

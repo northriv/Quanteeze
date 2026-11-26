@@ -76,3 +76,31 @@ def test_lines_the_page_builds():
             ' で見つかったモデル（LM Studio か Hugging Face のキャッシュにあるもの）を選ぶか、Hugging Face から取得します。',
     }
     assert dict(zip(cases, swap(list(cases)))) == cases
+
+
+def test_requests_at_once_in_japanese():
+    """The Requests at once card: its own text, the lines showRequestThreads builds, and why_alone's reasons."""
+    import ast
+    from quanteeze import request_threads
+    tree = ast.parse(Path(request_threads.__file__).read_text(encoding='utf-8'))
+    why = next(f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == 'why_alone')
+    reasons = [r.value.value for r in ast.walk(why) if isinstance(r, ast.Return) and isinstance(r.value, ast.Constant)
+               and isinstance(r.value.value, str)]
+    reasons += [r.value.left.value + ' (a GGUF tier)' for r in ast.walk(why)
+                if isinstance(r, ast.Return) and isinstance(r.value, ast.BinOp)]
+    assert len(reasons) == 5
+    shown = ['Requests at once', 'Requests served at once, at most', 'Save', 'Reload the model now', 'A whole number, 1 or more.',
+             'One loop for every request (mlx-vlm’s).', 'Loading again…',
+             'Saved. It takes effect when the model is next loaded.', 'Saved. It takes effect when a model is loaded.',
+             'The model was loaded with 1; 3 takes effect when it is next loaded.', 'Up to 3 at once.',
+             'Now 2 running; at most 3 at once so far.',
+             'Up to 3 at once, but one at a time now: a drafter other than DFlash (MTP head) drafts with its request alone.']
+    shown += [f'Up to 2 at once, but one at a time now: {r}.' for r in reasons]
+    page = HTML.read_text(encoding='utf-8')
+    note = page[page.index('<p class="note">Above 1, each request'):].split('</p>')[0].removeprefix('<p class="note">')
+    shown.append(note)
+    out = swap(shown)
+    untranslated = [s for s, j in zip(shown, out) if not (j and japanese(j))]
+    assert untranslated == []
+    leftover = [j for j in out[-len(reasons) - 1:-1] if 'the ' in j]   # each reason in Japanese, not left in English
+    assert leftover == []

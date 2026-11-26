@@ -679,6 +679,7 @@ def presets():
         )
     out['loaded'] = control._LOADED[0] is not None
     out['sampling'] = {key: os.environ.get(name) or None for name, key in control.SAMPLING.items()}
+    out['request_threads'] = variables.get('QUANTEEZE_REQUEST_THREADS')    # requests at once: read at the next load
     return out
 
 
@@ -827,6 +828,9 @@ def live():
         out['mtp'] = dict(mtp.summary(drafter), drafter=mtp.name(drafter), kind=kind, bits=mtp.bits_of(drafter))
     out['model'] = control.chosen() or control.current()
     out['requests'] = phases.state(control._SWITCH['inflight'])
+    if control._LOADED[0] is not None:                   # requests at once: as the load read them, and why apart
+        from . import request_threads
+        out['request_threads'] = request_threads.state()
     return out
 
 

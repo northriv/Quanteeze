@@ -420,3 +420,62 @@ def test_whole_model_together_ok_and_wired_while_generating(monkeypatch):
     assert request_threads._WIRING['generating'] == 0
     assert wired_calls == [123456, 999]
     assert request_threads.STATS['wired'] == 1
+
+
+def test_why_alone_says_what_keeps_requests_apart_and_state_tells_the_page(monkeypatch):
+    """why_alone: together_ok's conditions in words for the home page, the first that fails; together_ok is that
+    none does.  state() adds a drafter that drafts with its request alone (drafts_alone), for the page alone."""
+    from quanteeze import kernel_checks, mtp
+    monkeypatch.setattr(parallel, 'size', lambda: 1)
+    monkeypatch.setattr(kernel_checks, 'shared', lambda: True)
+    monkeypatch.setattr(demand, '_LIVE', set())
+    monkeypatch.setattr(request_threads, 'WHOLE', [True])
+    monkeypatch.setattr(mtp, 'ACTIVE', [None])
+    assert request_threads.why_alone() is None and request_threads.together_ok()
+    monkeypatch.setattr(request_threads, 'WHOLE', [False])
+    monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS_ANY', 'off')
+    assert 'GGUF' in request_threads.why_alone() and not request_threads.together_ok()
+    class Reader:                                         # (demand._LIVE is a set)
+        _stm, _stm_why = None, 'a GGUF tier'
+    reader = Reader()
+    monkeypatch.setattr(demand, '_LIVE', {reader})
+    assert request_threads.why_alone() == 'the C++ STM does not serve the on-demand reads (a GGUF tier)'
+    reader._stm = SimpleNamespace(started=False)
+    assert request_threads.why_alone() == "the C++ STM starts at the first request's pass"
+    reader._stm.started = True
+    assert request_threads.why_alone() is None and request_threads.together_ok()
+    monkeypatch.setattr(kernel_checks, 'shared', lambda: False)
+    assert 'C++ extension' in request_threads.why_alone() and not request_threads.together_ok()
+    monkeypatch.setattr(kernel_checks, 'shared', lambda: True)
+    monkeypatch.setattr(parallel, 'size', lambda: 2)
+    assert 'several GPUs' in request_threads.why_alone() and not request_threads.together_ok()
+    monkeypatch.setattr(parallel, 'size', lambda: 1)
+
+    monkeypatch.setattr(request_threads, '_LOADED', dict(threads=3, any=False))   # as the load read it
+    monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS', '2')
+    s = request_threads.state()
+    assert s['set'] == 2 and s['loaded'] == 3 and s['why_alone'] is None
+    assert {'running', 'together', 'alone', 'most_at_once'} <= set(s)
+    monkeypatch.setattr(mtp, 'ACTIVE', [(object(), 'mtp')])
+    assert request_threads.state()['why_alone'] == 'a drafter other than DFlash (MTP head) drafts with its request alone'
+    monkeypatch.setattr(mtp, 'ACTIVE', [(object(), 'dflash')])
+    assert request_threads.state()['why_alone'] is None
+    monkeypatch.setattr(request_threads, '_LOADED', dict(threads=1, any=False))   # one loop: nothing to tell
+    monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS', '1')
+    monkeypatch.setattr(parallel, 'size', lambda: 2)
+    assert request_threads.state()['why_alone'] is None
+
+
+def test_the_home_page_gets_requests_at_once(monkeypatch):
+    """home.presets: QUANTEEZE_REQUEST_THREADS as set (read at the next load); home.live: state() once a model is
+    loaded, nothing before."""
+    from quanteeze import control, home
+    monkeypatch.delenv('QUANTEEZE_REQUEST_THREADS', raising=False)
+    assert home.presets()['request_threads'] == '1'                      # the default
+    monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS', '3')
+    assert home.presets()['request_threads'] == '3'
+    monkeypatch.setattr(control, '_LOADED', [None])
+    assert 'request_threads' not in home.live()
+    monkeypatch.setattr(control, '_LOADED', [object()])
+    monkeypatch.setattr(request_threads, 'state', lambda: {'set': 3, 'loaded': 1, 'why_alone': None})
+    assert home.live()['request_threads']['loaded'] == 1
