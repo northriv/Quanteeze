@@ -1068,9 +1068,13 @@ init();
 
   const JA = {
     'Every setting →': '詳細設定 →',
-    'Choose a model and its expert precision on': 'モデルとエキスパートの量子化精度を',
+    // the two sentences around <span class="here">this Mac</span>: Japanese puts the machine first
+    'Choose a model and its expert precision on': '',
     'this Mac': 'この Mac', 'this machine': 'このマシン',
-    '.': 'で選びます。',
+    '.': ' で使うモデルと、エキスパートの量子化精度を選びます。',
+    'Pick a checkpoint found on': '',
+    "(in LM Studio or Hugging Face's cache), or fetch one from Hugging Face.":
+      'で見つかったモデル（LM Studio か Hugging Face のキャッシュにあるもの）を選ぶか、Hugging Face から取得します。',
     'Token': 'トークン',
     'Control token': '管理トークン',
     'Use': '使う',
@@ -1107,6 +1111,7 @@ init();
     'Model & expert precision': 'モデルと量子化精度',
     'Fetch from Hugging Face: org/model-name': 'Hugging Face から取得: org/model-name',
     'Check size': 'サイズ確認',
+    'Hugging Face repository': 'Hugging Face のリポジトリ',
     'Routed expert precision': 'ルーティング・エキスパートの精度',
     'Checkpoint precision without re-quantizing': '再量子化せずチェックポイントの元の精度を使用',
     'Serve this model': 'このモデルを配信',
@@ -1131,8 +1136,21 @@ init();
     'Memory, PLE, MTP & heat': 'メモリ・PLE・MTP・発熱',
     'Saved at once; settings marked as load-time take effect the next time a model loads.': 'すぐに保存されます（読み込み時設定は次回モデル読み込みから有効）。',
     'Memory reserve': 'メモリ確保枠',
+    'more memory kept for long conversations and other apps (reserve 0.45)':
+      '長い会話やほかのアプリのために、メモリを多めに空けておきます（確保枠 0.45）',
+    'the default: three tenths of the working set kept free (reserve 0.30)':
+      '既定：作業領域の 10 分の 3 を空けておきます（確保枠 0.30）',
+    'more memory for the experts; long prompts and other apps have less room (reserve 0.15)':
+      'エキスパートにメモリを多く回します。長いプロンプトやほかのアプリの余裕は減ります（確保枠 0.15）',
     'Wired memory': 'メモリの固定',
     'PLE n-gram table': 'PLE n-gram 表',
+    'Memory': 'メモリ',
+    'the n-gram table read from the SSD where, held in memory, it would leave the experts less room than they take; held in memory where they fit whole beside it':
+      'n-gram 表をメモリに置くとエキスパートの場所が足りなくなるときは SSD から読み、エキスパートと並べて丸ごと収まるときはメモリに置きます',
+    'always read from the SSD row by row: its memory left to the experts':
+      'いつも SSD から行ごとに読みます。その分のメモリはエキスパートに回します',
+    'always held in memory beside the experts: no reads from the SSD':
+      'いつもエキスパートと並べてメモリに置きます。SSD からは読みません',
     'KV cache': 'KV キャッシュ',
     '8 bits': '8 ビット',
     "the default: the full attention layers' keys and values kept as the model computes them, 24.6 kB a token (1.7 GB at 70k tokens, 6.4 GB at 262k)":
@@ -1144,11 +1162,24 @@ init();
     "the full attention layers' keys and values at 8 bits in mlx-vlm's own cache, the last of them left at bfloat16: 0.56 of the memory (Qwen3.8-27B: 36.7 kB a token, 4.8 GB at 128k tokens). Not the same bits; on a Mac decode is 1-3% slower":
       'フルアテンション層のキーと値を mlx-vlm 自身のキャッシュで 8 ビット保持します（最終層のみ bfloat16 のまま：メモリ使用量は 0.56 倍、Qwen3.8-27B で 1トークン 36.7 kB・128k トークンで 4.8 GB）。ビット完全一致ではなく、Mac ではデコードが 1〜3% 遅くなります',
     'MTP speculative decoding': 'MTP 投機デコード',
+    "drafts tokens ahead with the model's own MTP / DSpark head where that pays here, verified bit for bit against single-token decode":
+      'モデル同梱の MTP / DSpark ヘッドで、このマシンで得になるときに先のトークンを下書きし、1 トークンずつのデコードとビット単位で一致するか確かめます',
+    "drafts with the model's own MTP head wherever it has one, verified bit for bit":
+      'モデルに MTP ヘッドがあればいつも下書きし、ビット単位で確かめます',
+    "drafts with the model's own MTP head, verifying tokens together in one multi-token pass":
+      'モデル同梱の MTP ヘッドで下書きし、複数のトークンを 1 回のパスでまとめて確かめます',
+    "one token a pass; the drafter head's 1-2 GB stay free":
+      '1 回のパスで 1 トークンずつ生成します。下書き用ヘッドの 1〜2 GB は空いたままです',
     'Speculative drafter': '下書き役（Drafter）',
     'MTP head': 'MTP ヘッド',
     'No drafter while MTP is Off.': 'MTP がオフの間は下書き役を使用しません。',
     'Downloaded drafter; it activates on the next model load.': '下書き役をダウンロードしました（次のモデル読み込みから有効になります）。',
     'Thermal throttle': '発熱による減速',
+    'slows down from the first warmth, so the fans stay low': '少し温まったところから減速し、ファンを静かに保ちます',
+    'the default: slows down once the machine reports heavy heat': '既定：マシンが強い発熱を知らせたら減速します',
+    'never slows down for heat (the machine still protects itself)': '発熱では減速しません（マシン自身の保護は働きます）',
+    'Only macOS tells quanteeze how hot it runs: here none of these slows it down.':
+      '発熱の度合いを quanteeze に知らせるのは macOS だけです。ここではどれを選んでも減速しません。',
     'Roomy': 'ゆったり', 'Standard': '標準', 'Most for experts': 'エキスパート最大',
     'Quiet': '静か', 'Full speed': '全速', 'Auto': '自動', 'SSD': 'SSD', 'Off': 'オフ', 'On': 'オン',
     'On (exact)': 'オン（完全一致）', 'On (fast)': 'オン（高速）',
@@ -1192,14 +1223,18 @@ init();
       (m, pk, ca, ws) => `最大 ${pk}${ca ? ` · キャッシュ ${ca}` : ''}${ws ? ` · 作業枠 ${ws} GB` : ''}`],
     [/^at most (.+) · keeps to (.+?)(?: · stops at (.+) GB)?$/,
       (m, pk, lim, st) => `最大 ${pk} · 目安 ${lim}${st ? ` · ${st} GB で停止` : ''}`],
-    [/^slows from (.+) · rested (.+) s$/, (m, lv, s) => `${JA[lv] || lv} から減速 · 休止計 ${s} 秒`],
+    [/^slows from (.+) · rested (.+) s$/, (m, lv, s) => `「${JA[lv] || lv}」以上で減速 · 休止計 ${s} 秒`],
     [/^Speculative decoding \((.+)\)$/, (m, k) => `投機デコード（${JA[k] || k}）`],
     [/^(.+) accepted$/, '$1 受理'],
     [/^(?:(.+?)(?:-bit)? · )?(.+) tokens a round · (.+) rounds$/,
       (m, b, tok, r) => `${b ? (/^\d/.test(b) ? `${b}ビット · ` : `${b} · `) : ''}1ラウンド ${tok} トークン · 計 ${r} ラウンド`],
     [/^(\d+) answered · (\d+) running now$/, '完了 $1 · 実行中 $2'],
     [/^(\d+) running$/, '実行中 $1'], [/^(\d+) recent$/, '直近 $1'], [/^(\d+) ended lately$/, '直近完了 $1'],
-    [/^(.+) in memory$/, 'メモリ内ヒット $1'],
+    // the on-demand SSD card's hit rate ("93.8% in memory"); not "… fits in memory" nor "… all weights in memory"
+    [/^([0-9.]+%) in memory$/, 'メモリ内ヒット $1'],
+    [/^(\d+)-bit stock$/, '元 $1 ビット'],
+    [/^(.+) is a dense model \((.+) GB\): all weights load at their checkpoint precision\.$/,
+      '$1 は密なモデル（$2 GB）です。すべての重みをチェックポイントの元の精度で読み込みます。'],
     [/^Ready — serving model(?: \((.+)s\))?\.$/, (m, s) => `準備完了 — 配信中${s ? `（${s}秒）` : ''}。`],
     [/^Original \((.+)-bit\)$/, '元の精度（$1 ビット）'],
     [/^(\d+) bits? \(least-squares\)$/, '$1 ビット（最小二乗）'],
@@ -1252,9 +1287,13 @@ init();
     [/([0-9,]+) landed/, 'C++配置 $1'],
     [/([0-9,]+) misses/, 'ミス $1'],
     [/([0-9.]+) s read/, '読込 $1 秒'],
+    ['Loading model… ', 'モデルを読み込み中… '],
     ['opening the checkpoint', 'チェックポイントを開いています'],
     ['reading the weights', '重みを読み込んでいます'],
     ['quantizing the experts', 'エキスパートを量子化しています'],
+    [/([0-9.]+)% · starting/, '$1% · 開始しています'],
+    [/ \(([0-9.]+ [GM]B) of ([0-9.]+ [GM]B)\)/, '（$2 中 $1）'],
+    [/ \(([0-9.]+) of ([0-9.]+) MoE layers\)/, '（MoE 層 $2 中 $1）'],
     ['thinking with ', '思考中：'],
     ['answering (', '回答中（'],
     ['calling a tool (', 'ツール呼出中（'],
@@ -1262,6 +1301,9 @@ init();
     [' · called a tool · ', ' · ツール呼出 · '],
     [' · cut at its token limit · ', ' · 最大トークン到達 · '],
     [' · cancelled · ', ' · キャンセル · '],
+    [' · ended in its thinking, with no answer and no call: the client may ask again · ',
+      ' · 思考のまま終了（回答もツール呼出もなし。クライアントが再要求することがあります） · '],
+    [' · stopped without saying it ended (an error?) · ', ' · 終わりを告げずに停止（エラー？） · '],
     ["the model's default effort", '既定の思考量'],
     ['no thinking', '思考なし'],
     [/ prompt tokens \((.+?) from the cache\)/, ' プロンプトトークン（キャッシュ $1）'],

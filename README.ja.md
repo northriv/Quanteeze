@@ -101,13 +101,23 @@ Web UI は上から順番に使っていきます。ブラウザの言語設定�
 1. **モデルと量子化精度**（Model & expert precision）
    このマシンで見つかったローカルモデルの一覧から使いたいモデルを選びます。まだ手元にないモデルを使う場合は、`org/model-name` を入力して **サイズ確認**（Check size）を押し、表示された合計ファイル数と容量（GB）を確認してから **Download ... GB** で取得できます。
    - **量子化されていない元の重み（`f32` / `bf16` / `f16`）の MLX 変換**：未量子化の `safetensors` チェックポイントには **`not quantized`** バッジが付きます。モデルを読み込んでいない状態であれば、**4 ビットに変換…** / **8 ビットに変換…** から使用ツール（`mlx-lm` または `mlx-vlm`）、保存先（LM Studio フォルダの隣または `~/.quanteeze/models`）、予想書き込みサイズ・空き容量を確認したうえで、リポジトリ付属コードを実行しない隔離プロセスで変換できます。
+
+   ![Web UI：モデルと量子化精度（LM Studio のフォルダで見つかったモデルの一覧）](docs/images/webui-models-ja.png)
 2. **ルーティング・エキスパートの精度**（Routed expert precision）
    MoE モデルを選ぶと、元の精度や各量子化形式（**4・3・2・1 ビット（最小二乗）**、**MXFP4 / Q3_K / Q2_K / IQ2_XS**）ごとに、エキスパートが使う容量と **メモリに収まる**（fits in memory）/ **SSD からオンデマンド読込**（streams from SSD）が表示されます。
    - **迷ったときの選び方**：まずは **メモリに収まる**（fits in memory）と表示される選択肢の中で一番ビット数の高いものを選ぶのがおすすめです（元の精度のままでも収まる場合は **元の精度** でそのまま高速に動きます）。メモリに入りきらないモデルを試したい場合は **SSD からオンデマンド読込** でもそのまま動きます。
+
+     下の例は 128 GB の Mac で `Qwen3.8-Flash-Next-MLX-8bit-MTP` を選んだところです。元の 8 ビットのエキスパート（135.9 GB）は SSD から読むことになるので、メモリに収まる中で一番ビット数の高い **4 ビット（最小二乗）** を選んでいます。
+
+     ![Web UI：ルーティング・エキスパートの精度（選択肢ごとのエキスパートの容量と、メモリに収まるか SSD から読むか）](docs/images/webui-precision-ja.png)
    - 選んだら **このモデルを配信**（Serve this model）を押します。読み込みの進捗や現在のメモリ・発熱・速度は、画面一番上の **いま配信中**（Serving now）にリアルタイムで表示されます（C++20 [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) エンジンでオンデマンド配信している場合は **`C++ STM`** のバッジも表示されます）。
+
+     ![Web UI：いま配信中（Qwen3.6-35B-A3B を元の 8 ビットで配信。メモリ、発熱、答えたリクエスト）](docs/images/webui-serving-ja.png)
    - **モデルの解放と再読み込み**（Unload / Load it again）：**いま配信中** の **モデルを解放**（Unload）を押すと、実行中のリクエスト完了後にモデルを解放してメモリを返します。再度 **もう一度読み込む**（Load it again）または別のモデルを読み込むまで生成リクエストは 503 で拒否されるため、接続中のクライアントにメモリを再確保させません。
 3. **質問してみる**（Try a prompt）
    ブラウザからそのままモデルに質問を送って、応答・生成速度（`tok/s`）・**思考の内容**（Its thinking）を確認できます（`Cmd+Enter` / `Ctrl+Enter` でも送信できます）。
+
+   ![Web UI：質問してみる（応答とトークン数・速度。思考の内容は折りたたみ）](docs/images/webui-try-prompt-ja.png)
 4. **メモリ・PLE・MTP・発熱**（Memory, PLE, MTP & heat）
    よく使う設定をワンクリックで切り替えられます。
    - **メモリ確保枠**（Memory reserve）：**ゆったり** / **標準** / **エキスパート最大**（Most experts）
@@ -117,8 +127,14 @@ Web UI は上から順番に使っていきます。ブラウザの言語設定�
    - **MTP 投機デコード**（MTP speculative decoding）：**自動** / **オン（完全一致）** / **On (fast)** / **オフ**
    - **下書き役（Drafter）**（Speculative drafter）：対応モデル選択時に **MTP ヘッド** / **DFlash2**（`QUANTEEZE_DRAFTER`）を切り替え、未保存の場合は **取得** ボタンからサイズ確認後にダウンロードできます（未取得・非対応時はモデル同梱ヘッドへ自動フォールバック）。
    - **発熱による減速**（Thermal throttle、macOS のみ）：**静か** / **標準** / **全速**
+
+   ![Web UI：メモリ・PLE・MTP・発熱（既定のプリセット）](docs/images/webui-presets-ja.png)
 5. **アプリをつなぐ**（Connect an app）
    OpenAI 互換 URL・Anthropic 互換 URL・Claude Code / Codex CLI 用コマンド・`curl` 例が表示され、**コピー**（Copy）ボタンでそのままコピーできます。
+
+**詳細設定 →**（Every setting →、`/quanteeze/settings`）には、すべての `QUANTEEZE_*` 変数がグループごとに、働き・既定値・サーバーが読むとき（起動時、モデルの読み込み時、リクエストごと）とともに並び、その場で設定できます（変更は `~/.quanteeze/settings.json` に保存されます）。**Model** のカードからは、再起動せずに別のモデルやエキスパートのビット数で読み込み直せます。このページは英語表示だけです。
+
+![Web UI：詳細設定（Model のカードと、Memory の最初の変数）](docs/images/webui-settings.png)
 
 ### 7. Claude Code・Codex CLI や他のアプリからつなぐ
 

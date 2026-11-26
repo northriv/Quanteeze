@@ -101,13 +101,23 @@ Work through the UI from top to bottom (switch between **English / 日本語** i
 1. **Model & expert precision**
    Pick a local checkpoint, or enter `org/model-name`, click **Check size**, verify file count and total GB, and click **Download ... GB**.
    - **Converting unquantized float weights (`f32` / `bf16` / `f16`)**: Unquantized `safetensors` checkpoints are badged **`not quantized`**. When no model is loaded, clicking **Convert to 4 bits…** or **Convert to 8 bits…** lets you inspect the tool (`mlx-lm` or `mlx-vlm`), output directory (beside LM Studio models or in `~/.quanteeze/models`), estimated size, and free space before converting in an isolated process without executing repository custom code.
+
+   ![Browser UI: Model & expert precision, the checkpoints found in LM Studio's folder](docs/images/webui-models.png)
 2. **Routed expert precision**
    For MoE models, the UI displays expert memory usage and whether each option **fits in memory** or **streams from SSD** across original precision, least-squares (**4 / 3 / 2 / 1 bit**), and **MXFP4 / Q3_K / Q2_K / IQ2_XS**.
    - **Rule of thumb**: pick the highest bit width marked **fits in memory** (if original precision fits, serve it as-is). To run models larger than memory, choose an option marked **streams from SSD**.
+
+     Below, `Qwen3.8-Flash-Next-MLX-8bit-MTP` on a 128 GB Mac: its original 8-bit experts (135.9 GB) would stream from SSD, so **4 bits (least-squares)**, the highest option that fits in memory, is picked.
+
+     ![Browser UI: Routed expert precision, each option's expert size and whether it fits in memory or streams from SSD](docs/images/webui-precision.png)
    - Click **Serve this model**. Live load progress, memory, thermal pressure, and throughput appear in **Serving now** at the top (along with a **`C++ STM`** badge when the [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) on-demand engine is active).
+
+     ![Browser UI: Serving now, Qwen3.6-35B-A3B at its original 8 bits with memory, heat, and the requests answered](docs/images/webui-serving.png)
    - **Unload / Load it again**: clicking **Unload** waits for in-flight generations to finish, releases model and cache memory, and returns HTTP 503 to new generation requests until you explicitly click **Load it again** or load another model — preventing connected background clients from immediately reloading weights into memory.
 3. **Try a prompt**
    Send a test prompt directly from the browser (`Cmd+Enter` / `Ctrl+Enter`) to inspect responses, `tok/s`, and **Its thinking**.
+
+   ![Browser UI: Try a prompt, a reply with its token count and speed, its thinking folded](docs/images/webui-try-prompt.png)
 4. **Memory, PLE, MTP & heat**
    One-click presets for common runtime controls:
    - **Memory reserve**: Comfortable / Standard / Most experts
@@ -117,8 +127,14 @@ Work through the UI from top to bottom (switch between **English / 日本語** i
    - **MTP speculative decoding**: Auto / On (exact) / On (fast) / Off
    - **Speculative drafter**: switch between bundled **MTP head** and external **DFlash2** (`QUANTEEZE_DRAFTER`) on supported models, with size check and one-click download (falls back automatically to bundled MTP if unavailable)
    - **Thermal throttle** (macOS only): Quiet / Standard / Full speed
+
+   ![Browser UI: Memory, PLE, MTP & heat, the presets with their defaults](docs/images/webui-presets.png)
 5. **Connect an app**
    Ready-to-copy OpenAI / Anthropic base URLs, Claude Code & Codex CLI launch commands, and `curl` snippets.
+
+**Every setting →** (`/quanteeze/settings`) lists every `QUANTEEZE_*` variable by group with what it does, its default, and when the server reads it (at start, at a load, or per request); a change is saved to `~/.quanteeze/settings.json`. Its **Model** card loads another model or expert bit width without a restart.
+
+![Browser UI: Every setting, the Model card and the first Memory variables](docs/images/webui-settings.png)
 
 ### 7. Connecting Claude Code, Codex CLI, and Other Apps
 
