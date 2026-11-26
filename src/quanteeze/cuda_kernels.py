@@ -15,10 +15,15 @@ import mlx.core as mx
 
 FUSE = [True]                   # QUANTEEZE_CUDA_FUSE: a layer's parts fused across one another
 
-HEADER = r"""
+# What every kernel's header starts with, in this order: NVRTC's precompiled header (QUANTEEZE_NVRTC_PCH) is made a
+# sequence of includes, some 330 MB each, so kernels that begin alike share one.
+INCLUDES = r"""
 #include "mlx/backend/cuda/device/unary_ops.cuh"
 #include "mlx/backend/cuda/device/binary_ops.cuh"
 #include <cooperative_groups/reduce.h>
+"""
+
+HEADER = INCLUDES + r"""
 // MLX's Multiply rounded to its type before anything adds to it.  On sm_90 and later cuda_bf16's
 // operator* is a bare mul.bf16 (mul.f16 for half), which ptxas may fuse with an add that follows
 // into one fma; on sm_80 it is fma.rn with -0, which it never fuses, and mul.rn is that same rounding.

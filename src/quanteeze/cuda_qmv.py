@@ -48,8 +48,7 @@ CHOICE, CHECKED = kernel_checks.tables('cuda_qmv')  # (K, N, group size[, bits, 
 SAID = []
 _ORIGINAL = []                  # mx.quantized_matmul as MLX gave it
 
-HEADER = r"""
-#include <cooperative_groups/reduce.h>
+_OWN = r"""
 
 // the pair p of a word v's 8 nibbles (inputs 2p and 2p + 1) under bits 0 and 16: byte p of v and of
 // v >> 4, their low nibbles (one byte_perm and a mask where shifts and masks took four or five)
@@ -384,6 +383,13 @@ __device__ __forceinline__ void qz_qmv8_rows(const __nv_bfloat16* x, const uint3
 }
 """
 
+# After cuda_kernels.HEADER (cuda_kernels.kernel puts that first), and for the kernels made here alone.  MLX's
+# device headers have no include guard NVRTC honours, so they are included once, by whichever comes first; alone,
+# the header begins with the same includes as every other kernel's, and NVRTC's precompiled header (some 330 MB
+# a distinct beginning; QUANTEEZE_NVRTC_PCH) is shared with them.
+HEADER = '\n#include <cooperative_groups/reduce.h>\n' + _OWN
+ALONE = cuda_kernels.INCLUDES + _OWN
+
 # A warp a row, 8 rows a block, as MLX's qmv launches it.
 SOURCE = r"""
     auto warp = cg::tiled_partition<32>(cg::this_thread_block());
@@ -426,10 +432,10 @@ def _kernel(bits=4):
             input_names=['x', 'w', 'scales', 'biases'],
             output_names=['y'],
             source=SOURCE.replace('qz_qmv4_row<K_IN, GS>', 'qz_qmv8_row<K_IN, GS, true>'),
-            header=HEADER,
+            header=ALONE,
         )
     return mx.fast.cuda_kernel(name='quanteeze_qmv4', input_names=['x', 'w', 'scales', 'biases'],
-                               output_names=['y'], source=SOURCE, header=HEADER)
+                               output_names=['y'], source=SOURCE, header=ALONE)
 
 
 def qmv(x, w, scales, biases, group_size, bits=4):
@@ -448,7 +454,7 @@ def qmv(x, w, scales, biases, group_size, bits=4):
 @lru_cache(maxsize=None)
 def _rows_kernel():
     return mx.fast.cuda_kernel(name='quanteeze_qmv_rows', input_names=['x', 'w', 'scales', 'biases'],
-                               output_names=['y'], source=ROWS_SOURCE, header=HEADER)
+                               output_names=['y'], source=ROWS_SOURCE, header=ALONE)
 
 
 def qmv_rows(x, w, scales, biases, group_size, bits):

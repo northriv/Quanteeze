@@ -163,3 +163,31 @@ def test_cuda_head_ple_8bit_sm120_and_v41_gpu_guard(monkeypatch):
     sentinel = mx.ones((1, 64), mx.bfloat16)
     monkeypatch.setattr(cuda_qmv, '_ORIGINAL', [lambda *a, **k: sentinel])
     assert cuda_qmv.qmv_fp8(x.reshape(1, -1), w, s) is sentinel
+
+
+@pytest.mark.skipif(not cuda_kernels.available(), reason="MLX's CUDA backend")
+def test_every_way_the_kernels_headers_are_put_together_compiles():
+    """MLX's device headers have no include guard NVRTC honours, so a header that brings them in twice does not
+    compile; the kernels put together from several headers (the hyper-connections', the shared expert's, the PLE
+    layer's) are otherwise built only when a model that has them is served."""
+    from quanteeze import cuda_head, cuda_qmv
+
+    source = r"""
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+      y[i] = x[i] + 1.0f;
+    }
+"""
+    x = mx.arange(64, dtype=mx.float32)
+    after = {'plain': '', 'qmv': cuda_qmv.HEADER, 'moe': cuda_qmv.HEADER + cuda_experts.HEADER,
+             'head': cuda_head.HEADER, 'fp8': cuda_qmv.FP8_HEADER}
+    made = [cuda_kernels.kernel('quanteeze_test_headers_' + name, ['x'], ['y'], source, header)
+            for name, header in after.items()]
+    made.append(mx.fast.cuda_kernel(name='quanteeze_test_headers_alone', input_names=['x'], output_names=['y'],
+                                    source=source, header=cuda_qmv.ALONE))
+    for kernel in made:
+        y = kernel(inputs=[x], template=[('N', 64)], grid=(64, 1, 1), threadgroup=(32, 1, 1),
+                   output_shapes=[(64,)], output_dtypes=[mx.float32])[0]
+        assert mx.array_equal(y, x + 1).item()
+    # one beginning for all of them: NVRTC's precompiled header is made a distinct sequence of includes
+    assert cuda_kernels.HEADER.startswith(cuda_kernels.INCLUDES) and cuda_qmv.ALONE.startswith(cuda_kernels.INCLUDES)
