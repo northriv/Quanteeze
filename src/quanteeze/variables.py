@@ -43,7 +43,8 @@ _TABLE = [
      'per-thread host allocation and warm SSD-slice buffer recycling with low RSS (auto: build and preload '
      'when a C++17 compiler is present, else system malloc; on: require kamepoolalloc; off: system malloc)'),
     ('QUANTEEZE_CACHE_GB', 'auto', 'memory', 'start',
-     'GB of freed buffers MLX keeps (auto: 2, and on a GPU no more than 3% of its working set)'),
+     'GB of freed buffers MLX keeps (auto: 2, and on a GPU no more than 3% of its working set '
+     '-- on CUDA 1 GB at least: an MTP verify pass turns over ~0.75 GB)'),
     ('QUANTEEZE_WIRED_GB', '0', 'memory', 'load',
      'GB of MLX\'s memory wired from each load on (0 or off: none beyond what mlx-vlm wires while generating; '
      'auto: Metal\'s recommended working set, held during load; no-op without Metal)'),
@@ -361,6 +362,11 @@ _TABLE = [
     ('QUANTEEZE_EVAL_LAYERS', '12', 'speed', 'start',
      'Flash-Next\'s decode token handed to the GPU this many layers at a time, not one by one (mlx-vlm\'s): on '
      'MLX\'s CUDA backend each hand-over ends a CUDA graph, between which the GPU waits (1: mlx-vlm\'s)'),
+    ('QUANTEEZE_VERIFY_LEAD_LAYERS', 'auto', 'speed', 'start',
+     'layers the host may build ahead of the GPU in a Flash-Next MTP verify pass: before building a layer, wait '
+     'for the input to the layer this many steps behind so freed buffers do not pile up in the driver pool and '
+     'evict managed-memory experts on memory-tight GPUs (auto: 4 on a single CUDA GPU, 0 on Apple Silicon or '
+     'multi-GPU; off or 0: no bound)'),
     ('QUANTEEZE_NATIVE', 'on', 'speed', 'load',
      'compile and load C++20 nanobind extensions on demand (off: disabled, pure Python fallbacks)'),
     ('QUANTEEZE_NVRTC_PCH', 'on', 'speed', 'start',

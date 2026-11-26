@@ -354,6 +354,9 @@ def test_unpacked_is_auto_on_metal_and_said_on_or_off(fresh):
 @pytest.mark.parametrize('length', [1, 3])
 @pytest.mark.parametrize('mask', [None, 'causal', 'array'])
 def test_the_attention_over_the_keys_spread_out_is_the_spread_out_products(fresh, monkeypatch, mask, length):
+    if length <= kv_bits.ROWS_MOST and not mx.metal.is_available():
+        pytest.skip("MLX CUDA's quantized_matmul over weights with a head dimension gives other products; "
+                    "the shape check detects it and falls back to _spread (UNPACKED auto is off on CUDA)")
     monkeypatch.setattr(kv_bits, 'UNPACKED', [True])
     mx.random.seed(4)
     keys, values = _quantized((2, 2, 40, 64), mx.bfloat16), _quantized((2, 2, 40, 64), mx.bfloat16)
@@ -373,6 +376,8 @@ def test_the_attention_over_the_keys_spread_out_is_the_spread_out_products(fresh
     assert kv_bits.STATS['differed'] == kv_bits.STATS['spread'] == 0
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="decode tokens use mlx-vlm's single-call quantized "
+                    "attention, which differs on MLX CUDA (UNPACKED auto is Metal-only)")
 def test_a_prompt_read_over_the_keys_spread_out_is_the_one_a_head_at_a_time(lm, monkeypatch):
     mx.random.seed(12)
     ids = mx.random.randint(2, ARGS['vocab_size'], (1, 160))
@@ -391,6 +396,20 @@ def test_a_prompt_read_over_the_keys_spread_out_is_the_one_a_head_at_a_time(lm, 
     assert kv_bits.STATS['unpacked'] >= 1 and kv_bits.STATS['differed'] == 0
     full = next(i for i, layer in enumerate(lm.layers) if not layer.is_linear)
     assert mx.array_equal(kept[1][full].state[0][0][0], kept[0][full].state[0][0][0]).item()
+
+
+@pytest.mark.skipif(mx.metal.is_available(), reason="MLX CUDA quantized_matmul fallback test; Metal passes directly")
+def test_mlx_vlms_quantized_attention_in_one_call_is_found_out_on_cuda_and_the_spread_out_product_serves(fresh, monkeypatch):
+    monkeypatch.setattr(kv_bits, 'UNPACKED', [True])
+    mx.random.seed(4)
+    keys, values = _quantized((2, 2, 40, 64), mx.bfloat16), _quantized((2, 2, 40, 64), mx.bfloat16)
+    queries = mx.random.normal((2, 4, 1, 64)).astype(mx.bfloat16)
+    scaled = (queries * 0.125).reshape(2, 2, 2, 1, 64)
+    want = kv_bits._spread(scaled, keys[1], values[1], None, kv_bits.GROUP, kv_bits.BITS).reshape(queries.shape)
+    for n in range(4):
+        got = kv_bits.attention(queries, keys[1], values[1], 0.125, None)
+        assert _off(got, want) < 2e-2, n
+    assert kv_bits.STATS['differed'] == 1 and kv_bits.STATS['quantized'] == 0 and kv_bits.STATS['spread'] == 3
 
 
 def test_home_kv_preset_and_model_info(tmp_path, monkeypatch):

@@ -1094,11 +1094,12 @@ def _unload_from_page():
 
 
 CACHE_SHARE = 0.03
+CACHE_LEAST_ON_CUDA = int(1e9)          # minimum freed-buffer cache on CUDA (MTP verify turns over ~0.75 GB)
 
 
 def _cache_limit():
     """MLX's limit on freed buffers it keeps, in bytes: QUANTEEZE_CACHE_GB (auto: 2 GB, and on a GPU
-    no more than CACHE_SHARE of its working set)."""
+    no more than CACHE_SHARE of its working set, keeping at least CACHE_LEAST_ON_CUDA on CUDA)."""
     text = (variables.get('QUANTEEZE_CACHE_GB', variables.at_start()) or 'auto').strip().lower()
     if text != 'auto':
         return int(variables.number('QUANTEEZE_CACHE_GB', variables.at_start()) * 1e9)
@@ -1106,7 +1107,8 @@ def _cache_limit():
     if mx.default_device() == mx.gpu:
         budget = guards.recommended_budget()
         if budget:
-            limit = min(limit, int(CACHE_SHARE * budget))
+            share = int(CACHE_SHARE * budget)
+            limit = min(limit, max(share, CACHE_LEAST_ON_CUDA) if cuda_kernels.available() else share)
     return limit
 
 
@@ -1782,6 +1784,12 @@ def main():
     from .arch import qwen4_exp
     qwen4_exp.COMPILE[0] = not variables.off('QUANTEEZE_COMPILE_DECODE')
     qwen4_exp.EVAL_LAYERS[0] = variables.integer('QUANTEEZE_EVAL_LAYERS')
+    lead = (variables.get('QUANTEEZE_VERIFY_LEAD_LAYERS', variables.at_start()) or 'auto').strip().lower()
+    qwen4_exp.VERIFY_LEAD[0] = (-1 if lead == 'auto' else 0 if lead == 'off'
+                                else max(0, variables.integer('QUANTEEZE_VERIFY_LEAD_LAYERS', variables.at_start())))
+    atexit.register(lambda: print(f'quanteeze: layers of MTP verify passes the host waited before building '
+                                  f'(QUANTEEZE_VERIFY_LEAD_LAYERS), {qwen4_exp.PACED}', file=sys.stderr, flush=True)
+                    if qwen4_exp.PACED['waits'] else None)
     linear_attn.ON[0] = not variables.off('QUANTEEZE_LINEAR_ATTN_KERNELS')
     try:
         linear_attn.share_fused_linears()

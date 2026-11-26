@@ -166,6 +166,12 @@ model = "local"
   ```
 
 - `--api-key` を付けて起動したときは、`[model_providers.quanteeze]` に `env_key = "MLX_VLM_SERVER_API_KEY"` などを足し、Codex を起動するシェルの環境変数にキーを入れてください。
+- **承認の自動審査（auto-review）を使うときは、審査の締め切りを延ばしてください。** Codex の承認審査は別会話で毎回抜粋を選び直して送るためプロンプトキャッシュがほぼ効かず、約 2 万トークンのプリフィルで既定の 90 秒（`90000`）に掛かることがあります。`~/.codex/config.toml` に次を足すと 300 秒へ延長できます（Codex 0.171.0 以降、`0` でタイムアウト無効）:
+
+  ```toml
+  [auto_review]
+  timeout_ms = 300000   # 自動審査の持ち時間（ミリ秒、既定は 90000）
+  ```
 
 `config.toml` を書き換えずに CLI をワンライナーで起動する場合（Web UI の **アプリをつなぐ** からもコピーできます）：
 
@@ -417,6 +423,7 @@ uv run python -m quanteeze.variables --markdown
 | 変数 | 既定値 | 説明 |
 |---|---|---|
 | `QUANTEEZE_ALLOCATOR` | `auto` | 同梱 [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)（v1.4.0 / `rss-zero-loss`）の自動ビルド・プリロード（`auto` / `on` / `off`）。 |
+| `QUANTEEZE_CACHE_GB` | `auto` | MLX が保持する解放済みバッファの上限 GB（`auto`: 最大 2 GB かつ GPU 作業領域の 3% 以下、CUDA では MTP 検証パス用に最低 1 GB を維持）。 |
 | `QUANTEEZE_WIRED_GB` | `0` | モデル読み込み時から MLX メモリをワイヤード固定する上限 GB（`0` / `off`: 生成中のみ mlx-vlm が固定、`auto`: Metal 推奨作業領域をロード時から固定。Metal 環境専用）。 |
 | `QUANTEEZE_MEMORY_RESERVE` | `0.3` | KV キャッシュや推論用バッファのために GPU/Metal 作業領域から差し引いておく割合。 |
 | `QUANTEEZE_CPU_THREADS` | `auto` | CPU エキスパート計算のワーカースレッド数（`auto`: GPU 直結 NUMA ノードの物理コア数から予約コアを除き上限 24 で各物理コアに固定）。 |
@@ -449,6 +456,7 @@ uv run python -m quanteeze.variables --markdown
 | `QUANTEEZE_MTP_BITS` | `auto` | MTP ドラフトヘッド内エキスパートの均一ビット幅（`auto`: `qwen4_exp` は 4・ほかは 2、数値指定、または `off` で元精度）。 |
 | `QUANTEEZE_EXPERT_QMV_VERIFY_FUSED` | `on` | 均一 MoE 層の speculative verify パスをデコード用 2 カーネル融合パス（`expert_qmv.fused`）で実行（`on` / `off`）。 |
 | `QUANTEEZE_MTP_EXACT` | `bits` | 検証モード：`bits`（1 トークンデコードとビット完全一致）または `distribution`（高速な一括検証）。 |
+| `QUANTEEZE_VERIFY_LEAD_LAYERS` | `auto` | Flash-Next の MTP 検証パスでホストが GPU より先に組み進めてよい最大層数（`auto`: CUDA 単一 GPU では 4（一時バッファによるマネージドメモリ退避を抑制）、Apple Silicon / マルチ GPU では `0`、`off` または `0` で無制限）。 |
 | `QUANTEEZE_PARALLEL` | `auto` | マルチ GPU レイヤー並列（`auto` / `layers` / `off`）。 |
 | `QUANTEEZE_GPUS` | `auto` | `QUANTEEZE_PARALLEL` 使用時の GPU 数（`auto` ですべて）。 |
 | `QUANTEEZE_LOOPS` | `on` | 繰り返しループに陥った生成を自動検出して停止する。 |

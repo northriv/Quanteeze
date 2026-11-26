@@ -9,6 +9,7 @@ Hooks the batch-invariant decode/verify forward so one-token decode and speculat
 - custom Metal/CUDA routed-expert and MoE kernels (`quanteeze.expert_qmv`, `quanteeze.cuda_experts`,
   `quanteeze.cuda_router`, `quanteeze.cuda_moe`).
 """
+import functools
 import sys
 import weakref
 
@@ -21,6 +22,9 @@ from .. import expert_qmv, linear_attn, per_thread, prefill, requant
 
 COMPILE = [True]                        # quanteeze.serve: QUANTEEZE_COMPILE_DECODE
 EVAL_LAYERS = [12]                      # quanteeze.serve: QUANTEEZE_EVAL_LAYERS
+VERIFY_LEAD = [0]                       # quanteeze.serve: QUANTEEZE_VERIFY_LEAD_LAYERS (-1: auto, _verify_lead)
+VERIFY_LEAD_ON_CUDA = 4                 # auto default on a single CUDA GPU
+PACED = dict(waits=0)                   # layers of verify passes the host waited before building
 COMPILE_STATS = {'compiled': 0, 'hyper': 0, 'refused': 0}
 VERIFY_ROWS_MOST = 8
 VERIFYING = per_thread.Field('verify')
@@ -62,6 +66,24 @@ class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
         finally:
             VERIFYING[0] = was
 
+    @staticmethod
+    def _verify_lead(hidden):
+        """Layers the host may build ahead of the GPU during a single-request MTP verify pass (0: unbounded).
+
+        With `QUANTEEZE_VERIFY_LEAD_LAYERS`, before building a layer of a verify pass (`VERIFYING` and
+        `hidden.shape[0] == 1` and `hidden.shape[1] >= 2`), the host waits for the input to the layer that many
+        steps behind. `auto` (`-1`) enables `VERIFY_LEAD_ON_CUDA` (4) on a single CUDA GPU so freed transient
+        buffers do not pile up in the driver pool ahead of execution and evict managed-memory experts; `0` on
+        Apple Silicon or multi-GPU runs.
+        """
+        if not VERIFYING[0] or hidden.shape[0] != 1 or hidden.shape[1] < 2:
+            return 0
+        lead = VERIFY_LEAD[0]
+        if lead >= 0:
+            return lead
+        from .. import cuda_kernels, parallel
+        return VERIFY_LEAD_ON_CUDA if cuda_kernels.available() and parallel.size() == 1 else 0
+
     def _model(self, model, inputs, cache, inputs_embeds, position_ids, capture_layer_ids=None, hidden_sink=None):
         """mlx-vlm's _model, a one-token step's layers handed to the GPU EVAL_LAYERS at a time."""
         hidden = model.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
@@ -73,7 +95,13 @@ class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
         every = max(1, EVAL_LAYERS[0]) if hidden.shape[1] == 1 else 1
         last = len(model.layers) - 1
         capture = set(capture_layer_ids or ())
+        lead, behind = self._verify_lead(hidden), []
         for i, (layer, layer_cache) in enumerate(zip(model.layers, cache)):
+            if lead:
+                behind.append(hidden)
+                if len(behind) > lead:
+                    mx.eval(behind.pop(0))
+                    PACED['waits'] += 1
             layer_mask = ssm_mask if layer.is_linear else fa_mask
             hidden = self._layer(layer, hidden, inputs, layer_mask, layer_cache, position_ids)
             if hidden_sink is not None and i in capture:
@@ -424,6 +452,9 @@ def _install_qsa_cache():
     """Patch QSA KV caches to preallocate indexer storage and retain valid block summaries on trim."""
     qsa_cls = _language.QSAKVCache
     if not getattr(qsa_cls, '_quanteeze_qsa_cache', False):
+        orig_qsa_trim = qsa_cls.trim
+
+        @functools.wraps(orig_qsa_trim)
         def qsa_trim(self, n):
             n = min(self.offset, n)
             super(_language.QSAKVCache, self).trim(n)
@@ -438,6 +469,9 @@ def _install_qsa_cache():
 
     qsa_quant_cls = _language.QSAQuantizedKVCache
     if not getattr(qsa_quant_cls, '_quanteeze_qsa_cache', False):
+        orig_quant_trim = qsa_quant_cls.trim
+
+        @functools.wraps(orig_quant_trim)
         def qsa_quant_trim(self, n):
             n = min(self.offset, n)
             super(_language.QSAQuantizedKVCache, self).trim(n)
@@ -452,16 +486,21 @@ def _install_qsa_cache():
 
     batch_cls = _language.BatchQSAKVCache
     if not getattr(batch_cls, '_quanteeze_qsa_cache', False):
+        orig_batch_trim = batch_cls.trim
+        orig_batch_update = batch_cls.update_indexer
+
+        @functools.wraps(orig_batch_trim)
         def batch_trim(self, n):
             trimmed = self.kv_cache.trim(n)
             self.index_offset = max(0, self.index_offset - trimmed)
             _trim_index_blocks(self, self.index_offset)
             return trimmed
 
+        @functools.wraps(orig_batch_update)
         def batch_update_indexer(self, keys, position_ids):
-            prev = self.index_offset
+            prev = int(self.index_offset)
             incoming = keys.shape[1]
-            step = getattr(self, 'step', 256) or 256
+            step = int(getattr(self, 'step', 256) or 256)
             add = ((incoming + step - 1) // step) * step if incoming > 0 else step
             if self.index_keys is None:
                 self.index_keys = mx.zeros((keys.shape[0], add, keys.shape[2]), dtype=keys.dtype)

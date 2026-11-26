@@ -630,3 +630,228 @@ def test_qsa_cache_preallocates_indexer_and_preserves_blocks_on_trim():
         return second.logits
 
     assert mx.array_equal(run_verify(clear_blocks=False), run_verify(clear_blocks=True)).item()
+
+
+def test_verify_lead_layers_bit_for_bit_and_auto_policy(monkeypatch):
+    """`QUANTEEZE_VERIFY_LEAD_LAYERS` paces verify passes without altering logits, taps, or auto policy."""
+    from mlx_vlm.generate.ar import _make_cache
+    from mlx_vlm.models.qwen4_exp.config import ModelConfig, VisionConfig
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+    from quanteeze import cuda_kernels, parallel
+
+    mx.random.seed(15)
+    cfg = _make_qwen4_text_config(num_layers=6)
+    lm = LanguageModel(
+        cfg,
+        ModelConfig(text_config=cfg, vision_config=VisionConfig(), model_type=cfg.model_type),
+    )
+    lm.set_dtype(mx.bfloat16)
+    mx.eval(lm.parameters())
+    qwen4_exp.install(lm)
+
+    ids = mx.random.randint(2, cfg.vocab_size, (1, 36), dtype=mx.int32)
+    monkeypatch.setattr(qwen4_exp, 'VERIFY_LEAD', list(qwen4_exp.VERIFY_LEAD))
+    monkeypatch.setitem(qwen4_exp.PACED, 'waits', 0)
+
+    def run(lead):
+        qwen4_exp.VERIFY_LEAD[0] = lead
+        qwen4_exp.PACED['waits'] = 0
+        caches = _make_cache(lm, [0])
+        mx.eval(lm(ids[:, :32], cache=caches).logits)
+        assert qwen4_exp.PACED['waits'] == 0
+        out = lm(ids[:, 32:36], cache=caches, capture_layer_ids=[1, 3, 5], speculative_verify=True)
+        mx.eval(out.logits, *out.hidden_states)
+        out.gdn_states.abort()
+        return out.logits, out.hidden_states, qwen4_exp.PACED['waits']
+
+    want_logits, want_taps, no_waits = run(0)
+    assert no_waits == 0
+    for lead in (1, 2):
+        got_logits, got_taps, waits = run(lead)
+        assert waits == 6 - lead
+        assert mx.array_equal(got_logits, want_logits).item()
+        for gh, wh in zip(got_taps, want_taps):
+            assert mx.array_equal(gh, wh).item()
+
+    lead_fn = qwen4_exp._BatchInvariantForward._verify_lead
+    three, one, rows = mx.zeros((1, 3, 8)), mx.zeros((1, 1, 8)), mx.zeros((2, 3, 8))
+    was = qwen4_exp.VERIFYING[0]
+    try:
+        qwen4_exp.VERIFYING[0] = False
+        assert lead_fn(three) == 0
+        qwen4_exp.VERIFYING[0] = True
+        qwen4_exp.VERIFY_LEAD[0] = 4
+        assert lead_fn(three) == 4 and lead_fn(one) == 0 and lead_fn(rows) == 0
+        qwen4_exp.VERIFY_LEAD[0] = 0
+        assert lead_fn(three) == 0
+        qwen4_exp.VERIFY_LEAD[0] = -1
+        monkeypatch.setattr(cuda_kernels, 'available', lambda: True)
+        monkeypatch.setattr(parallel, 'size', lambda: 1)
+        assert lead_fn(three) == qwen4_exp.VERIFY_LEAD_ON_CUDA == 4
+        monkeypatch.setattr(parallel, 'size', lambda: 4)
+        assert lead_fn(three) == 0
+        monkeypatch.setattr(parallel, 'size', lambda: 1)
+        monkeypatch.setattr(cuda_kernels, 'available', lambda: False)
+        assert lead_fn(three) == 0
+    finally:
+        qwen4_exp.VERIFYING[0] = was
+
+
+def test_qsa_batch_indexer_ragged_left_and_right_padding_bit_for_bit(monkeypatch):
+    """`BatchQSAKVCache.update_indexer` matches `mlx-vlm` bit-for-bit across ragged left padding,
+    8-bit KV batching, `filter()`, and `finalize()` right-padding rolls."""
+    from mlx_vlm.generate.ar import _make_cache
+    from mlx_vlm.models import base
+    from mlx_vlm.models.qwen4_exp import language as _language
+    from mlx_vlm.models.qwen4_exp.config import ModelConfig, VisionConfig
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+    from quanteeze import kv_bits
+
+    qsa_classes = (_language.QSAKVCache, _language.QSAQuantizedKVCache, _language.BatchQSAKVCache)
+    qwen4_exp._install_qsa_cache()
+    for cls in qsa_classes:
+        monkeypatch.setattr(cls, 'trim', cls.trim)
+        monkeypatch.setattr(cls, '_quanteeze_qsa_cache', getattr(cls, '_quanteeze_qsa_cache', True))
+    monkeypatch.setattr(_language.BatchQSAKVCache, 'update_indexer', _language.BatchQSAKVCache.update_indexer)
+
+    # Isolate kv_bits global state cleanly for the 8-bit subtest.
+    monkeypatch.setattr(base, 'quantized_scaled_dot_product_attention', base.quantized_scaled_dot_product_attention)
+    monkeypatch.setattr(_language, 'dispatch_qsa_attention', _language.dispatch_qsa_attention)
+    monkeypatch.setattr(kv_bits, 'CHOICE', {})
+    monkeypatch.setattr(kv_bits, 'CHECKED', {})
+    monkeypatch.setattr(kv_bits, 'STATS', {name: 0 for name in kv_bits.STATS})
+    monkeypatch.setattr(kv_bits, 'SELECTED', [True])
+    monkeypatch.setattr(kv_bits, 'UNPACKED', [False])
+    monkeypatch.setattr(kv_bits, 'SAID', [])
+    monkeypatch.setattr(kv_bits, '_UNKNOWN', [])
+    monkeypatch.setattr(kv_bits, 'SERVED', [False])
+    monkeypatch.setattr(kv_bits, '_CLASSES', [])
+    for name in ('to_batch', 'merge', 'prefix_cache_merge', 'prefix_cache_snapshot'):
+        if name in vars(_language.QSAQuantizedKVCache):
+            monkeypatch.setattr(_language.QSAQuantizedKVCache, name, vars(_language.QSAQuantizedKVCache)[name])
+        else:
+            monkeypatch.setattr(_language.QSAQuantizedKVCache, name, None, raising=False)
+            monkeypatch.delattr(_language.QSAQuantizedKVCache, name)
+
+    def unpatch_qsa():
+        for cls in qsa_classes:
+            cls.trim = getattr(cls.trim, '__wrapped__', cls.trim)
+            cls._quanteeze_qsa_cache = False
+        batch = _language.BatchQSAKVCache
+        batch.update_indexer = getattr(batch.update_indexer, '__wrapped__', batch.update_indexer)
+
+    def build_model():
+        mx.random.seed(4)
+        cfg = _make_qwen4_text_config(num_layers=6)
+        lm = LanguageModel(
+            cfg,
+            ModelConfig(text_config=cfg, vision_config=VisionConfig(), model_type=cfg.model_type),
+        )
+        lm.set_dtype(mx.bfloat16)
+        mx.eval(lm.parameters())
+        return cfg, lm
+
+    def padded(ids, lengths):
+        most = max(lengths)
+        return mx.stack([mx.concatenate([mx.zeros((most - n,), dtype=ids.dtype), ids[r, :n]])
+                         for r, n in enumerate(lengths)]), [most - n for n in lengths]
+
+    def batch_rounds(lm, ids, lengths, rounds=5):
+        full = [i for i, layer in enumerate(lm.layers) if not layer.is_linear]
+        prompt, pads = padded(ids, lengths)
+        caches = _make_cache(lm, pads)
+        out = [lm(prompt, cache=caches).logits[:, -1:]]
+        at = max(lengths)
+        # Exercise B > 1 BatchQSAKVCache.update_indexer decode before filtering down to one row.
+        out.append(lm(ids[:, at:at + 1], cache=caches).logits)
+        at += 1
+        for r in range(rounds):
+            if r == 2:
+                for c in caches:
+                    c.filter(mx.array([0]))
+                out = [o[:1] for o in out]
+                ids = ids[:1]
+            step = ids[:, at:at + 4]
+            out.append(lm(step, cache=caches).logits)
+            for i in full:
+                caches[i].trim(4 - (1 + r % 3))
+            at += 1 + r % 3
+        out.append(lm(ids[:, at:at + 1], cache=caches).logits)
+        mx.eval(out)
+        return mx.concatenate(out, axis=1), caches[full[0]]
+
+    for lengths in ((90, 54), (280, 173, 210)):
+        unpatch_qsa()
+        cfg, lm_ref = build_model()
+        ids = mx.random.randint(2, cfg.vocab_size, (len(lengths), max(lengths) + 40), dtype=mx.int32)
+        theirs, plain = batch_rounds(lm_ref, ids, lengths)
+        assert plain.index_keys.shape[1] == plain.index_offset
+
+        _, lm_mine = build_model()
+        qwen4_exp.install(lm_mine)
+        mine, room = batch_rounds(lm_mine, ids, lengths)
+        assert room.index_keys.shape[1] > room.index_offset
+        assert mx.array_equal(mine, theirs).item()
+
+    unpatch_qsa()
+    cfg8, lm8_ref = build_model()
+    assert kv_bits.install(lm8_ref, {'QUANTEEZE_KV_BITS': '8'})
+    ids8 = mx.random.randint(2, cfg8.vocab_size, (2, 130), dtype=mx.int32)
+    theirs8, plain8 = batch_rounds(lm8_ref, ids8, (90, 54))
+    assert type(plain8).__module__ == 'quanteeze.kv_bits'
+
+    _, lm8_mine = build_model()
+    assert kv_bits.install(lm8_mine, {'QUANTEEZE_KV_BITS': '8'})
+    qwen4_exp.install(lm8_mine)
+    mine8, room8 = batch_rounds(lm8_mine, ids8, (90, 54))
+    assert room8.index_keys.shape[1] > room8.index_offset
+    assert mx.array_equal(mine8, theirs8).item()
+
+    def rows_slice(cache, arrays):
+        pads = [int(p) for p in cache.left_padding.tolist()]
+        keys, positions = arrays
+        return [(keys[r, p:], positions[..., r, p:]) for r, p in enumerate(pads)]
+
+    def ragged(cls_cache, positions3):
+        mx.random.seed(6)
+        c = cls_cache([0, 3])
+        seen = []
+
+        def chunk(n, right=None):
+            rows = c.index_keys.shape[0] if c.index_keys is not None else 2
+            keys = mx.random.normal((rows, n, 16))
+            pos = mx.broadcast_to(mx.arange(n, dtype=mx.int32)[None], (rows, n)) + int(c.index_offset)
+            if positions3:
+                pos = mx.broadcast_to(pos[None], (3, rows, n))
+            c.update_and_fetch(mx.random.normal((rows, 2, n, 64)), mx.random.normal((rows, 2, n, 64)))
+            if right is not None:
+                c.prepare(right_padding=right)
+            got = c.update_indexer(keys, pos)
+            if right is not None:
+                c.finalize()
+                got = (c.index_keys[:, :c.index_offset], c.index_position_ids[..., :c.index_offset])
+                assert c.left_padding.tolist() == [0, 8]
+            seen.extend(rows_slice(c, got))
+
+        chunk(40)
+        chunk(30, right=[0, 5])
+        chunk(1)
+        seen.extend(rows_slice(c, c.state[1:3]))
+        one = c.extract(1)
+        seen.append((one.index_keys, one.index_position_ids))
+        c.filter(mx.array([1]))
+        chunk(2)
+        return seen, int(c.index_offset), c.left_padding.tolist()
+
+    _, kv_batch_cls = kv_bits.classes()
+    for cache_cls in (_language.BatchQSAKVCache, kv_batch_cls):
+        for positions3 in (False, True):
+            unpatch_qsa()
+            theirs_r = ragged(cache_cls, positions3)
+            qwen4_exp._install_qsa_cache()
+            mine_r = ragged(cache_cls, positions3)
+            assert mine_r[1:] == theirs_r[1:]
+            assert len(mine_r[0]) == len(theirs_r[0])
+            for (k, p), (k2, p2) in zip(mine_r[0], theirs_r[0]):
+                assert k.shape == k2.shape and mx.array_equal(k, k2).item()
+                assert p.shape == p2.shape and mx.array_equal(p, p2).item()

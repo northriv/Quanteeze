@@ -1101,3 +1101,28 @@ def test_mtp_live_fields_and_ui_wording(monkeypatch):
     assert '均一' not in home_html
     assert 'uniform precision' not in home_html.lower()
     assert 'uniform expert' not in control_html.lower()
+
+
+def test_cache_limit_cuda_floor_and_metal_share(monkeypatch):
+    """`serve._cache_limit()` enforces `CACHE_LEAST_ON_CUDA` (1 GB) on CUDA and `CACHE_SHARE` on Metal."""
+    from quanteeze import guards, serve
+
+    monkeypatch.setattr(serve.mx, 'default_device', lambda: serve.mx.gpu)
+    monkeypatch.delenv('QUANTEEZE_CACHE_GB', raising=False)
+
+    monkeypatch.setattr(serve.cuda_kernels, 'available', lambda: True)
+    monkeypatch.setattr(guards, 'recommended_budget', lambda: 15.5e9)
+    assert serve._cache_limit() == serve.CACHE_LEAST_ON_CUDA
+
+    monkeypatch.setattr(guards, 'recommended_budget', lambda: 40e9)
+    assert serve._cache_limit() == int(serve.CACHE_SHARE * 40e9)
+
+    monkeypatch.setattr(guards, 'recommended_budget', lambda: 80e9)
+    assert serve._cache_limit() == int(2e9)
+
+    monkeypatch.setattr(serve.cuda_kernels, 'available', lambda: False)
+    monkeypatch.setattr(guards, 'recommended_budget', lambda: 15.5e9)
+    assert serve._cache_limit() == int(serve.CACHE_SHARE * 15.5e9)
+
+    monkeypatch.setenv('QUANTEEZE_CACHE_GB', '4')
+    assert serve._cache_limit() == int(4e9)

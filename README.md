@@ -166,6 +166,12 @@ model = "local"
   ```
 
 - If you started Quanteeze with `--api-key`, add `env_key = "MLX_VLM_SERVER_API_KEY"` under `[model_providers.quanteeze]` and export that variable in your shell.
+- When using Codex approval auto-review (`[auto_review]`), raise `timeout_ms` (e.g. `300000`, supported in Codex 0.171.0+; `0` disables the deadline): each auto-review sends a ~20k-token freshly selected conversation excerpt that rarely hits the prompt cache and can easily exceed the 90 s default on large models:
+
+  ```toml
+  [auto_review]
+  timeout_ms = 300000   # auto-review budget in ms (default: 90000)
+  ```
 
 One-liner without editing `config.toml` (also available in **Connect an app** in the UI):
 
@@ -414,6 +420,7 @@ uv run python -m quanteeze.variables --markdown
 | Variable | Default | Description |
 |---|---|---|
 | `QUANTEEZE_ALLOCATOR` | `auto` | Auto-build and preload bundled [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) (`auto` / `on` / `off`). |
+| `QUANTEEZE_CACHE_GB` | `auto` | Freed-buffer limit held by MLX in GB (`auto`: up to 2 GB and `<= 3%` of GPU working set, or at least 1 GB on CUDA so MTP verify buffer turnover stays in pool). |
 | `QUANTEEZE_WIRED_GB` | `0` | Wire MLX memory from load onward in GB (`0` / `off`: wired only while generating; `auto`: Metal recommended working set; Metal only). |
 | `QUANTEEZE_MEMORY_RESERVE` | `0.3` | Share of Metal/GPU working set reserved from experts for KV caches and activations. |
 | `QUANTEEZE_CPU_THREADS` | `auto` | CPU expert worker threads (`auto`: NUMA-local physical cores minus reserved cores, capped at 24 and pinned per core). |
@@ -446,6 +453,7 @@ uv run python -m quanteeze.variables --markdown
 | `QUANTEEZE_MTP_BITS` | `auto` | Uniform expert bit width inside MTP draft heads (`auto`: 4 for `qwen4_exp`, 2 otherwise; number; or `off`). |
 | `QUANTEEZE_EXPERT_QMV_VERIFY_FUSED` | `on` | Run speculative verify passes of uniform MoE layers through the fused two-kernel decode expert path (`on` / `off`). |
 | `QUANTEEZE_MTP_EXACT` | `bits` | Verification mode: `bits` (bit-identical to single-token decode) or `distribution` (fast multi-token pass). |
+| `QUANTEEZE_VERIFY_LEAD_LAYERS` | `auto` | Max layers the host may build ahead of the GPU in a Flash-Next MTP verify pass (`auto`: 4 on a single CUDA GPU so freed transient buffers do not evict managed-memory experts, `0` on Apple Silicon / multi-GPU; `off` or `0`: unbounded). |
 | `QUANTEEZE_PARALLEL` | `auto` | Multi-GPU layer parallelism (`auto` / `layers` / `off`). |
 | `QUANTEEZE_GPUS` | `auto` | Number of GPUs used by `QUANTEEZE_PARALLEL` (`auto` uses all visible GPUs). |
 | `QUANTEEZE_LOOPS` | `on` | Automatically detect and stop generations stuck in repetition loops. |
