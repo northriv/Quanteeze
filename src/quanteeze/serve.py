@@ -75,6 +75,7 @@ from . import (
     leases,
     linear_attn,
     loops,
+    metal_router,
     mtp,
     ngram_prefetch,
     parallel,
@@ -1793,7 +1794,10 @@ def main():
     cuda_v41.ON[0] = hyper.ON[0]
     from .arch import qwen4_exp
     qwen4_exp.COMPILE[0] = not variables.off('QUANTEEZE_COMPILE_DECODE')
-    qwen4_exp.EVAL_LAYERS[0] = variables.integer('QUANTEEZE_EVAL_LAYERS')
+    ev = (variables.get('QUANTEEZE_EVAL_LAYERS', variables.at_start()) or 'auto').strip().lower()
+    qwen4_exp.EVAL_LAYERS[0] = (
+        0 if ev == 'auto' else max(1, variables.integer('QUANTEEZE_EVAL_LAYERS', variables.at_start()))
+    )
     lead = (variables.get('QUANTEEZE_VERIFY_LEAD_LAYERS', variables.at_start()) or 'auto').strip().lower()
     qwen4_exp.VERIFY_LEAD[0] = (-1 if lead == 'auto' else 0 if lead == 'off'
                                 else max(0, variables.integer('QUANTEEZE_VERIFY_LEAD_LAYERS', variables.at_start())))
@@ -1813,6 +1817,7 @@ def main():
     cuda_qmv.ON[0] = not variables.off('QUANTEEZE_CUDA_QMV')
     cuda_qmv.ROWS_ON[0] = not variables.off('QUANTEEZE_CUDA_QMV_ROWS')
     cuda_router.ON[0] = not variables.off('QUANTEEZE_CUDA_ROUTER')
+    metal_router.ON[0] = not variables.off('QUANTEEZE_METAL_ROUTER')
     cuda_v41.ROUTE_ON[0] = cuda_router.ON[0]
     cuda_experts.ON[0] = not variables.off('QUANTEEZE_CUDA_EXPERTS')
     cuda_kernels.FUSE[0] = not variables.off('QUANTEEZE_CUDA_FUSE')
@@ -1849,6 +1854,8 @@ def main():
                                   flush=True) if cuda_moe.CHOICE else None)
     atexit.register(lambda: print(f'quanteeze: CUDA experts, {cuda_experts.summary()}', file=sys.stderr,
                                   flush=True) if cuda_experts.CHOICE else None)
+    atexit.register(lambda: print(f'quanteeze: Metal router, {metal_router.summary()}', file=sys.stderr,
+                                  flush=True) if metal_router.CHOICE or metal_router.WEIGHED_CHOICE else None)
     atexit.register(lambda: print(f'quanteeze: CUDA router, {cuda_router.summary()}', file=sys.stderr,
                                   flush=True) if cuda_router.CHOICE else None)
     if cuda_qmv.ON[0] and cuda_qmv.install():

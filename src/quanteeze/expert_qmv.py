@@ -18,6 +18,7 @@ from functools import lru_cache
 import inspect
 import re
 import sys
+import weakref
 
 import mlx.core as mx
 import numpy as np
@@ -587,15 +588,53 @@ def _fused_kernels():
     return gate_up, down
 
 
+def _projs(switch):
+    """Return `(gate_proj, up_proj, down_proj)` via direct dict lookup on MLX modules."""
+    if isinstance(switch, dict) and 'gate_proj' in switch and 'up_proj' in switch and 'down_proj' in switch:
+        return switch['gate_proj'], switch['up_proj'], switch['down_proj']
+    return switch.gate_proj, switch.up_proj, switch.down_proj
+
+
+def _proj_attr(proj, name):
+    """Read parameter array `name` from an MLX projection module without `Module.__getattr__` overhead."""
+    if isinstance(proj, dict) and name in proj:
+        return proj[name]
+    return getattr(proj, name, None)
+
+
 def fusable(switch, x):
     """Whether `fused()` computes this step: one-token decode or multi-token verify (`VERIFY[0]`),
     with affine `gate_proj`, `up_proj`, and `down_proj` with `bits in (1, 2, 4, 8)`."""
-    projs = (switch.gate_proj, switch.up_proj, switch.down_proj)
+    gp, up, dp = _projs(switch)
+    projs = (gp, up, dp)
     return ((x.shape[1] == 1 or VERIFY[0]) and verify_qmv.helpers() is not None
             and len({(getattr(p, 'bits', None), getattr(p, 'group_size', None)) for p in projs}) == 1
-            and getattr(switch.gate_proj, 'bits', None) in (1, 2, 4, 8)
+            and getattr(gp, 'bits', None) in (1, 2, 4, 8)
             and all(getattr(p, 'mode', 'affine') == 'affine' for p in projs)
             and eligible(switch, x, None))
+
+
+def _plan(switch, x, projs=None):
+    """Cached `(i_size, template_tail)` for `fused()` and `fusable()`, keyed by shape, `VERIFY`, weights, and weakrefs."""
+    gp, up, dp = _projs(switch) if projs is None else projs
+    gw, uw, dw = _proj_attr(gp, 'weight'), _proj_attr(up, 'weight'), _proj_attr(dp, 'weight')
+    stamp = (x.dtype, x.shape[0], x.shape[1], x.shape[-1], VERIFY[0], id(gw), id(uw), id(dw))
+    kept = switch.__dict__.get('_fused_plan')
+    if kept is not None and kept[0] == stamp and all(r() is p for r, p in zip(kept[1], (gp, up, dp))):
+        return kept[2]
+    plan = None
+    if fusable(switch, x):
+        d = x.shape[-1]
+        i_size = int(gw.shape[1])
+        tail = (
+            ('BITS', int(gp.bits)),
+            ('GS', int(gp.group_size)),
+            ('GU', port_of(gp, d) == 'generic'),
+            ('GD', port_of(dp, i_size) == 'generic'),
+        )
+        plan = (i_size, tail)
+    object.__setattr__(switch, '_fused_plan', (stamp, (weakref.ref(gp), weakref.ref(up), weakref.ref(dp)), plan))
+    return plan
 
 
 def fused(switch, x, indices):
@@ -604,21 +643,22 @@ def fused(switch, x, indices):
     b0, t0, k, d = x.shape[0], x.shape[1], indices.shape[-1], x.shape[-1]
     t = b0 * t0
     flat_idx = indices.reshape(-1).astype(mx.int32)
-    gp, up, dp = switch.gate_proj, switch.up_proj, switch.down_proj
-    i_size = gp.weight.shape[1]
-    template = [
-        ('T', x.dtype), ('D_SIZE', int(d)), ('I_SIZE', int(i_size)), ('K_SLOTS', int(k)),
-        ('BITS', int(gp.bits)), ('GS', int(gp.group_size)),
-        ('GU', port_of(gp, d) == 'generic'), ('GD', port_of(dp, i_size) == 'generic'),
-    ]
+    gp, up, dp = _projs(switch)
+    planned = _plan(switch, x, (gp, up, dp))
+    if planned is None:
+        return stock(switch, x, indices)
+    i_size, tail = planned
+    template = [('T', x.dtype), ('D_SIZE', int(d)), ('I_SIZE', i_size), ('K_SLOTS', int(k)), *tail]
     gate_up, down = _fused_kernels()
+    gw, gs, gb = _proj_attr(gp, 'weight'), _proj_attr(gp, 'scales'), _proj_attr(gp, 'biases')
+    uw, us, ub = _proj_attr(up, 'weight'), _proj_attr(up, 'scales'), _proj_attr(up, 'biases')
+    dw, ds, db = _proj_attr(dp, 'weight'), _proj_attr(dp, 'scales'), _proj_attr(dp, 'biases')
     hidden = gate_up(
-        inputs=[mx.contiguous(x.reshape(-1, d)), flat_idx,
-                gp.weight, gp.scales, gp.biases, up.weight, up.scales, up.biases],
+        inputs=[mx.contiguous(x.reshape(-1, d)), flat_idx, gw, gs, gb, uw, us, ub],
         template=template, grid=(32, 2 * (i_size // 8), t * k), threadgroup=(32, 2, 1),
         output_shapes=[(t * k, i_size)], output_dtypes=[x.dtype])[0]
     y = down(
-        inputs=[hidden, flat_idx, dp.weight, dp.scales, dp.biases],
+        inputs=[hidden, flat_idx, dw, ds, db],
         template=template, grid=(32, 2 * (d // 8), t * k), threadgroup=(32, 2, 1),
         output_shapes=[(t * k, d)], output_dtypes=[x.dtype])[0]
     return y.reshape(b0, t0, k, d)
@@ -629,19 +669,22 @@ def eligible(switch, x, indices):
             and ((x.shape[0] == 1 and 1 <= x.shape[1] <= verify_qmv.MAX_TOKENS)
                  or (x.shape[1] == 1 and 1 <= x.shape[0] <= verify_qmv.MAX_TOKENS))):
         return False
-    gp = switch.gate_proj
+    gp = switch['gate_proj'] if isinstance(switch, dict) and 'gate_proj' in switch else switch.gate_proj
     bits = getattr(gp, 'bits', None)
     gs = getattr(gp, 'group_size', None)
     mode = getattr(gp, 'mode', 'affine')
-    stamp = (bits, gs, mode, id(gp.weight), x.dtype, x.shape[-1])
+    gw = _proj_attr(gp, 'weight')
+    stamp = (bits, gs, mode, id(gw), x.dtype, x.shape[-1])
     kept = switch.__dict__.get('_expert_qmv')
     if kept is None or kept[0] != stamp:
         d = x.shape[-1]
-        ok = bits in (1, 2, 4, 8) and gp.weight.ndim == 3 and gp.weight.shape[-1] * 32 // bits == d
+        ok = bits in (1, 2, 4, 8) and gw is not None and gw.ndim == 3 and gw.shape[-1] * 32 // bits == d
         if ok:
-            for p in (switch.gate_proj, switch.up_proj, switch.down_proj):
+            for p in _projs(switch):
                 p_mode = getattr(p, 'mode', 'affine')
-                if p.weight.ndim != 3 or not applies(p, p.weight.shape[-1] * 32 // p.bits) or (p_mode == 'affine' and p.scales.dtype != x.dtype):
+                pw = _proj_attr(p, 'weight')
+                ps = _proj_attr(p, 'scales')
+                if pw.ndim != 3 or not applies(p, pw.shape[-1] * 32 // p.bits) or (p_mode == 'affine' and ps.dtype != x.dtype):
                     ok = False
                     break
         kept = (stamp, ok, (int(bits or 0), int(gs or 0), mode))
@@ -845,7 +888,7 @@ def decode(switch, x, indices, weights=None):
     if not ON[0] or not eligible(switch, x, indices):
         return stock(switch, x, indices, weights)
     k = key(switch, x, indices, weights is not None)
-    if FUSED[0] and weights is None and fusable(switch, x):
+    if FUSED[0] and weights is None and _plan(switch, x) is not None:
         return _checked(('fused',) + k, lambda: fused(switch, x, indices), lambda: stock(switch, x, indices), 'fused')
     return _checked(k, lambda: own(switch, x, indices, weights), lambda: stock(switch, x, indices, weights), 'served')
 

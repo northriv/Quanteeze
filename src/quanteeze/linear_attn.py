@@ -24,6 +24,7 @@ CHECKS = 3
 ROWS_MOST = 8                   # concurrent requests at most that decode_batch() takes (2 to 8)
 ON = [True]                     # QUANTEEZE_LINEAR_ATTN_KERNELS
 DELTA = [True]                  # QUANTEEZE_CUDA_DELTA: the delta rule's step on CUDA
+SLIDE = [True]                  # slide the cached conv window inside the Metal conv kernel on decode
 STATS = dict(conv=0, slide=0, norm=0, delta=0, gating=0, conv_rows=0, delta_rows=0, gating_rows=0, norm_rows=0,
              conv_batch=0, slide_batch=0, delta_batch=0, gating_batch=0, norm_batch=0, checked=0, mismatched=0, few=0)
 CHOICE, CHECKED = kernel_checks.tables('linear_attn')  # (part, shape, dtype): whether it matched the original
@@ -454,7 +455,11 @@ def _conv_kernel(scale, sliding=False):
         return cuda_kernels.kernel(name, ['state', 'x', 'w'], ['y'] + (['state_out'] if sliding else []),
                                    _CONV_CUDA.replace('/*STATE*/', _STATE if sliding else ''),
                                    f'constexpr float SCALE = {float(scale)!r}f;\n')
-    return mx.fast.metal_kernel(name=name, input_names=['state', 'x', 'w'], output_names=['y'], source=_CONV,
+    source = _CONV + (
+        '    for (int i = 0; i < 4; ++i) {\n      uint c = c0 + i;\n' + _STATE + '    }\n' if sliding else ''
+    )
+    return mx.fast.metal_kernel(name=name, input_names=['state', 'x', 'w'],
+                                output_names=['y'] + (['state_out'] if sliding else []), source=source,
                                 header=metal_kernels.SIGMOID + f'constant constexpr float SCALE = {float(scale)!r}f;\n')
 
 
@@ -575,12 +580,62 @@ def _conv_original(forward, layer, conv_input):
     return q, k, v
 
 
+IN_PROJ = ('in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a')
+
+
+def _in_proj(forward, layer, inputs):
+    """Run the four gated-delta decode input projections via mlx-vlm's cached joined weights when intact."""
+    if not isinstance(layer, dict):
+        return forward._linears(tuple(getattr(layer, name) for name in IN_PROJ), inputs)
+    kept = layer.__dict__.get('_quanteeze_in_proj')
+    if inputs.ndim == 3 and inputs.shape[1] == 1 and kept is not None and inputs.dtype == kept[0]:
+        held = kept[1]
+        if all(
+            layer.get(name) is lin
+            and isinstance(lin, dict)
+            and lin.get('weight') is w
+            and lin.get('scales') is s
+            and lin.get('biases') is b
+            for name, lin, (w, s, b) in zip(IN_PROJ, held[0], held[1])
+        ):
+            _, _, weights, scales, biases, split, group_size, bits, mode = kept
+            out = mx.quantized_matmul(
+                inputs,
+                weights,
+                scales=scales,
+                biases=biases,
+                transpose=True,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
+            return tuple(mx.split(out, split, axis=-1))
+        layer.__dict__.pop('_quanteeze_in_proj', None)
+    linears = tuple(layer[name] for name in IN_PROJ)
+    out = forward._linears(linears, inputs)
+    first = linears[0]
+    joined = first.get('_fused_decode_linears') if isinstance(first, dict) else None
+    if (
+        inputs.ndim == 3
+        and inputs.shape[1] == 1
+        and joined is not None
+        and all(isinstance(lin, dict) and lin.get('biases') is not None and 'bias' not in lin for lin in linears)
+        and joined[0] == tuple((id(lin['weight']), id(lin['scales']), id(lin['biases'])) for lin in linears)
+    ):
+        held = (linears, tuple((lin['weight'], lin['scales'], lin['biases']) for lin in linears))
+        object.__setattr__(
+            layer,
+            '_quanteeze_in_proj',
+            (inputs.dtype, held, joined[1], joined[2], joined[3], joined[4], first.group_size, first.bits, first.mode),
+        )
+    return out
+
+
 def decode(forward, layer, inputs, cache):
     """Qwen3_5BatchInvariantForward._gated_delta for a step applies() takes, through conv(),
     delta() (on CUDA) and gated_norm() where they matched."""
     from mlx_vlm.models.qwen3_5.gated_delta import _compute_g_beta, gated_delta_update
-    mixed_qkv, z, b, a = forward._linears(
-        (layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a), inputs)
+    mixed_qkv, z, b, a = _in_proj(forward, layer, inputs)
     z = z.reshape(1, 1, -1, layer.head_v_dim)
     state = cache[0]
     width = layer.conv_kernel_size - 1
@@ -591,8 +646,8 @@ def decode(forward, layer, inputs, cache):
         if not joined:
             joined.append(mx.concatenate([state, mixed_qkv], axis=1))
         return joined[0]
-    if (cuda_kernels.FUSE[0] and cuda_kernels.available() and cache.lengths is None
-            and not getattr(cache, 'history_capacity', 0)):
+    if (((cuda_kernels.FUSE[0] and cuda_kernels.available()) or (SLIDE[0] and mx.metal.is_available()))
+            and cache.lengths is None and not getattr(cache, 'history_capacity', 0)):
         def mine():
             y, slid = conv(layer, state, mixed_qkv, sliding=True)
             return (*_qkv(layer, y), slid)

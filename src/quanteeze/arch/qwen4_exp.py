@@ -7,7 +7,7 @@ Hooks the batch-invariant decode/verify forward so one-token decode and speculat
 - `mx.compile` graphs for the router, shared expert, and weighting (`QUANTEEZE_COMPILE_DECODE`),
 - fused hyper-connection and PLE kernels (`quanteeze.hyper`, `quanteeze.cuda_ple_layer`),
 - custom Metal/CUDA routed-expert and MoE kernels (`quanteeze.expert_qmv`, `quanteeze.cuda_experts`,
-  `quanteeze.cuda_router`, `quanteeze.cuda_moe`).
+  `quanteeze.metal_router`, `quanteeze.cuda_router`, `quanteeze.cuda_moe`).
 """
 import functools
 import sys
@@ -21,7 +21,9 @@ from mlx_vlm.models.qwen4_exp.language import (Qwen4ExpBatchInvariantForward, Qw
 from .. import expert_qmv, linear_attn, per_thread, prefill, requant
 
 COMPILE = [True]                        # quanteeze.serve: QUANTEEZE_COMPILE_DECODE
-EVAL_LAYERS = [12]                      # quanteeze.serve: QUANTEEZE_EVAL_LAYERS
+EVAL_LAYERS = [0]                       # quanteeze.serve: QUANTEEZE_EVAL_LAYERS (0: auto, _eval_layers)
+EVAL_LAYERS_ON_METAL = 4                # auto default on Apple Silicon (Metal)
+EVAL_LAYERS_ON_CUDA = 12                # auto default on CUDA (CUDA graph batching)
 VERIFY_LEAD = [0]                       # quanteeze.serve: QUANTEEZE_VERIFY_LEAD_LAYERS (-1: auto, _verify_lead)
 VERIFY_LEAD_ON_CUDA = 4                 # auto default on a single CUDA GPU
 PACED = dict(waits=0)                   # layers of verify passes the host waited before building
@@ -45,14 +47,20 @@ def refused(what, error):
 
 
 def _router_and_shared(forward, block, x):
-    from .. import cuda_moe, cuda_router
-    indices, scores = cuda_router.routed(forward._linear(block.gate, x), block.top_k)
+    from .. import cuda_moe, cuda_router, metal_router
+    logits = forward._linear(block.gate, x)
+    indices, scores = metal_router.routed(logits, block.top_k, lambda: cuda_router.routed(logits, block.top_k))
     return indices, scores, cuda_moe.gated_shared(forward, block, x)
 
 
 @mx.compile
-def _weighted(output, scores, shared):
+def _weighted_graph(output, scores, shared):
     return (output * scores[..., None]).sum(axis=-2) + shared
+
+
+def _weighted(output, scores, shared):
+    from .. import metal_router
+    return metal_router.weighted(output, scores, shared, lambda: _weighted_graph(output, scores, shared))
 
 
 class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
@@ -84,15 +92,26 @@ class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
         from .. import cuda_kernels, parallel
         return VERIFY_LEAD_ON_CUDA if cuda_kernels.available() and parallel.size() == 1 else 0
 
+    @staticmethod
+    def _eval_layers(hidden):
+        """Decode layer batch cadence handed to `mx.async_eval` (`1` for prefill/verify)."""
+        if hidden.shape[1] != 1:
+            return 1
+        every = EVAL_LAYERS[0]
+        if every > 0:
+            return every
+        from .. import cuda_kernels
+        return EVAL_LAYERS_ON_CUDA if cuda_kernels.available() else EVAL_LAYERS_ON_METAL
+
     def _model(self, model, inputs, cache, inputs_embeds, position_ids, capture_layer_ids=None, hidden_sink=None):
-        """mlx-vlm's _model, a one-token step's layers handed to the GPU EVAL_LAYERS at a time."""
+        """mlx-vlm's _model, a one-token step's layers handed to the GPU `_eval_layers()` at a time."""
         hidden = model.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         hidden = mx.tile(hidden, (1, 1, model.args.hc_count))
         if cache is None:
             cache = [None] * len(model.layers)
         fa_mask = _language._create_qwen3_5_attention_mask(hidden, cache[model.fa_idx])
         ssm_mask = _language._create_qwen3_5_ssm_mask(hidden, cache[model.ssm_idx])
-        every = max(1, EVAL_LAYERS[0]) if hidden.shape[1] == 1 else 1
+        every = self._eval_layers(hidden)
         last = len(model.layers) - 1
         capture = set(capture_layer_ids or ())
         lead, behind = self._verify_lead(hidden), []
@@ -203,7 +222,7 @@ class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
         return self._inject(self._feed_forward(feed_forward, x), hyper_input, injection)
 
     def _compiled(self, block, x):
-        from .. import verify_qmv
+        from .. import metal_router, verify_qmv
         graphs = per_thread.slots(block).setdefault('_router_and_shared_by_b', {})
         key = (int(x.shape[0]), int(x.shape[1]))
         graph = graphs.get(key)
@@ -217,11 +236,16 @@ class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
                 return _weighted(self._experts(block, x, indices), scores, shared)
             ref = weakref.ref(block)
             graphs[key] = graph = mx.compile(lambda h: _router_and_shared(self, ref(), h))
-        elif graph is None:
+        elif graph is None or isinstance(graph, int):
+            gate = block['gate'] if isinstance(block, dict) and 'gate' in block else block.gate
+            gw = gate['weight'] if isinstance(gate, dict) and 'weight' in gate else getattr(gate, 'weight', None)
+            experts = int(gw.shape[0]) if gw is not None else 0
+            if graph is None or metal_router.pending(experts, block.top_k, x.dtype, x):
+                graphs[key] = (graph or 0) + 1
+                indices, scores, shared = _router_and_shared(self, block, x)
+                return _weighted(self._experts(block, x, indices), scores, shared)
             ref = weakref.ref(block)
-            graphs[key] = mx.compile(lambda h: _router_and_shared(self, ref(), h))
-            indices, scores, shared = _router_and_shared(self, block, x)
-            return _weighted(self._experts(block, x, indices), scores, shared)
+            graphs[key] = graph = mx.compile(lambda h: _router_and_shared(self, ref(), h))
         try:
             indices, scores, shared = graph(x)
         except Exception as error:

@@ -35,12 +35,17 @@ def _install_block(block):
 
         def __call__(self, x):
             if self.norm_topk_prob and x.ndim == 3 and x.shape[1] == 1:
-                from .. import cuda_router
-                inds, scores = cuda_router.routed(self.gate(x), self.top_k)
+                from .. import cuda_router, metal_router
+                logits = self.gate(x)
+                inds, scores = metal_router.routed(logits, self.top_k, lambda: cuda_router.routed(logits, self.top_k))
                 y = self.switch_mlp(x, inds)
-                y = (y * scores[..., None]).sum(axis=-2)
                 shared_y = self._shared_expert_scale(x) * self.shared_expert(x)
-                return y + shared_y
+                return metal_router.weighted(
+                    y,
+                    scores,
+                    shared_y,
+                    lambda: (y * scores[..., None]).sum(axis=-2) + shared_y,
+                )
             return orig_call(self, x)
 
     _FastMoeBlock.__name__ = cls.__name__

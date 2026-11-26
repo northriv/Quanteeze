@@ -129,6 +129,7 @@ CHOICES = {
     'QUANTEEZE_CUDA_ATTN_ROWS': ('on', 'off'),
     'QUANTEEZE_CUDA_DELTA': ('on', 'off'),
     'QUANTEEZE_CUDA_EXPERTS': ('on', 'off'),
+    'QUANTEEZE_METAL_ROUTER': ('on', 'off'),
     'QUANTEEZE_CUDA_ROUTER': ('on', 'off'),
     'QUANTEEZE_NUMPY_HUGE_PAGES': ('on', 'off'),
     'QUANTEEZE_CPU_EXPERTS': ('auto', 'on', 'off'),
@@ -317,7 +318,7 @@ def check(name, value):
         return f'a positive whole number, or {" or ".join(WORDS)} (the default is {setting.default})'
     if value and name in CHOICES and value not in CHOICES[name]:
         return f'one of {", ".join(CHOICES[name])}'
-    if value and name in ('QUANTEEZE_READ_THREADS', 'QUANTEEZE_CPU_THREADS') and value.lower() != 'auto' and not (
+    if value and name in ('QUANTEEZE_READ_THREADS', 'QUANTEEZE_CPU_THREADS', 'QUANTEEZE_EVAL_LAYERS') and value.lower() != 'auto' and not (
         value.isdigit() and int(value) > 0
     ):
         return 'a positive whole number or auto'

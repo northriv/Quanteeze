@@ -358,15 +358,20 @@ _TABLE = [
     ('QUANTEEZE_CUDA_EXPERTS', 'on', 'speed', 'start',
      'on MLX\'s CUDA backend, a decode token\'s 4-bit or 2-bit affine or MXFP4 routed experts in two kernels '
      '(gate+up+swiglu; down) where mlx-vlm runs four, checked bit for bit first (off: mlx-vlm\'s)'),
+    ('QUANTEEZE_METAL_ROUTER', 'on', 'speed', 'start',
+     'on Metal, a decode token\'s routing (softmax, top k, and renormalized weights) in one kernel where MLX runs '
+     'seven ops, and routed outputs weighted, summed, and combined with the shared expert in one kernel where '
+     'MLX runs three (quanteeze.metal_router), each shape checked bit for bit first (off: MLX\'s ops)'),
     ('QUANTEEZE_CUDA_ROUTER', 'on', 'speed', 'start',
      'on MLX\'s CUDA backend, a decode token\'s routing in one kernel where MLX runs six, checked bit for bit '
      'first (off: MLX\'s ops)'),
     ('QUANTEEZE_COMPILE_DECODE', 'on', 'speed', 'start',
      'Flash-Next\'s decode token with its routers, shared experts, weighting and hyper-connections as compiled '
      'graphs (mx.compile) (off: op by op)'),
-    ('QUANTEEZE_EVAL_LAYERS', '12', 'speed', 'start',
-     'Flash-Next\'s decode token handed to the GPU this many layers at a time, not one by one (mlx-vlm\'s): on '
-     'MLX\'s CUDA backend each hand-over ends a CUDA graph, between which the GPU waits (1: mlx-vlm\'s)'),
+    ('QUANTEEZE_EVAL_LAYERS', 'auto', 'speed', 'start',
+     'Flash-Next\'s decode token handed to the GPU this many layers at a time, not one by one (mlx-vlm\'s): '
+     'auto uses 4 on Apple Silicon (Metal) and 12 on CUDA to preserve CUDA graph batching (positive int overrides; '
+     '1: mlx-vlm\'s)'),
     ('QUANTEEZE_VERIFY_LEAD_LAYERS', 'auto', 'speed', 'start',
      'layers the host may build ahead of the GPU in a Flash-Next MTP verify pass: before building a layer, wait '
      'for the input to the layer this many steps behind so freed buffers do not pile up in the driver pool and '
