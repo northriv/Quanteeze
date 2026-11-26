@@ -545,7 +545,7 @@ See [LICENSE](LICENSE) for full details. Third-party components under `src/quant
 
 Quanteeze distributes no model weights; users are responsible for complying with each model's own license (including any MaaS / service-offering terms when binding beyond `127.0.0.1` via `--host`).
 
-**Commercial licensing, product integration, and enhanced editions:** For proprietary product integration outside GPL-2.0 / PolyForm Shield, research collaborations, or enhanced editions with additional optimization capabilities, please contact [Kitagawa Laboratory, ISSP, University of Tokyo](https://kitag.issp.u-tokyo.ac.jp/).
+**Product integration and enhanced editions:** For product integration outside GPL-2.0 / PolyForm Shield, research collaborations, or enhanced editions with additional optimization capabilities, please contact [Kitagawa Laboratory, ISSP, University of Tokyo](https://kitag.issp.u-tokyo.ac.jp/).
 
 ---
 

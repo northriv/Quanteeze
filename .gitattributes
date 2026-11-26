@@ -1,0 +1,13 @@
+# Count first-party C++20 extensions and bundled kamestm / kamepoolalloc in GitHub language stats
+# (keep third-party deepseek_v4 and deepseek_v41 under vendor/ excluded as vendored).
+src/quanteeze/vendor/checks/** linguist-vendored=false
+src/quanteeze/vendor/cpu_experts/** linguist-vendored=false
+src/quanteeze/vendor/drafts/** linguist-vendored=false
+src/quanteeze/vendor/dspark/** linguist-vendored=false
+src/quanteeze/vendor/engram/** linguist-vendored=false
+src/quanteeze/vendor/kamepoolalloc/** linguist-vendored=false
+src/quanteeze/vendor/native_reads/** linguist-vendored=false
+src/quanteeze/vendor/nvrtc_pch/** linguist-vendored=false
+src/quanteeze/vendor/stm_core/** linguist-vendored=false
+src/quanteeze/vendor/touch/** linguist-vendored=false
+src/quanteeze/vendor/v41_attention/** linguist-vendored=false
