@@ -228,12 +228,16 @@ def test_nemotron_vendor_license_and_lazy_isolation():
     assert all(m is not None for m in (serve, home, control, image_mcp, nemotron_image, vlm_image))
 
     vendor_dir = Path(nemotron_image.__file__).resolve().parent / 'vendor' / 'nemotron_image'
-    lic = (vendor_dir / 'LICENSE').read_text(encoding='utf-8')
-    notice = (vendor_dir / 'NOTICE.md').read_text(encoding='utf-8')
-    l24sq_src = (vendor_dir / 'l24sq.py').read_text(encoding='utf-8')
-    assert 'NVIDIA License' in lic and 'research or evaluation purposes only' in lic
-    assert 'GPL-2.0-only' in notice and 'NVIDIA License' in notice
-    assert 'SPDX-License-Identifier: LicenseRef-NvidiaProprietary' in l24sq_src
+    if vendor_dir.is_dir():
+        lic = (vendor_dir / 'LICENSE').read_text(encoding='utf-8')
+        notice = (vendor_dir / 'NOTICE.md').read_text(encoding='utf-8')
+        l24sq_src = (vendor_dir / 'l24sq.py').read_text(encoding='utf-8')
+        assert 'NVIDIA License' in lic and 'research or evaluation purposes only' in lic
+        assert 'GPL-2.0-only' in notice and 'NVIDIA License' in notice
+        assert 'SPDX-License-Identifier: LicenseRef-NvidiaProprietary' in l24sq_src
+    else:
+        with pytest.raises(RuntimeError, match=r'quanteeze\.vendor\.nemotron_image\.l24sq is not installed'):
+            nemotron_image.draw('.', '.', 'x')
     assert image_mcp.ORDER == ('z-image-turbo', 'flux2-klein', 'qwen-image', 'nemotron-image')
     assert 'NVIDIA License' in image_mcp.Nemotron.license
     assert 'research or evaluation only' in image_mcp.Nemotron.license

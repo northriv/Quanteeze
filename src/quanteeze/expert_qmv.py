@@ -788,20 +788,30 @@ def install_switch(switch):
         return switch
     orig_call = cls.__call__
     has_weights = weighs(switch.activation)
+    has_combine = not has_weights and callable(getattr(cls, '_combine', None))
 
     class _FastSwitch(cls):
         _quanteeze_expert_qmv = True
 
         def __call__(self, x, indices, *args, **kwargs):
-            w = args[0] if (args and has_weights) else kwargs.get('weights')
+            w = (args[0] if args else kwargs.get('weights')) if has_weights else None
+            combine = None
+            if has_combine and (args or kwargs):
+                c_weights = args[0] if len(args) >= 1 else kwargs.get('weights')
+                c_shared = args[1] if len(args) >= 2 else kwargs.get('shared')
+                c_residual = args[2] if len(args) >= 3 else kwargs.get('residual')
+                if c_weights is not None or c_shared is not None or c_residual is not None:
+                    combine = (c_weights, c_shared, c_residual)
             if x.ndim == 3 and ((x.shape[0] == 1 and 1 <= x.shape[1] <= verify_qmv.MAX_TOKENS)
                                 or (x.shape[1] == 1 and 1 <= x.shape[0] <= verify_qmv.MAX_TOKENS)):
-                return decode(self, x, indices, w if has_weights else None)
+                y = decode(self, x, indices, w)
+                return self._combine(y, *combine) if combine is not None else y
             if any(
                 getattr(p, 'bits', None) is not None and not requant.native(p.bits, getattr(p, 'mode', 'affine'))
                 for p in (self.gate_proj, self.up_proj, self.down_proj)
             ):
-                return stock(self, x, indices, w if has_weights else None)
+                y = stock(self, x, indices, w)
+                return self._combine(y, *combine) if combine is not None else y
             return orig_call(self, x, indices, *args, **kwargs)
 
     _FastSwitch.__name__ = cls.__name__

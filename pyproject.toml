@@ -4,7 +4,12 @@ version = "0.1.10"
 description = "Fast uniform least-squares quantization and speculative MoE serving on Apple Silicon and CUDA"
 readme = "README.md"
 license = "GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0"
-license-files = ["LICENSE", "LICENSE-GPL-2.0", "LICENSE-POLYFORM-SHIELD"]
+license-files = [
+    "LICENSE",
+    "LICENSE-GPL-2.0",
+    "LICENSE-POLYFORM-SHIELD",
+    "docs/images/Montserrat-OFL.txt",
+]
 authors = [{ name = "Kentaro Kitagawa" }]
 requires-python = ">=3.12"
 keywords = [
@@ -77,6 +82,7 @@ source-include = [
 source-exclude = [
     "/tests/test_local_*.py",
     "/CLAUDE.md",
+    "/src/quanteeze/vendor/nemotron_image/**",
     "**/__pycache__",
     "**/*.py[cod]",
 ]
@@ -85,6 +91,7 @@ wheel-exclude = [
     "**/*.py[cod]",
     "quanteeze/vendor/deepseek_v4/tests/**",
     "quanteeze/vendor/deepseek_v41/tests/**",
+    "quanteeze/vendor/nemotron_image/**",
 ]
 
 [build-system]

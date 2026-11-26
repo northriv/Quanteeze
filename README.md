@@ -367,6 +367,35 @@ Across 3 fixed prompts (English explanation, Python code generation, Japanese ex
 | `QUANTEEZE_MTP=auto` (default, 2-bit DSpark ON) | 31.0 s | **16.5 tok/s** / 16.2 / 12.2–22.2 | 15.9 / 22.1 tok/s | 93.8% | **90.1%** (2.26 tok/round) | 0 mismatches (150,171 calls) | **91.0 GB** (0 over-limit) |
 | `QUANTEEZE_MTP=off` (single-token decode) | 24.4 s | **13.5 tok/s** / 13.4 / 11.7–15.8 | 13.0 / 14.6 tok/s | 96.2% | — | 0 mismatches (292,158 calls) | **85.6 GB** (0 over-limit, +0.0 GB swap) |
 
+### Multimodal Multi-Turn Agent, Restart APC & Concurrency (Apple M5 Max 128 GB, 2026-11-26)
+
+Measured on the same **Apple M5 Max (128 GB Unified Memory / internal NVMe SSD)** serving checkpoints **in place (`0 GB` extra repacking)**:
+
+#### 1. 43k–47k Multimodal Agent + Session Switch + Hard Server Restart (`Qwen3.8-Flash-Next-4bit-mtp-plemmap`)
+
+- **Setup**: `QUANTEEZE_DRAFTER=dflash2` (4-bit `DFlash2`, 0.3 GB), `QUANTEEZE_KV_BITS=8`, AES-256-GCM disk-only APC (`0 GB` GPU APC footprint, **3.33 GB** sealed across 12 files on disk, **0** plaintext canary leaks), 42.8k–46.8k source-code context + 2 PNG screenshots, `temperature=0`, `0` kernel mismatches (`expert_qmv`, `hyper`, `linear_attn`, `8-bit KV`, `verify`). Startup took **15.5 s** cold / **11.5–12.0 s** on restart (sustained runs engaged macOS `thermal pressure 2` = 85% GPU duty cycle).
+
+| Step | Prompt (+ 2 PNG Images) | Cached Tokens | TTFT | Prefill Speed | Decode Speed | Notes |
+|---|---|---|---|---|---|---|
+| **Turn 1 (Cold)** | 42,806 tok + 2 images | 0 | 47.45 s | 964.1 tok/s | 42.7 tok/s | Sealed 1.94 GB encrypted APC on disk |
+| **Turn 2 (Warm)** | 44,271 tok + 2 images | **42,805** | **5.04 s** | **14,057.7 tok/s** | **54.3 tok/s** | 99.998% prefix hit via OS page cache |
+| Competing Session B | 20,349 tok (text) | 0 | 20.34 s | 1,006.9 tok/s | 46.1 tok/s | Disjoint session; did not evict Session A |
+| **Turn 3 (Return to A)** | 45,617 tok + 2 images | **44,270** | **5.23 s** | **11,488.1 tok/s** | **68.2 tok/s** | Final disk APC **3.33 GB** (0 leaks) |
+| **Turn 4 (Post-Restart Restore)** | **46,842 tok + 2 images** | **45,616** | **10.20 s** | **14,162.5 tok/s** | **56.0 tok/s** | Restored from disk after full process restart |
+| **Control: No APC (`APC_ENABLED=0`)** | **46,842 tok + 2 images** | 0 | **65.08 s** | 795.6 tok/s | 49.9 tok/s | **`6.38x`** post-restart TTFT speedup (`~12.9x` warm vs 47k cold); 4-turn total **78.5 s** |
+
+- **Decode responsiveness under an 18.4k cold prompt arrival (`APC=0`)**: Launching an **18,389-token** cold prompt 1.5 s into a 320-token decode (`634` prompt tokens) let the active decode finish all 320 tokens cleanly at **59.5 tok/s** with **39.45 ms** max inter-token gap (**33.07 ms** P95, **30.92 ms** median; 24.0 s before the 18.4k prefill finished; peak **114.2 GB < 115.4 GB** limit, 0 OOM). Across clean `B = 1 / 2 / 4` bursts (~2.3k prompts, 200 generated tokens), memory-aware admission held peak footprint at **111.5 GB** (**+0.0 GB** swap) while sustaining **67.3–72.7 tok/s** per-request decode (**476.7 / 493.6 / 440.8 tok/s** total `S`, aggregate `S_TG = 67.0 / 72.4 / 58.6 tok/s`).
+
+#### 2. Multi-Model Zero-Repack Coverage on 128 GB Mac (`0 GB` Extra Disk Overhead)
+
+| Model | Placement on 128 GB Mac | Load Time | Decode Speed (`temperature=0`) | Kernel Checks |
+|---|---|---|---|---|
+| `Qwen3.8-Flash-Next-4bit-mtp-plemmap` (`dflash2`, `KV=8bit`) | In-memory (**75.5 GB** experts) | 11.5–15.5 s | **42.7–76.4 tok/s** (warm 43k–47k: **54.3–68.2 tok/s**) | **0 mismatches** |
+| `DeepSeek-V4.1-Flash-1017` + `--experts-gguf UD-IQ1_M` (`DSpark`) | On-demand SSD (**71.6 / 132.2 GB**, `208/384` layers) | 31.1 s | **10.9–15.4 tok/s** sustained (mean **13.15**, `88.57%` accept, `92.67%` SSD hit; **16.5 / max 22.2 tok/s** in 2026-11-15 run) | **0 mismatches** |
+| `GLM-5.3-Flash-MLX-4bit-MTP` (`glm5_next`) | On-demand SSD (**75.5 / 171.2 GB**, `127/288` layers) | 52.4–60.2 s | **6.7–7.1 tok/s** (`MTP=off`, mean **6.90**, `82.31%` hit); **6.3–6.7 tok/s** (`MTP=auto`, `68.05%` accept / `1.681 tok/round`) | **0 mismatches** (`expert_qmv`, `glm_hyper`, `glm_linear_attn`, `sigmoid_router`, `verify`) |
+
+> When `GLM-5.3-Flash`'s 171.2 GB 4-bit experts stream at 44.1% residency on a 128 GB Mac, `QUANTEEZE_MTP=off` leaves slightly more room and avoids extra SSD misses (`82.31%` vs `78.71%` hit rate), outperforming `QUANTEEZE_MTP=auto` (`6.90` vs `6.50 tok/s`).
+
 ### Operational Notes
 
 - **Synergy with DSpark MTP**: The 2-bit MLX DSpark drafter achieves **90.1%** acceptance against GGUF `UD-IQ1_M` experts, reaching **up to 22.2 tok/s** on Python code generation (**+64%** over `MTP=off` at 13.5 tok/s; macOS `thermal pressure 2` = 85% GPU duty cycle engaged during sustained runs).

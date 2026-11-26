@@ -86,6 +86,7 @@ from . import (
     reask,
     request_threads,
     requant,
+    responses,
     shutdown,
     sigmoid_router,
     stream,
@@ -1737,6 +1738,7 @@ def main():
     _wire()
     generation.load = _load_hooked
     efforts.install(generation.GenerationArguments)
+    responses.install()
     prefetcher = ngram_prefetch.use()
     print(f'quanteeze: n-gram pages read ahead by {prefetcher.threads} threads' if prefetcher.threads
           else 'quanteeze: n-gram read-ahead off', file=sys.stderr, flush=True)
