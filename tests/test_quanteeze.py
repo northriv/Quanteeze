@@ -560,6 +560,99 @@ def test_uniform_ggml_lower_model_and_demand(tmp_path, monkeypatch, mode):
 
 
 @pytest.mark.parametrize('mode', ['q2_k', 'q3_k', 'iq2_xs'])
+def test_uniform_ggml_on_cuda_through_the_raw_block_kernels(tmp_path, monkeypatch, mode):
+    """On CUDA the uniform ggml layout `(body, d, dmin)` is joined into raw ggml blocks, byte for byte as
+    `ggml_quants.blocks` lays them out, and served by `gguf_qmv`'s kernels within their tolerance of the unpacked
+    product: a decode token (the fused kernels), rows of a prompt, and the on-demand slots."""
+    import mlx.nn as nn
+    from quanteeze import cuda_kernels, demand, ggml_quants, gguf_qmv
+
+    if mx.metal.is_available() or not cuda_kernels.available() or mx.default_device() != mx.gpu:
+        pytest.skip('CUDA-only: Metal serves this layout with the K-quant kernels')
+    monkeypatch.setenv('QUANTEEZE_QUANT_CACHE', str(tmp_path / 'qcache'))
+    monkeypatch.setenv('QUANTEEZE_CPU_EXPERTS', 'off')
+    hidden, inner, experts = 512, 256, 16
+
+    def build_model():
+        sw = SwitchGLU(input_dims=hidden, hidden_dims=inner, num_experts=experts, bias=False)
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            setattr(sw, proj, getattr(sw, proj).to_quantized(group_size=64, bits=4))
+        mlp = nn.Module()
+        mlp.switch_mlp = sw
+        layer = nn.Module()
+        layer.mlp = mlp
+        m = nn.Module()
+        m.layers = [layer]
+        return m
+
+    mx.random.seed(303)
+    stock = build_model().layers[0].mlp.switch_mlp
+    mx.eval(stock.parameters())
+    ckpt_dir = tmp_path / 'ckpt'
+    ckpt_dir.mkdir()
+    (ckpt_dir / 'config.json').write_text('{"quantization": {"group_size": 64, "bits": 4}}', encoding='utf-8')
+    mx.save_safetensors(str(ckpt_dir / 'model.safetensors'), {
+        f'layers.0.mlp.switch_mlp.{proj}.{part}': getattr(getattr(stock, proj), part)
+        for proj in ('gate_proj', 'up_proj', 'down_proj') for part in ('weight', 'scales', 'biases')})
+
+    m_mem = build_model()
+    requant.lower_model(m_mem.layers, ckpt_dir, mode, 256)
+    sw = m_mem.layers[0].mlp.switch_mlp
+    expert_qmv.install_switch(sw)
+    for name in ('gate_proj', 'up_proj', 'down_proj'):
+        proj = getattr(sw, name)
+        raw = expert_qmv._raw_blocks(proj)
+        assert raw.mode == 'gguf:' + mode.upper()
+        got = np.array(raw.weight)
+        want = ggml_quants.blocks(proj.weight, proj.scales, proj.biases if mode == 'q2_k' else None, mode=mode)
+        assert got.dtype == np.uint8 and np.array_equal(got.reshape(-1, got.shape[-1]), want)
+        some = mx.array([5, 1, 1, 3], dtype=mx.uint32)
+        assert np.array_equal(np.array(expert_qmv._raw_blocks(proj, some).weight), got[[5, 1, 1, 3]])
+
+    def f32(a):
+        return np.array(a.astype(mx.float32))
+
+    rng = np.random.default_rng(7)
+    before = dict(gguf_qmv.STATS)
+    for (b, t), k in [((1, 1), 4), ((2, 1), 4), ((1, 6), 4), ((1, 40), 4), ((1, 1), 8)]:
+        x = mx.array(rng.standard_normal((b, t, hidden)).astype(np.float32)).astype(mx.bfloat16)
+        idx = mx.array(rng.integers(0, experts, (b, t, k)).astype(np.uint32))
+        mx.eval(x, idx)
+        monkeypatch.setattr(gguf_qmv, 'ON', [False])
+        want = sw(x, idx)
+        mx.eval(want)
+        monkeypatch.setattr(gguf_qmv, 'ON', [True])
+        for _ in range(gguf_qmv.CHECKS + 2):
+            got = sw(x, idx)
+            mx.eval(got)
+            assert got.shape == want.shape
+            assert np.abs(f32(got) - f32(want)).max() <= gguf_qmv.TOLERANCE * np.abs(f32(want)).max()
+    assert gguf_qmv.STATS['mismatched'] == before['mismatched']
+    assert gguf_qmv.STATS['served'] > before['served']
+
+    m_ssd = build_model()
+    dem = demand.Demand(m_ssd, requant.Flat(ckpt_dir, mode, 256), budget_bytes=1, workers=2)
+    before = dict(gguf_qmv.STATS)
+    try:
+        for (b, t), k in [((1, 1), 4), ((1, 6), 4), ((1, 1), 4), ((1, 1), 4), ((1, 1), 4), ((1, 1), 4)]:
+            x = mx.array(rng.standard_normal((b, t, hidden)).astype(np.float32)).astype(mx.bfloat16)
+            idx = mx.array(np.stack([rng.permutation(experts)[:k] for _ in range(b * t)]).reshape(b, t, k).astype(np.uint32))
+            scores = mx.ones(idx.shape, dtype=mx.bfloat16) * 0.25
+            mx.eval(x, idx, scores)
+            monkeypatch.setattr(gguf_qmv, 'ON', [False])
+            want = sw(x, idx)
+            mx.eval(want)
+            monkeypatch.setattr(gguf_qmv, 'ON', [True])
+            got = m_ssd.layers[0].mlp.switch_mlp(x, idx, scores)
+            mx.eval(got)
+            np.testing.assert_allclose(f32(got), f32(want), rtol=2e-2, atol=2e-2)
+    finally:
+        dem.close()
+    assert gguf_qmv.STATS['mismatched'] == before['mismatched']
+    assert gguf_qmv.STATS['served'] > before['served']
+
+
+@pytest.mark.parametrize('mode', ['q2_k', 'q3_k', 'iq2_xs'])
 def test_uniform_ggml_lower_model_mlx_vlm_and_bf16_mixed_dims(tmp_path, monkeypatch, mode):
     """`requant.lower_model` handles `mlx_vlm` `QuantizedSwitchLinear` and BF16 `SwitchLinear`,
     including mixed 4D ggml (`gate_proj`/`up_proj`) and 3D affine (`down_proj`) dimensions."""

@@ -675,6 +675,58 @@ def own(switch, x, indices, weights=None):
     return run(switch.down_proj, hidden, idx, per).reshape(b0, t0, k, d)
 
 
+class _RawProj(dict):
+    """Experts of a projection as raw ggml blocks (`weight uint8 [experts, rows, blocks, block bytes]`,
+    `mode 'gguf:<NAME>'`), as `gguf_qmv`'s kernels read them."""
+
+    def __init__(self, weight, mode):
+        super().__init__(weight=weight)
+        self.weight, self.mode = weight, mode
+
+
+def _f16_bytes(a):
+    return a.astype(mx.float16).view(mx.uint8).reshape(*a.shape, 2)
+
+
+def _raw_blocks(proj, flat=None):
+    """`proj`'s experts (those at `flat`, in that order, or all of them) joined from the uniform ggml layout
+    `(body, d, dmin)` into raw ggml blocks as `ggml_quants.blocks` lays them out, or None where `proj` is not in
+    that layout.  The Q2_K / Q3_K / IQ2_XS kernels of `kquant_qmv` read the split layout but are Metal's; on CUDA
+    `gguf_qmv`'s read raw blocks, and without them every pass unpacks the routed experts to floats."""
+    mode = getattr(proj, 'mode', None)
+    if mode not in requant.GGML_MODES:
+        return None
+    body, d, dmin = proj.weight, getattr(proj, 'scales', None), getattr(proj, 'biases', None)
+    if body.ndim != 4 or body.dtype != mx.uint8 or d is None or (mode == 'q2_k' and dmin is None):
+        return None
+    if flat is not None:
+        body, d, dmin = body[flat], d[flat], None if dmin is None else dmin[flat]
+    if mode == 'iq2_xs':
+        parts = [_f16_bytes(d), body]
+    elif mode == 'q2_k':
+        parts = [body, _f16_bytes(d), _f16_bytes(dmin)]
+    else:
+        parts = [body, _f16_bytes(d)]
+    return _RawProj(mx.concatenate(parts, axis=-1), 'gguf:' + mode.upper())
+
+
+def _uniform_ggml(switch):
+    return all(getattr(getattr(switch, n, None), 'mode', None) in requant.GGML_MODES
+               for n in ('gate_proj', 'up_proj', 'down_proj'))
+
+
+def _raw_switch(switch, indices):
+    """`(switch, indices)` with the experts `indices` names as raw ggml blocks, one a routed slot in `indices`'
+    order, and the indices that name them so; None where a projection cannot be joined."""
+    from types import SimpleNamespace
+    flat = indices.reshape(-1)
+    projs = [_raw_blocks(getattr(switch, n), flat) for n in ('gate_proj', 'up_proj', 'down_proj')]
+    if any(p is None for p in projs):
+        return None
+    raw = SimpleNamespace(gate_proj=projs[0], up_proj=projs[1], down_proj=projs[2], activation=switch.activation)
+    return raw, mx.arange(indices.size, dtype=mx.uint32).reshape(indices.shape)
+
+
 def _proj_call(proj, x, indices, sorted_indices=False, rows_plan=None):
     bits = getattr(proj, 'bits', None)
     mode = getattr(proj, 'mode', 'affine')
@@ -707,6 +759,22 @@ def _proj_call(proj, x, indices, sorted_indices=False, rows_plan=None):
                 return kquant_qmv.gather(proj, x, indices, unpacked)
             if kquant_qmv.takes_rows(proj, x, indices):
                 return kquant_qmv.gather_rows(proj, x, indices, unpacked)
+        if mode in requant.GGML_MODES and not mx.metal.is_available():
+            from . import gguf_qmv
+            if gguf_qmv.ON[0] and gguf_qmv._gpu_available():       # CUDA: gguf_qmv's kernels over raw blocks
+                rows = indices.ndim == 1 and x.ndim == 3 and x.shape[0] == indices.size
+                if rows or indices.size >= proj.weight.shape[0]:   # (rows of a prompt: the whole bank joined)
+                    raw, idx = _raw_blocks(proj), indices
+                else:                                              # (a few routed slots: those alone)
+                    raw = _raw_blocks(proj, indices.reshape(-1))
+                    idx = mx.arange(indices.size, dtype=mx.uint32).reshape(indices.shape)
+                if raw is not None:
+                    if prefer_rows and gguf_qmv.takes_rows(raw, x, idx):
+                        return gguf_qmv.gather_rows(raw, x, idx, unpacked)
+                    if gguf_qmv.takes(raw, x, idx):
+                        return gguf_qmv.gather(raw, x, idx, unpacked)
+                    if gguf_qmv.takes_rows(raw, x, idx):
+                        return gguf_qmv.gather_rows(raw, x, idx, unpacked)
         return unpacked()
     return proj(x, indices, sorted_indices=sorted_indices)
 
@@ -769,6 +837,11 @@ def decode(switch, x, indices, weights=None):
             return cuda_experts.decode(switch, x, indices, lambda: stock(switch, x, indices))
         if gguf_qmv.ON[0] and gguf_qmv.takes_switch(switch, x, indices):
             return gguf_qmv.decode_switch(switch, x, indices, lambda: stock(switch, x, indices))
+        if (gguf_qmv.ON[0] and x.ndim == 3 and x.shape[1] == 1 and 1 <= x.shape[0] <= 8 and indices.ndim == 3
+                and _uniform_ggml(switch)):                        # uniform Q2_K / Q3_K / IQ2_XS: the routed slots
+            made = _raw_switch(switch, indices)                    # joined into raw ggml blocks for the same kernels
+            if made is not None and gguf_qmv.takes_switch(made[0], x, made[1]):
+                return gguf_qmv.decode_switch(made[0], x, made[1], lambda: stock(switch, x, indices))
     if not ON[0] or not eligible(switch, x, indices):
         return stock(switch, x, indices, weights)
     k = key(switch, x, indices, weights is not None)
