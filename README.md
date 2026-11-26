@@ -516,42 +516,11 @@ uv run python bench/llamacpp/batched_bench.py --url 127.0.0.1:8765 --checkpoint 
 
 ## Citing
 
-Quanteeze incorporates the formally verified lock-free Software Transactional Memory library **[`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm)** (`Transactional::Node` / `Snapshot` / `Transaction`, `atomic_shared_ptr`, `XWaitCell`) and the four-tier lock-free pool allocator **[`kamepoolalloc`](https://github.com/northriv/kamepoolalloc)** extracted from the physical-property measurement platform **[KAME](https://github.com/northriv/KAME)**.
+See [CITATION.cff](CITATION.cff) (or GitHub's **Cite this repository** button).
 
-- **`kamestm` (Lock-Free Software Transactional Memory)**:  
-  K. Kitagawa, *"Formally Verified Lock-Free Software Transactional Memory for Scientific Measurement"*, [arXiv:2608.12024](https://arxiv.org/abs/2608.12024) (2026), DOI: [`10.48550/arXiv.2608.12024`](https://doi.org/10.48550/arXiv.2608.12024) ([`northriv/KAME/kamestm`](https://github.com/northriv/KAME/tree/master/kamestm))
-- **`kamepoolalloc` (Four-Tier Lock-Free Pool Allocator)**:  
-  K. Kitagawa, *"`kamepoolalloc`: A Lock-Free, Per-Thread, Four-Tier Pool Allocator"* ([`northriv/kamepoolalloc`](https://github.com/northriv/kamepoolalloc) · [`northriv/KAME/kamepoolalloc`](https://github.com/northriv/KAME/tree/master/kamepoolalloc))
-- **KAME**:  
-  *"KAME: AI-Assisted Automation Program for Physical Property Measurements"* ([`northriv/KAME`](https://github.com/northriv/KAME))
-
-```bibtex
-@misc{kitagawa2026kamestm,
-  title         = {Formally Verified Lock-Free Software Transactional Memory
-                   for Scientific Measurement},
-  author        = {Kitagawa, Kentaro},
-  year          = {2026},
-  eprint        = {2608.12024},
-  archivePrefix = {arXiv},
-  primaryClass  = {cond-mat.other},
-  doi           = {10.48550/arXiv.2608.12024},
-  url           = {https://arxiv.org/abs/2608.12024}
-}
-
-@misc{kitagawa2026kamepoolalloc,
-  title        = {kamepoolalloc: A Lock-Free, Per-Thread, Four-Tier Pool Allocator},
-  author       = {Kitagawa, Kentaro},
-  year         = {2026},
-  howpublished = {\url{https://github.com/northriv/kamepoolalloc}}
-}
-
-@misc{kitagawa2026quanteeze,
-  title        = {Quanteeze: Fast Uniform Quantization and On-Demand {MoE} Serving on {Apple} Silicon and {CUDA}},
-  author       = {Kitagawa, Kentaro},
-  year         = {2026},
-  howpublished = {\url{https://github.com/northriv/Quanteeze}}
-}
-```
+- **Quanteeze**: K. Kitagawa, [`northriv/Quanteeze`](https://github.com/northriv/Quanteeze) (2026)
+- **`kamestm`**: K. Kitagawa, [arXiv:2608.12024](https://arxiv.org/abs/2608.12024) (2026)
+- **`kamepoolalloc` / KAME**: [`northriv/kamepoolalloc`](https://github.com/northriv/kamepoolalloc) · [`northriv/KAME`](https://github.com/northriv/KAME)
 
 ---
 
