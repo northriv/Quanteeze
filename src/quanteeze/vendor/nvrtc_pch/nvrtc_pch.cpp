@@ -28,7 +28,11 @@ using Program = void *;                              // nvrtcProgram
 using Compile = Result (*)(Program, int, const char *const *);
 using Create = Result (*)(Program *, const char *, const char *, int, const char *const *, const char *const *);
 using Status = Result (*)(Program);                  // nvrtcGetPCHCreateStatus
+using Needed = Result (*)(Program, size_t *);        // nvrtcGetPCHHeapSizeRequired
+using Resize = Result (*)(size_t);                   // nvrtcSetPCHHeapSize
 constexpr Result INTERNAL_ERROR = 11;                // NVRTC_ERROR_INTERNAL_ERROR
+constexpr Result HEAP_EXHAUSTED = 14;                // NVRTC_ERROR_PCH_CREATE_HEAP_EXHAUSTED
+constexpr size_t HEAP_MOST = size_t(1) << 30;        // the PCH heap is never grown past this
 constexpr char CUSTOM[] = "custom_kernel_";
 constexpr uint64_t MOST_MADE = 8;
 constexpr size_t PATH_MOST = 4096;                   // a loaded library's path, with its end
@@ -36,6 +40,9 @@ constexpr size_t PATH_MOST = 4096;                   // a loaded library's path,
 atomic<Compile> real_compile{nullptr};
 atomic<Create> real_create{nullptr};
 atomic<Status> real_status{nullptr};
+atomic<Needed> real_needed{nullptr};
+atomic<Resize> real_resize{nullptr};
+atomic<uint64_t> grown{0};
 atomic<uint64_t> compiles{0}, added{0}, made{0};
 
 struct Place {
@@ -140,8 +147,17 @@ extern "C" __attribute__((visibility("default"))) Result nvrtcCompileProgram(Pro
     }
     added.fetch_add(1, std::memory_order_relaxed);
     const Result r = f(program, static_cast<int>(with.size()), with.data());
-    if(status(program) == 0)
+    const Result created = status(program);
+    if(created == 0)
         made.fetch_add(1, std::memory_order_relaxed);
+    else if(created == HEAP_EXHAUSTED) {             // the heap NVRTC set aside was too small for this program's
+        Needed needed = own(real_needed, "nvrtcGetPCHHeapSizeRequired");     // headers: grown to what it asks, for
+        Resize resize = own(real_resize, "nvrtcSetPCHHeapSize");             // the custom kernels compiled after
+        size_t bytes = 0;
+        if(needed && resize && needed(program, &bytes) == 0 && bytes > 0 && bytes <= HEAP_MOST &&
+           resize(bytes) == 0)
+            grown.fetch_add(1, std::memory_order_relaxed);
+    }
     return r;
 }
 
@@ -163,4 +179,9 @@ extern "C" __attribute__((visibility("default"))) void qz_nvrtc_pch_counts(uint6
     out[0] = compiles.load(std::memory_order_relaxed);
     out[1] = added.load(std::memory_order_relaxed);
     out[2] = made.load(std::memory_order_relaxed);
+}
+
+// How many times the PCH heap was grown to what a compile asked for.
+extern "C" __attribute__((visibility("default"))) uint64_t qz_nvrtc_pch_grown() noexcept {
+    return grown.load(std::memory_order_relaxed);
 }
