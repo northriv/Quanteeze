@@ -2,13 +2,15 @@
 // NVRTC automatic precompiled headers for MLX custom CUDA kernels (QUANTEEZE_NVRTC_PCH; quanteeze/__init__.py).
 //
 // Loaded with RTLD_GLOBAL before MLX is imported, this library interposes nvrtcCreateProgram and
-// nvrtcCompileProgram and delegates to libnvrtc.so.12 via RTLD_NOLOAD:
+// nvrtcCompileProgram and delegates to the libnvrtc.so.<major> this process has loaded (CUDA 12's or 13's: found
+// among the loaded objects by name, opened with RTLD_NOLOAD):
 // - "--pch" and "--pch-dir=<dir>" are added only for mx.fast.cuda_kernel programs (named "custom_kernel_*")
 //   whose compile follows on the same thread; MLX's own PTX kernels (which are cached on disk and can
 //   require >268 MB PCH heaps) compile unmodified.
 // - PCH files go to a per-process directory set once via qz_nvrtc_pch_dir (never cwd), skipped in forked
 //   children, skipped if NVRTC < 12.8 lacks nvrtcGetPCHCreateStatus, and capped at MOST_MADE files.
 #include <dlfcn.h>
+#include <link.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -29,6 +31,7 @@ using Status = Result (*)(Program);                  // nvrtcGetPCHCreateStatus
 constexpr Result INTERNAL_ERROR = 11;                // NVRTC_ERROR_INTERNAL_ERROR
 constexpr char CUSTOM[] = "custom_kernel_";
 constexpr uint64_t MOST_MADE = 8;
+constexpr size_t PATH_MOST = 4096;                   // a loaded library's path, with its end
 
 atomic<Compile> real_compile{nullptr};
 atomic<Create> real_create{nullptr};
@@ -43,12 +46,40 @@ atomic_shared_ptr<const Place> place;
 
 thread_local Program custom = nullptr;
 
+constexpr char NVRTC[] = "libnvrtc.so";              // libnvrtc.so.12, libnvrtc.so.13, ...: whichever MLX was built for
+
+// dl_iterate_phdr callback: the first loaded object whose file is libnvrtc.so[.<version>] (not libnvrtc-builtins,
+// not this library), its path copied to the caller's buffer.
+int find_nvrtc(struct dl_phdr_info *info, size_t, void *data) noexcept {
+    const char *path = info->dlpi_name;
+    if(!path || !*path)
+        return 0;
+    const char *base = std::strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const size_t n = sizeof(NVRTC) - 1;
+    if(std::strncmp(base, NVRTC, n) != 0 || (base[n] != '\0' && base[n] != '.'))
+        return 0;
+    char *out = static_cast<char *>(data);
+    if(std::strlen(path) >= PATH_MOST)
+        return 0;
+    std::strcpy(out, path);
+    return 1;
+}
+
+// A handle on the NVRTC already loaded here (RTLD_NOLOAD: never loads one), or nullptr.
+void *loaded_nvrtc() noexcept {
+    char path[PATH_MOST] = {0};
+    if(!dl_iterate_phdr(find_nvrtc, path))
+        return nullptr;
+    return dlopen(path, RTLD_NOW | RTLD_NOLOAD);
+}
+
 template<typename F>
 F own(atomic<F> &real, const char *name) noexcept {
     F f = real.load(std::memory_order_acquire);
     if(f)
         return f;
-    void *lib = dlopen("libnvrtc.so.12", RTLD_NOW | RTLD_NOLOAD);
+    void *lib = loaded_nvrtc();
     if(!lib)
         return nullptr;
     f = reinterpret_cast<F>(dlsym(lib, name));
