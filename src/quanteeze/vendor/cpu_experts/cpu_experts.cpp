@@ -84,6 +84,22 @@ static void quantize_q8(const float* x, int cols, int8_t* xq, float* xd) {
     }
 }
 
+// The sums over each group of `group` inputs of the int8 inputs as the Q8 kernels read them (xd[b] * xq[j]): an
+// affine weight is scale * q + bias with q 0..15, so its bias term must be taken over the same inputs as its q term.
+// Over the float inputs' sums the int8 rounding of the two terms does not cancel, and a projection's error is the
+// codes' (mean 7.5) over the rounding, not the weights' (2.6 times it for 4-bit weights of a checkpoint).
+static void sums_q8(const int8_t* xq, const float* xd, int cols, int group, float* xsum) {
+    for (int g = 0; g < cols / group; ++g) {
+        float sum = 0.0f;
+        for (int b = g * (group / 32); b < (g + 1) * (group / 32); ++b) {
+            int32_t s = 0;
+            for (int j = b * 32; j < (b + 1) * 32; ++j) s += xq[j];
+            sum += xd[b] * static_cast<float>(s);
+        }
+        xsum[g] = sum;
+    }
+}
+
 #ifdef QZ_X86
 // ---------------------------------------------------------------- AVX2 + FMA: 8 values per step
 
@@ -526,17 +542,6 @@ static void as_q8(const float* x, int cols, std::vector<float>& out) {
     for (int j = 0; j < cols; ++j) out[j] = d[j / 32] * static_cast<float>(q[j]);
 }
 
-static void bias_back(const Proj& p, const float* x, const float* xhat, float* y) {
-    if (p.kind == 1) return;
-    const int groups = p.cols / p.group;
-    const uint16_t* bi = static_cast<const uint16_t*>(p.bi);
-    for (int g = 0; g < groups; ++g) {
-        double d = 0.0;
-        for (int j = g * p.group; j < (g + 1) * p.group; ++j) d += double(x[j]) - double(xhat[j]);
-        for (int r = 0; r < p.rows; ++r) y[r] += static_cast<float>(double(bf16_value(bi[size_t(r) * groups + g])) * d);
-    }
-}
-
 API void qz_expert_reference(const Proj* gate, const Proj* up, const Proj* down, const float* x, float* out,
                              float limit, float weight, int style, int q8) {
     std::vector<float> g(gate->rows), u(up->rows), h(gate->rows), xin, hin;
@@ -545,12 +550,8 @@ API void qz_expert_reference(const Proj* gate, const Proj* up, const Proj* down,
         as_q8(x, gate->cols, xin);
         a = xin.data();
     }
-    reference_rows(*gate, a, g.data());
-    reference_rows(*up, a, u.data());
-    if (a != x) {
-        bias_back(*gate, x, a, g.data());
-        bias_back(*up, x, a, u.data());
-    }
+    reference_rows(*gate, a, g.data());              // (Q8: the weights over the int8 inputs, their biases' sums
+    reference_rows(*up, a, u.data());                // over the same int8 inputs: sums_q8)
     activate(g.data(), u.data(), h.data(), gate->rows, limit, weight, style);
     const float* b = h.data();
     if (q8 && q8_takes(*down, 1)) {
@@ -558,7 +559,6 @@ API void qz_expert_reference(const Proj* gate, const Proj* up, const Proj* down,
         b = hin.data();
     }
     reference_rows(*down, b, out);
-    if (b != h.data()) bias_back(*down, h.data(), b, out);
     finish(out, down->rows, style);
 }
 
@@ -826,6 +826,8 @@ static local_shared_ptr<Phase> make_phase(Pool* pool, const Proj* a, const Proj*
         p->xsum[k] = nullptr;
         if (given[k] && p->p[k] && p->p[k]->kind == 0) {
             p->xsum_own[k].assign(given[k], given[k] + p->p[k]->cols / p->p[k]->group);
+            if (p->q8)
+                sums_q8(p->xq_own.data(), p->xd_own.data(), p->p[k]->cols, p->p[k]->group, p->xsum_own[k].data());
             p->xsum[k] = p->xsum_own[k].data();
         }
     }

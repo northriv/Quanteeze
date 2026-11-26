@@ -603,7 +603,6 @@ _IQ2_XS_METAL = r"""
 """
 
 _CUDA_HEADER = r"""
-#include <cstdint>
 __device__ __forceinline__ float qz_ggml_wsum(float v) {
   for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
   return v;

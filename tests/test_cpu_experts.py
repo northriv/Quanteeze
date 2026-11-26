@@ -426,7 +426,9 @@ def test_q8_kernels_and_reference(kind, monkeypatch):
     expert, mlx = _expert(made)
     x = np.random.default_rng(11).normal(size=D).astype(np.float32)
     ref_q8 = ce.native_reference(expert, x, 10.0, q8=True)
-    assert np.all(np.isfinite(ref_q8)) and _close(ref_q8, mlx(x, 10.0), 6e-2)
+    # (affine: the biases' sums are the int8 inputs' own, so the rounding weighs by the weights, not by their codes
+    # 0..15: 1.7% of the largest output here, 3.7% with the float inputs' sums)
+    assert np.all(np.isfinite(ref_q8)) and _close(ref_q8, mlx(x, 10.0), 2.5e-2 if kind == 'affine4' else 6e-2)
     pool = ce.Pool(4, q8=True)
     try:
         got = pool.expert(expert, x, 10.0)

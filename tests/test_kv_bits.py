@@ -29,8 +29,11 @@ VISION = SimpleNamespace(
     video_token_id=1001, vision_start_token_id=1002,
 )
 ON = {'QUANTEEZE_KV_BITS': '8'}
-# On Metal MLX computes float32 matmuls via tf32 (~1.4e-3 difference vs ~1e-4 on CUDA/CPU).
-FLOAT32_CLOSE = 3e-3 if mx.metal.is_available() else 1e-4
+# On Metal MLX computes float32 matmuls via tf32 (~1.4e-3 difference). On CUDA a float32 matmul of more than one row
+# is within ~3e-4 of the float64 product (a single row and the CPU: ~1e-7), so the dequantized reference (_spread) is
+# 3e-4 to 5e-4 off the per-head quantized products there (RTX 5060 Ti, CUDA 13).
+_CUDA = bool(getattr(getattr(mx, 'cuda', None), 'is_available', lambda: False)())
+FLOAT32_CLOSE = 3e-3 if mx.metal.is_available() else 1e-3 if _CUDA else 1e-4
 
 
 def _model():
