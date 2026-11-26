@@ -103,6 +103,12 @@ def test_the_logits_over_mlx_vlms_8_bit_cache_a_head_at_a_time_and_spread_out(fr
     assert mx.isfinite(outs[1]).all().item()
     assert _off(outs[1], outs[0]) < 1e-3
     assert _off(outs[0], floats) < 0.1
-    assert kv_bits.STATS['differed'] == kv_bits.STATS['spread'] == 0
     assert kv_bits.STATS['checked'] >= kv_bits.CHECKS
-    assert kv_bits.STATS['unpacked'] >= 1 and kv_bits.STATS['quantized'] >= 1
+    if mx.metal.is_available():
+        assert kv_bits.STATS['differed'] == kv_bits.STATS['spread'] == 0
+        assert kv_bits.STATS['unpacked'] >= 1 and kv_bits.STATS['quantized'] >= 1
+    else:
+        # MLX CUDA's quantized_matmul has no implementation for mlx-vlm's 8-bit attention in one call: the decode's
+        # is found out once and the spread-out product serves it (the logits above are still the per-head path's)
+        assert kv_bits.STATS['differed'] == 1 and kv_bits.STATS['quantized'] == 0
+        assert kv_bits.STATS['spread'] >= 1 and kv_bits.STATS['unpacked'] >= 1

@@ -317,6 +317,14 @@ def test_macos_mount_network_fs_detection(monkeypatch):
         'nas.local:/exports/lab on /Volumes/Lab Share (nfs, nodev, nosuid)\n'
     )
     monkeypatch.setattr(sys, 'platform', 'darwin')
+    read_text = q2_experts.Path.read_text
+
+    def no_proc(self, *args, **kwargs):                # macOS has no /proc/mounts; hide Linux's when run there
+        if str(self) == '/proc/mounts':
+            raise FileNotFoundError(str(self))
+        return read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(q2_experts.Path, 'read_text', no_proc)
     monkeypatch.setattr(
         q2_experts.subprocess,
         'run',
@@ -697,7 +705,9 @@ def test_expert_qmv_and_qwen4_exp_batch_decode_compile():
         x = mx.random.normal((b_rows, 1, 128)).astype(mx.bfloat16)
         indices = mx.array([[[(r + k) % 8 for k in range(4)]] for r in range(b_rows)], dtype=mx.uint32)
         mx.eval(x, indices)
-        assert expert_qmv.eligible(sw, x, indices)
+        assert expert_qmv.eligible(sw, x, indices) == mx.metal.is_available()
+        if not mx.metal.is_available():                # expert_qmv's own kernels are Metal's; elsewhere the stock
+            continue                                   # product serves, and only the compiled forward is checked
         want = expert_qmv.stock(sw, x, indices)
         got_own = expert_qmv.own(sw, x, indices)
         got_dec = expert_qmv.decode(sw, x, indices)
