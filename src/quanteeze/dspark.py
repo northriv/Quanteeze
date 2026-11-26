@@ -45,7 +45,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import per_thread
+from . import kernel_checks, per_load, per_thread
 
 BLOCK = 5                       # positions a block drafts (dspark_block_size)
 NOISE = 128799                  # the token the positions after the anchor are (dspark_noise_token_id)
@@ -150,6 +150,7 @@ class Drafter(nn.Module):
     Markov head (markov_embed, markov_head) and the confidence head (confidence)."""
 
     prefer_requested_block_size = True
+    _quanteeze_counts_itself = True
 
     def __init__(self, config, cfg):
         super().__init__()
@@ -263,7 +264,7 @@ class Drafter(nn.Module):
             NATIVE[1] += 1
             same = all(
                 (a is None and b is None)
-                or (a is not None and b is not None and a.dtype == b.dtype and mx.array_equal(a, b).item())
+                or (a is not None and b is not None and kernel_checks.same_bits(a, b))
                 for a, b in zip(got, ref)
             )
             if not same:
@@ -303,7 +304,7 @@ def _native():
     """Return the compiled `_dspark` C++20 extension when QUANTEEZE_DSPARK_NATIVE enables it."""
     if NATIVE[0] is None:
         from . import native_ext, variables
-        m = (variables.get('QUANTEEZE_DSPARK_NATIVE') or 'auto').strip().lower()
+        m = (variables.get('QUANTEEZE_DSPARK_NATIVE', variables.at_load()) or 'auto').strip().lower()
         use = m == 'on' or (m == 'auto' and mx.metal.is_available())
         ext = native_ext.extension('dspark', with_mlx=True, with_stm=False, quiet=(m == 'auto')) if use else None
         NATIVE[0] = ext or False
@@ -348,6 +349,9 @@ def native_markov(drafter, native, logits, anchor, sampling, base):
 PENDING = per_thread.Field('round')     # the round being verified: Pending
 GATE = [None]                   # QUANTEEZE_DSPARK_GATE as read (gated()), and the log (QUANTEEZE_DSPARK_LOG)
 LOG = [None, None]              # its file, and when the last round was walked (perf_counter)
+LOG_KEPT_BYTES = 64 << 20
+LOG_WRITTEN_BYTES = 64 << 20
+LOG_BYTES = {'file': 0, 'written': 0, 'said': False}
 
 
 class Pending:
@@ -379,7 +383,7 @@ def gate_threshold():
     three seeds).  serve._drafter resets it at each load."""
     if GATE[0] is None:
         from . import variables
-        raw = (variables.get('QUANTEEZE_DSPARK_GATE') or 'off').strip().lower()
+        raw = (variables.get('QUANTEEZE_DSPARK_GATE', variables.at_load()) or 'off').strip().lower()
         if raw == 'auto':
             from .arch import deepseek_v41
             GATE[0] = (GATE_EXACT if deepseek_v41.EXACT[0] else GATE_FAST,)
@@ -418,24 +422,51 @@ def python_gated(conf, k, threshold):
 
 
 def log_round(pending, alphas, accepted, budget):
-    """QUANTEEZE_DSPARK_LOG: a JSON line a round -- the confidences of all BLOCK drafts, each
-    walked draft's chance of being kept (min(1, p/q), or 1/0 where greedy), the drafts and how
-    many were kept, the temperature, and the time since the last round was walked."""
-    import json
+    """QUANTEEZE_DSPARK_LOG: append one JSON line per round, capped at `LOG_KEPT_BYTES` and `LOG_WRITTEN_BYTES`."""
     import time
     if LOG[0] is None:
         from . import variables
-        path = variables.path('QUANTEEZE_DSPARK_LOG')
-        LOG[0] = open(path, 'a', buffering=1) if path else False
+        path = variables.get('QUANTEEZE_DSPARK_LOG', variables.at_load())
+        LOG[0] = _open_log(Path(path).expanduser()) if path else False
     if not LOG[0]:
         return
     now = time.perf_counter()
     gap, LOG[1] = (None if LOG[1] is None else now - LOG[1]), now
     conf = mx.sigmoid(pending.conf[0]).tolist()
-    LOG[0].write(json.dumps({'conf': [round(c, 4) for c in conf], 'alpha': [round(a, 4) for a in alphas],
-                             'k': int(pending.drafts.shape[1]), 'a': int(accepted), 'budget': int(budget),
-                             'temp': pending.sampling.temperature if pending.sampling else 0.0,
-                             'gap_ms': None if gap is None else round(gap * 1e3, 2)}) + '\n')
+    line = json.dumps({'conf': [round(c, 4) for c in conf], 'alpha': [round(a, 4) for a in alphas],
+                       'k': int(pending.drafts.shape[1]), 'a': int(accepted), 'budget': int(budget),
+                       'temp': pending.sampling.temperature if pending.sampling else 0.0,
+                       'gap_ms': None if gap is None else round(gap * 1e3, 2)}) + '\n'
+    if _log_full(len(line)):
+        return
+    LOG[0].write(line)
+    LOG_BYTES['file'] += len(line)
+    LOG_BYTES['written'] += len(line)
+
+
+def _open_log(path):
+    """Open `path` for append unless it already exceeds `LOG_KEPT_BYTES`."""
+    file = open(path, 'a', buffering=1)
+    LOG_BYTES['file'] = path.stat().st_size
+    return file if not _log_full(0, file) else False
+
+
+def _log_full(size, file=None):
+    """Close the log and stop appending if adding `size` bytes would exceed either 64 MB cap."""
+    if LOG_BYTES['file'] + size <= LOG_KEPT_BYTES and LOG_BYTES['written'] + size <= LOG_WRITTEN_BYTES:
+        return False
+    (file or LOG[0]).close()
+    LOG[0] = False
+    if not LOG_BYTES['said']:
+        LOG_BYTES['said'] = True
+        print(
+            f'quanteeze: QUANTEEZE_DSPARK_LOG: no more rounds logged -- the file holds {LOG_BYTES["file"] >> 20} MB '
+            f'(at most {LOG_KEPT_BYTES >> 20}) and this process wrote {LOG_BYTES["written"] >> 20} MB '
+            f'(at most {LOG_WRITTEN_BYTES >> 20}); the file is left as is',
+            file=sys.stderr,
+            flush=True,
+        )
+    return True
 PROPOSE, UNIFORM, RESIDUAL = 0x0DFA5202, 0x5A3E1C07, 0x2B7F49D1     # salts of the keys by position
 
 
@@ -568,6 +599,9 @@ def _record(draft_model, accepted, draft_count):
     """mlx-vlm's _record_speculative_round, counting the drafts DSpark's gate kept, not the block's."""
     if isinstance(draft_model, Drafter) and DRAFTED[0] is not None:
         draft_count = DRAFTED[0]                  # every row of a batched round's (mlx-vlm records a row each)
+    if isinstance(draft_model, Drafter):
+        from . import mtp
+        mtp.count_round(draft_model, accepted, draft_count)
     return _RECORD[0](draft_model, accepted, draft_count)
 
 
@@ -661,10 +695,12 @@ def load(path, bits=2):
         nn.quantize(drafter, group_size=32, bits=8 if mode == 'mxfp8' else 4, mode=mode,
                     class_predicate=lambda p, m, names=names: p in names and hasattr(m, 'to_quantized'))
     drafter.load_weights(list(tensors.items()), strict=True)
+    del tensors, modes
     if bits is not None:
         mtp.lower(drafter, bits)
     drafter.head = own_head(path, head_bits())
     mx.eval(drafter.parameters())
+    _native()
     return drafter, 'dflash'
 
 
@@ -675,7 +711,7 @@ def head_bits():
     """QUANTEEZE_DSPARK_HEAD_BITS: the bits of the drafter's own copy of the target's head, or None
     (off: the target's own, read whole each round)."""
     from . import variables
-    raw = (variables.get('QUANTEEZE_DSPARK_HEAD_BITS') or 'off').strip().lower()
+    raw = (variables.get('QUANTEEZE_DSPARK_HEAD_BITS', variables.at_load()) or 'off').strip().lower()
     return None if raw in ('off', '0') else int(raw)
 
 
@@ -695,3 +731,14 @@ def own_head(path, bits):
     linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
     linear.weight = weight.astype(mx.bfloat16)
     return nn.QuantizedLinear.from_linear(linear, group_size=HEAD_GROUP, bits=bits)
+
+
+@per_load.on_let_go
+def let_go():
+    """Close any DSpark log handle and reset per-load native extension/check/gate state on unload."""
+    if LOG[0]:
+        LOG[0].close()
+    LOG[:] = [None, None]
+    LOG_BYTES['file'] = 0
+    NATIVE[:] = [None, 0, 0]
+    GATE[0] = None

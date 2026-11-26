@@ -12,13 +12,12 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from . import cuda_kernels
+from . import cuda_kernels, kernel_checks, per_thread
 
 CHECKS = 3
 ON = [True]                     # QUANTEEZE_CUDA_ROUTER
 STATS = dict(served=0, checked=0, mismatched=0)
-CHOICE = {}                     # (experts, k, dtype): whether it matched MLX's ops
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('cuda_router')  # (experts, k, dtype): whether it matched MLX's ops
 SAID = []
 
 HEADER = r"""
@@ -206,7 +205,7 @@ def routed(logits, k):
     e = logits.shape[-1]
     rows = max(1, logits.size // e)
     key = (e, int(k), str(logits.dtype)) if rows == 1 else (rows, e, int(k), str(logits.dtype))
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS['served'] += 1
@@ -215,7 +214,7 @@ def routed(logits, k):
     want = original(logits, k)
     try:
         got = route(logits, k)
-        same = all(mx.array_equal(a, b).item() for a, b in zip(got, want))
+        same = kernel_checks.same_bits(got, want)
     except Exception as error:
         if 'transformations' in str(error):                 # traced (mx.compile): nothing to compare yet
             return want
@@ -226,7 +225,7 @@ def routed(logits, k):
         same = False
     STATS['checked'] += 1
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 

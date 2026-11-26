@@ -18,7 +18,7 @@ from functools import lru_cache
 import mlx.core as mx
 import numpy as np
 
-from . import cuda_kernels, iq_experts
+from . import cuda_kernels, iq_experts, kernel_checks
 
 CHECKS = 3
 TOLERANCE = 1e-2
@@ -28,7 +28,8 @@ WARPS = 4
 TILE = 32
 ON = [True]                                     # synced with QUANTEEZE_KQUANT_QMV in serve
 STATS = dict(served=0, checked=0, mismatched=0)
-CHOICE, CHECKED, SAID = {}, {}, []
+CHOICE, CHECKED = kernel_checks.tables('gguf_qmv')
+SAID = []
 _DUMMY_GRID = None
 
 _HEADER = r"""
@@ -1218,29 +1219,16 @@ def gather_rows(experts, x, indices, unpacked, plan=None):
     return _checked(key, lambda: run_rows(experts, x, indices, plan=plan), unpacked)
 
 
+def _near(got, want):
+    got, w = got.astype(mx.float32), want.astype(mx.float32)
+    return (
+        got.shape == w.shape
+        and bool((mx.abs(got - w).max() <= TOLERANCE * mx.maximum(mx.abs(w).max(), 1e-30)).item())
+    )
+
+
 def _checked(key, mine, unpacked):
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
-    if choice is not None and seen >= CHECKS:
-        if not choice:
-            return unpacked()
-        STATS['served'] += 1
-        return mine()
-    want = unpacked()
-    STATS['checked'] += 1
-    try:
-        got = mine().astype(mx.float32)
-        w = want.astype(mx.float32)
-        near = got.shape == w.shape and (mx.abs(got - w).max() <= TOLERANCE * mx.maximum(mx.abs(w).max(), 1e-30)).item()
-    except Exception as error:
-        if not SAID:
-            SAID.append(True)
-            print(f'quanteeze: GGUF kernel unavailable ({type(error).__name__}: {error})',
-                  file=sys.stderr, flush=True)
-        near = False
-    if not near:
-        STATS['mismatched'] += 1
-    CHOICE[key], CHECKED[key] = bool(near), (seen + 1 if near else CHECKS)
-    return want
+    return kernel_checks.served(sys.modules[__name__], key, mine, unpacked, 'GGUF kernel', same=_near)
 
 
 def summary():

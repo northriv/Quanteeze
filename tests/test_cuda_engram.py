@@ -220,3 +220,45 @@ def test_hold_takes_the_token_embedding_first_and_pins_what_the_gpu_reads(engram
         assert cuda_engram._table(tables.engram) is not None and cuda_engram._table(tables.embed_tokens) is not None
     finally:
         ngram_prefetch.let_go()
+
+
+def test_ngram_host_copy_whole_within_tolerance_and_left_counts(tmp_path):
+    """`HostCopy` bumps a budget shortfall within `min(WHOLE_WITHIN, wanted // WHOLE_SHARE)` to hold all arrays,
+    and counts `left` / `left_bytes` when arrays genuinely exceed budget."""
+    import mmap
+    import mlx.nn as nn
+    from quanteeze import ngram_prefetch
+
+    n_rows, cols = 2000, 128
+    arr_bytes = n_rows * cols
+    f1 = tmp_path / 't1.bin'
+    f2 = tmp_path / 't2.bin'
+    f1.write_bytes(b'\x01' * arr_bytes)
+    f2.write_bytes(b'\x02' * arr_bytes)
+
+    class Holder:
+        def __init__(self, a, b):
+            self._arrays = {'m1': a, 'm2': b}
+
+    m1 = np.memmap(f1, dtype=np.uint8, mode='r', shape=(n_rows, cols))
+    m2 = np.memmap(f2, dtype=np.uint8, mode='r', shape=(n_rows, cols))
+    h = Holder(m1, m2)
+    wanted = 2 * arr_bytes
+    # Short by 512 bytes (< wanted // 200 = 2560): tolerated -> both held, left == 0
+    copy = ngram_prefetch.HostCopy([h], budget=wanted - 512, workers=1)
+    try:
+        assert copy.wait() == wanted
+        assert copy.left == 0 and copy.left_bytes == 0
+    finally:
+        copy.close()
+
+    # Short by more than tolerance (only room for 1 array): left == 1, left_bytes == arr_bytes
+    m1b = np.memmap(f1, dtype=np.uint8, mode='r', shape=(n_rows, cols))
+    m2b = np.memmap(f2, dtype=np.uint8, mode='r', shape=(n_rows, cols))
+    h2 = Holder(m1b, m2b)
+    copy2 = ngram_prefetch.HostCopy([h2], budget=arr_bytes, workers=1)
+    try:
+        assert copy2.wait() == arr_bytes
+        assert copy2.left == 1 and copy2.left_bytes == arr_bytes
+    finally:
+        copy2.close()

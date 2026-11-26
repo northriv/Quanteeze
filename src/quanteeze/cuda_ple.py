@@ -18,7 +18,7 @@ from functools import lru_cache
 import mlx.core as mx
 import numpy as np
 
-from . import cuda_kernels, per_thread
+from . import cuda_kernels, kernel_checks, per_thread
 
 CHECKS = 3
 MAX_ROWS = 256
@@ -28,8 +28,7 @@ TOKENS = per_thread.Field('ple_tokens')
 PENDING = per_thread.Field('ple_pending')
 STATS = dict(ngram=0, served=0, checked=0, mismatched=0, pinned_bytes=0)
 HOST_STATS = dict(served=0, checked=0, mismatched=0, context_read=0, verified=0, wrong=0)
-CHOICE = {}                     # (shards, row width, group size, rows): whether it matched the host's
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('cuda_ple')  # (shards, row width, group size): whether it matched the host's
 SAID = []
 PIN_SAID = []                   # what pinned() could not pin, said once each
 _DRIVER = []                    # [(libcuda, the device's primary context)] or [None]
@@ -170,6 +169,29 @@ def _driver():
             pass
         _DRIVER.append(found)
     return _DRIVER[0]
+
+
+_MAJOR = []
+_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
+
+
+def compute_major():
+    """CUDA device 0 compute capability major number (e.g. 8 on A100, 12 on RTX 5060 Ti), or 0 without CUDA."""
+    if not _MAJOR:
+        result = 0
+        found = None if mx.metal.is_available() or not cuda_kernels.available() else _driver()
+        if found is not None:
+            cuda, _ = found
+            device, value = ctypes.c_int(), ctypes.c_int()
+            try:
+                if not (cuda.cuDeviceGet(ctypes.byref(device), 0)
+                        or cuda.cuDeviceGetAttribute(ctypes.byref(value), _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                                                     device.value)):
+                    result = int(value.value)
+            except (AttributeError, OSError):
+                result = 0
+        _MAJOR.append(result)
+    return _MAJOR[0]
 
 
 def gpu_room():
@@ -527,8 +549,8 @@ def lookup(embedding, row_ids, own):
     table = _table(embedding)
     if table is None:
         return None
-    key = (table.shards, embedding.row_width, table.group_size, row_ids.size)
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    key = (table.shards, embedding.row_width, table.group_size)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS['served'] += 1
@@ -537,7 +559,7 @@ def lookup(embedding, row_ids, own):
     want = own(embedding, row_ids)
     try:
         got = rows(embedding, table, row_ids)
-        same = got.shape == want.shape and mx.array_equal(got.view(mx.uint16), want.view(mx.uint16)).item()
+        same = kernel_checks.same_bits(got, want)
     except Exception as error:
         if not SAID:
             SAID.append(True)
@@ -546,7 +568,7 @@ def lookup(embedding, row_ids, own):
         same = False
     STATS['checked'] += 1
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 
@@ -642,7 +664,7 @@ def host_embed(module, input_ids, cache, own):
     ids = host_ids(module, context, token)
     window = np.concatenate([context, [token]])[-module.context_len:].astype(np.int64)
     key = ('host', module.context_len, module.heads_per_ngram)
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if not choice:
             return None
@@ -658,8 +680,8 @@ def host_embed(module, input_ids, cache, own):
         got = module.ngram_embedding(ids)
         got = got.reshape(*got.shape[:-2], -1)
         same = (
-            int(np.array(input_ids).reshape(-1)[0]) == token and got.shape == want.shape
-            and mx.array_equal(got.view(mx.uint16), want.view(mx.uint16)).item()
+            int(np.array(input_ids).reshape(-1)[0]) == token
+            and kernel_checks.same_bits(got, want)
             and np.array_equal(np.array(cache[3]).reshape(-1), window)
         )
     except Exception as error:
@@ -670,7 +692,7 @@ def host_embed(module, input_ids, cache, own):
         same = False
     HOST_STATS['checked'] += 1
     HOST_STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 
@@ -702,7 +724,7 @@ def embed(module, input_ids, cache, own):
     table = module.ngram_embedding._quanteeze_pinned
     key = ('ngram', table.shards, module.ngram_embedding.row_width, table.group_size, module.context_len,
            module.heads_per_ngram, str(input_ids.dtype))
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if not choice:
             return None
@@ -714,9 +736,7 @@ def embed(module, input_ids, cache, own):
     want = own(module, input_ids, cache)
     try:
         values, window = ngram(module, table, input_ids, context)
-        same = (values.reshape(want.shape).shape == want.shape
-                and mx.array_equal(values.reshape(want.shape).view(mx.uint16), want.view(mx.uint16)).item()
-                and mx.array_equal(window, cache[3]).item())
+        same = kernel_checks.same_bits(values.reshape(want.shape), want) and kernel_checks.same_bits(window, cache[3])
     except Exception as error:
         if not SAID:
             SAID.append(True)
@@ -725,7 +745,7 @@ def embed(module, input_ids, cache, own):
         same = False
     STATS['checked'] += 1
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 
@@ -747,7 +767,7 @@ def install(cls=None, module_cls=None):
         cls.__call__ = cls.lookup = call
         cls._quanteeze_cuda_ple = True
     if not module_cls.__dict__.get('_quanteeze_cuda_ple', False):
-        own_embed = module_cls.__call__
+        own_embed = getattr(module_cls, '_quanteeze_cuda_ple_own', None) or module_cls.__call__
 
         def embed_call(self, input_ids, cache):
             got = embed(self, input_ids, cache, own_embed)
@@ -756,6 +776,7 @@ def install(cls=None, module_cls=None):
             return own_embed(self, input_ids, cache) if got is None else got
 
         module_cls.__call__ = embed_call
+        module_cls._quanteeze_cuda_ple_own = staticmethod(own_embed)
         module_cls._quanteeze_cuda_ple = True
     return cls
 

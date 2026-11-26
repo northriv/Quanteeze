@@ -337,8 +337,10 @@ class Demand:
         self._cpu_status = []
         self._cpu_counts = []
         self._cpu_status_lock = threading.Lock()
+        self._cpu_lock = threading.Lock()
         self._cpu_eval_tid = None
         self.cpu_served = 0
+        self.cpu_yielded = 0
         self.cpu_late = 0
         self.cpu_wait_ms = 0.0
 
@@ -492,6 +494,10 @@ class Demand:
         if getattr(self, '_stm', None) is not None:
             self._stm.thread_done()
 
+    def pass_failed(self):
+        """Release any thread-local pass leases after a raised pass failure."""
+        self.thread_done()
+
     def _room_back(self):
         if self._free_least is not None:
             from . import cuda_ple
@@ -623,48 +629,55 @@ class Demand:
 
         spec = cpu_experts.layer_spec(arrays, groups, layer_kind, layer_bits)
         try:
-            if self._cpu is None:
-                if cpu_experts.lib() is None or cpu_experts.isa() is None:
-                    raise ValueError('CPU experts C++ library failed to build')
-                if cpu_experts.openblas_one_thread():
-                    print('quanteeze: numpy OpenBLAS held to 1 thread alongside CPU expert workers',
-                          file=sys.stderr, flush=True)
-                pool = cpu_experts.Pool()
-                if self._cpu_load is not None:
-                    self._cpu_load.threads = pool.threads
-                rng = np.random.default_rng(0)
-                n_held = int(next(iter(spec['arrays']['gate_proj'].values())).shape[0])
-                for slot in range(cpu_experts.CHECKS):
-                    xs = rng.normal(0, 1, hidden_dim).astype(np.float32)
-                    if pool.expert(cpu_experts.layer_expert(spec, slot % n_held), xs) is None and cpu_experts.verified()[1]:
+            with self._cpu_lock:
+                if self._cpu is None:
+                    from . import request_threads
+                    if cpu_experts.lib() is None or cpu_experts.isa() is None:
+                        raise ValueError('CPU experts C++ library failed to build')
+                    if cpu_experts.openblas_one_thread():
+                        print('quanteeze: numpy OpenBLAS held to 1 thread alongside CPU expert workers',
+                              file=sys.stderr, flush=True)
+                    pool = cpu_experts.Pool()
+                    try:
+                        if self._cpu_load is not None:
+                            self._cpu_load.threads = pool.threads
+                        rng = np.random.default_rng(0)
+                        n_held = int(next(iter(spec['arrays']['gate_proj'].values())).shape[0])
+                        for slot in range(cpu_experts.CHECKS):
+                            xs = rng.normal(0, 1, hidden_dim).astype(np.float32)
+                            if (pool.expert(cpu_experts.layer_expert(spec, slot % n_held), xs) is None
+                                    and cpu_experts.verified()[1]):
+                                raise ValueError(cpu_experts.verified()[1])
+                        active_init = self._cpu_load.allowed() if self._cpu_load is not None else pool.threads
+                        on_cuda = cuda_kernels.available() and not mx.metal.is_available()
+                        server = (
+                            cpu_experts.Server(
+                                pool, self.moe_indices, hidden_dim, lanes=request_threads.request_lanes(),
+                            )
+                            if on_cuda else None
+                        )
+                        if server is not None:
+                            server.active(active_init)
+                    except BaseException:
                         pool.close()
-                        raise ValueError(cpu_experts.verified()[1])
-                active_init = self._cpu_load.allowed() if self._cpu_load is not None else pool.threads
-                on_cuda = cuda_kernels.available() and not mx.metal.is_available()
-                try:
-                    server = cpu_experts.Server(pool, self.moe_indices, hidden_dim) if on_cuda else None
-                except Exception:
-                    pool.close()
-                    raise
-                if server is not None:
-                    server.active(active_init)
-                self._cpu = SimpleNamespace(
-                    pool=pool, server=server, layers=set(), specs={}, declined=set(),
-                    active=active_init,
-                )
-                where = (f'server thread on CPUs {server.cpus}' if server is not None else 'direct pool')
-                q8_info = ', q8' if (pool.q8 and pool.isa >= 1) else ''
-                print(
-                    f'quanteeze: decode misses in host memory computed on the CPU '
-                    f'(QUANTEEZE_CPU_EXPERTS={self._cpu_mode}): {pool.threads} workers on CPUs {pool.cpus}, '
-                    f'{where}, {cpu_experts.ISA_NAMES[pool.isa]}{q8_info}',
-                    file=sys.stderr, flush=True,
-                )
-            if self._cpu.server is not None:
-                self._cpu.server.add(layer, spec, limit, activation)
-                self._cpu.server.start()
-            self._cpu.specs[layer] = (spec, limit, activation)
-            self._cpu.layers.add(layer)
+                        raise
+                    self._cpu = SimpleNamespace(
+                        pool=pool, server=server, layers=set(), specs={}, declined=set(),
+                        active=active_init,
+                    )
+                    where = (f'server thread on CPUs {server.cpus}' if server is not None else 'direct pool')
+                    q8_info = ', q8' if (pool.q8 and pool.isa >= 1) else ''
+                    print(
+                        f'quanteeze: decode misses in host memory computed on the CPU '
+                        f'(QUANTEEZE_CPU_EXPERTS={self._cpu_mode}): {pool.threads} workers on CPUs {pool.cpus}, '
+                        f'{where}, {cpu_experts.ISA_NAMES[pool.isa]}{q8_info}',
+                        file=sys.stderr, flush=True,
+                    )
+                if self._cpu.server is not None:
+                    self._cpu.server.add(layer, spec, limit, activation)
+                    self._cpu.server.start()
+                self._cpu.specs[layer] = (spec, limit, activation)
+                self._cpu.layers.add(layer)
             return True
         except (ValueError, OSError) as e:
             self._cpu_why = f'{type(e).__name__}: {e}'
@@ -890,7 +903,14 @@ class Demand:
         if (x.ndim != 3 or x.shape[1] != 1 or not 1 <= x.shape[0] <= cpu_experts.SERVE_BMAX
                 or x.dtype not in (mx.bfloat16, mx.float16, mx.float32)):
             return None
-        if self._cpu_allowed() <= 0 or not self._cpu_layer(layer, switch, int(x.shape[-1]), host):
+        if self._cpu_why is not None or self._cpu_mode == 'off' or host is None or not self._has_tensor_table():
+            return None
+        if self._cpu_allowed() <= 0:
+            if self._cpu is None or layer not in self._cpu.declined:
+                with self._cpu_status_lock:
+                    self.cpu_yielded += 1
+            return None
+        if not self._cpu_layer(layer, switch, int(x.shape[-1]), host):
             return None
         c = self._cpu
         b_rows, top_k = int(x.shape[0]), int(indices.shape[-1])
@@ -946,14 +966,17 @@ class Demand:
         has_gpu_slots = bool((inv < 0).any())
 
         if c.server is not None:
+            addr = c.server.addr[layer]
+            if addr is None:
+                return None
             rows_mx = mx.array(req_slots, dtype=mx.int32)
             inv_mx = mx.array(inv, dtype=mx.int32)
-            token = cpu_experts.cpu_ask(c.server.addr[layer], x, rows_mx, inv_mx, weights)
+            token = cpu_experts.cpu_ask(addr, x, rows_mx, inv_mx, weights)
             if has_gpu_slots:
                 y_gpu = expert_qmv.decode(switch, x, switch._local_indices(indices), weights)
             else:
                 y_gpu = mx.zeros((b_rows, 1, top_k, int(x.shape[-1])), dtype=x.dtype)
-            out, status = cpu_experts.cpu_wait(c.server.addr[layer], token, y_gpu, inv_mx, most=int(req_slots.size))
+            out, status = cpu_experts.cpu_wait(addr, token, y_gpu, inv_mx, most=int(req_slots.size))
             mx.async_eval(out, status)
             with self._cpu_status_lock:
                 self._cpu_eval_tid = threading.get_ident()
@@ -1668,6 +1691,7 @@ class Demand:
         with self._cpu_status_lock:
             cpu = self._cpu
             cpu_served = self.cpu_served
+            cpu_yielded = self.cpu_yielded
             cpu_late = self.cpu_late
             cpu_wait_ms = round(self.cpu_wait_ms, 2)
             cpu_why = self._cpu_why
@@ -1696,8 +1720,9 @@ class Demand:
         }
         if native_reads or self._native is not None:
             out['native_reads'] = native_reads
-        if cpu is not None or cpu_served or cpu_why is not None:
+        if cpu is not None or cpu_served or cpu_yielded or cpu_why is not None:
             out['cpu_served'] = cpu_served
+            out['cpu_yielded'] = cpu_yielded
             out['cpu_late'] = cpu_late
             out['cpu_wait_ms'] = cpu_wait_ms
             if server_counts is not None:
@@ -1778,3 +1803,6 @@ class Demand:
         if self._native is not None:
             self._native.close()
             self._native = None
+        for sw in list(self.switches.values()):
+            sw.demand = None
+        self.switches.clear()

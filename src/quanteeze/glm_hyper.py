@@ -35,11 +35,12 @@ import mlx.nn as nn
 from mlx_vlm.models.deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from mlx_vlm.models.fast_ops import exact_hc_normalized_norm
 
+from . import kernel_checks
+
 CHECKS = 3
 ON = [True]                     # QUANTEEZE_HC_KERNELS
 STATS = dict(pre=0, expand=0, checked=0, mismatched=0)
-CHOICE = {}                     # (part, shape): whether it matched mlx-vlm's
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('glm_hyper')  # (part, shape): whether it matched mlx-vlm's
 SAID = []
 
 _EXPAND = r"""
@@ -129,28 +130,8 @@ def apply_branch(connection, x, norm, branch, *args, **kwargs):
 def _served(part, key, mine, theirs):
     """mine() where this part's shape matched theirs() bit for bit the first CHECKS times it was
     met, else theirs()."""
-    key = (part,) + key
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
-    if choice is not None and seen >= CHECKS:
-        if choice:
-            STATS[part] += 1
-            return mine()
-        return theirs()
-    want = theirs()
-    STATS['checked'] += 1
-    try:
-        got = mine()
-        pairs = zip(got, want) if isinstance(want, tuple) else [(got, want)]
-        same = all(a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(a, b).item() for a, b in pairs)
-    except Exception as error:                              # a kernel that does not build: mlx-vlm's
-        if not SAID:
-            SAID.append(True)
-            print(f'quanteeze: GLM-5.3\'s hyper-connection kernels unavailable ({type(error).__name__}: {error})',
-                  file=sys.stderr, flush=True)
-        same = False
-    STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
-    return want
+    return kernel_checks.served(sys.modules[__name__], (part,) + key, mine, theirs,
+                                "GLM-5.3's hyper-connection kernels", stat=part)
 
 
 def summary():

@@ -34,7 +34,7 @@ def _warn_once(key, msg):
 
 def mode():
     """Return QUANTEEZE_DEMAND_STM normalized to 'auto', 'on', 'shadow', or 'off'."""
-    raw = (variables.get('QUANTEEZE_DEMAND_STM') or 'auto').strip().lower()
+    raw = (variables.get('QUANTEEZE_DEMAND_STM', variables.at_load()) or 'auto').strip().lower()
     if raw in ('auto', 'on', 'shadow', 'off'):
         return raw
     return 'auto'
@@ -673,13 +673,19 @@ class CoreDriver:
         return 0 if self.model is None else int(self.model.room_free())
 
     def close(self):
-        """Shut down the C++ lander thread cleanly."""
+        """Shut down the C++ lander thread cleanly and break references to model weights."""
         self._prev_out = None
         self._layer_out = None
+        self.token = None
+        self._marked = {}
+        self._version = {}
         if self.model is not None:
             self.model.turn_give()
             self.model.stop_lander()
             self.started = False
+            self.model = None
+            self.hints = None
+        self.demand = None
 
 
 for _name in ('token', '_prev_out', '_layer_out', '_marked', '_version', '_gen', 'pass_num'):

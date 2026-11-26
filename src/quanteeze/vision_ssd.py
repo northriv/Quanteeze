@@ -16,11 +16,18 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import variables
+from . import per_load, variables
 
 TOWERS = ('vision_tower',)
 PREFIXES = ('vision_tower.', 'model.visual.', 'visual.', 'model.vision_tower.')
 _AUTO = {}                      # {(path, working_set, bits, gguf, reserve, whole, fs): bool}
+
+
+@per_load.on_let_go
+def let_go():
+    """Drop cached image embeddings and per-load auto decisions when unloading a model."""
+    IMAGES.clear()
+    _AUTO.clear()
 
 
 def vision_whole(path, model=None):
@@ -28,7 +35,7 @@ def vision_whole(path, model=None):
     from mlx.utils import tree_flatten
     from . import arch, fitting, gguf_experts, guards, parallel
 
-    if (variables.get('QUANTEEZE_LOAD_WHOLE') or '').strip().lower() in ('1', 'true', 'yes', 'on'):
+    if (variables.get('QUANTEEZE_LOAD_WHOLE', variables.at_load()) or '').strip().lower() in ('1', 'true', 'yes', 'on'):
         return True
     working_set = guards.recommended_budget()
     if not working_set:
@@ -60,7 +67,7 @@ def vision_whole(path, model=None):
     meta = parallel._config_meta(path)
     text_cfg = meta.get('text_config') or {}
     model_type = meta.get('model_type') or text_cfg.get('model_type')
-    if (not variables.is_set('QUANTEEZE_MEMORY_RESERVE') and model_type in fitting.RESERVE_ON_CUDA
+    if (not variables.is_set('QUANTEEZE_MEMORY_RESERVE', variables.at_load()) and model_type in fitting.RESERVE_ON_CUDA
             and not mx.metal.is_available() and mx.default_device() == mx.gpu):
         res = fitting.RESERVE_ON_CUDA[model_type]
     else:
@@ -74,14 +81,15 @@ def reads(path, model=None):
     from . import guards, q2_experts
     key = str(Path(path).expanduser().resolve())
     fs = q2_experts.file_system(key)
+    snap = variables.at_load()
     cache_key = (
         key,
         guards.recommended_budget(),
-        variables.get('QUANTEEZE_BITS'),
-        variables.get('QUANTEEZE_EXPERTS_GGUF'),
-        variables.get('QUANTEEZE_MEMORY_RESERVE'),
-        variables.get('QUANTEEZE_LOAD_WHOLE'),
-        variables.get('QUANTEEZE_V41_READS_IMAGES'),
+        variables.get('QUANTEEZE_BITS', snap),
+        variables.get('QUANTEEZE_EXPERTS_GGUF', snap),
+        variables.get('QUANTEEZE_MEMORY_RESERVE', snap),
+        variables.get('QUANTEEZE_LOAD_WHOLE', snap),
+        variables.get('QUANTEEZE_V41_READS_IMAGES', snap),
         fs,
     )
     if cache_key not in _AUTO:
@@ -99,7 +107,7 @@ def reads(path, model=None):
 
 def enabled(path=None, model=None):
     """`QUANTEEZE_VISION_SSD`: `auto` (default), `on`, or `off`."""
-    value = (variables.get('QUANTEEZE_VISION_SSD') or 'auto').strip().lower()
+    value = (variables.get('QUANTEEZE_VISION_SSD', variables.at_load()) or 'auto').strip().lower()
     if value not in ('auto', 'on', 'off'):
         raise ValueError(f'QUANTEEZE_VISION_SSD: auto, on, or off, not {value}')
     if value != 'auto':

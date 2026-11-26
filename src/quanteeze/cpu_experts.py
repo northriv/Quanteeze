@@ -32,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import allocator, variables
+from . import allocator, per_load, variables
 
 CHECKS = 3
 TOLERANCE = 2e-3
@@ -76,7 +76,8 @@ def in_batch_job(environ=None):
 
 def default_priority(priority=None, environ=None):
     """Worker scheduling priority name (`'idle'`, `'nice'`, `'normal'`, or `'wake'`)."""
-    raw = (priority or variables.get('QUANTEEZE_CPU_PRIORITY') or 'auto').strip().lower()
+    env = variables.at_load() if environ is None else environ
+    raw = (priority or variables.get('QUANTEEZE_CPU_PRIORITY', env) or 'auto').strip().lower()
     if raw == 'auto':
         return 'normal' if in_batch_job(environ) else 'idle'
     if raw not in PRIORITIES:
@@ -179,8 +180,9 @@ def auto_cpu_experts(bdf=None, pci_root='/sys/bus/pci/devices'):
 
 def cpu_setting():
     """`QUANTEEZE_CPU_EXPERTS`: `'off'`, `'on'`, or `'auto'`."""
-    explicit = variables.is_set('QUANTEEZE_CPU_EXPERTS')
-    value = (variables.get('QUANTEEZE_CPU_EXPERTS') or 'auto').strip().lower()
+    snap = variables.at_load()
+    explicit = variables.is_set('QUANTEEZE_CPU_EXPERTS', snap)
+    value = (variables.get('QUANTEEZE_CPU_EXPERTS', snap) or 'auto').strip().lower()
     if value not in CPU_EXPERTS:
         raise ValueError(f'QUANTEEZE_CPU_EXPERTS is one of {CPU_EXPERTS}, not {value!r}')
     if value == 'auto' and not explicit:
@@ -211,9 +213,10 @@ def _compiler():
 
 
 def source_digest(compiler_version):
-    """16-hex-char digest of `cpu_experts.cpp`, KAME headers, flags, target, and compiler."""
+    """16-hex-char digest of `cpu_experts.cpp`, `lanes.h`, KAME headers, flags, target, and compiler."""
     h = hashlib.sha256()
-    for part in [VENDOR_DIR / 'cpu_experts.cpp', *(KAME_DIR / name for name in KAME_HEADERS)]:
+    parts = [VENDOR_DIR / 'cpu_experts.cpp', VENDOR_DIR / 'lanes.h', *(KAME_DIR / name for name in KAME_HEADERS)]
+    for part in parts:
         h.update(part.name.encode('utf-8') + b'\0')
         h.update(part.read_bytes() + b'\0')
     h.update(' '.join((*FLAGS, sys.platform, platform.machine(), compiler_version)).encode('utf-8'))
@@ -225,6 +228,8 @@ def ensure_library():
     source = VENDOR_DIR / 'cpu_experts.cpp'
     if not source.is_file():
         raise OSError(f'missing C++ source {source}')
+    if not (VENDOR_DIR / 'lanes.h').is_file():
+        raise OSError(f'missing C++ header {VENDOR_DIR / "lanes.h"}')
     for header in KAME_HEADERS:
         if not (KAME_DIR / header).is_file():
             raise OSError(f'missing KAME header {KAME_DIR / header}')
@@ -234,7 +239,7 @@ def ensure_library():
     if out.is_file() and out.stat().st_size > 0:
         return out
     tmp = out.with_name(f'.{out.name}.tmp-{os.getpid()}-{threading.get_ident()}')
-    cmd = [*cxx, *FLAGS, f'-I{KAME_DIR}', str(source), '-o', str(tmp)]
+    cmd = [*cxx, *FLAGS, f'-I{VENDOR_DIR}', f'-I{KAME_DIR}', str(source), '-o', str(tmp)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
@@ -253,6 +258,10 @@ def lib():
     with _LOCK:
         if _LIB[1]:
             return _LIB[0]
+        if variables.off('QUANTEEZE_NATIVE', variables.at_load()):
+            _LIB[0] = None
+            _LIB[1] = True
+            return None
         try:
             loaded = ctypes.CDLL(str(ensure_library()))
             f32 = ctypes.POINTER(ctypes.c_float)
@@ -295,8 +304,10 @@ def lib():
             loaded.qz_server_new.argtypes = [
                 ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                 ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64,
-                ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
             ]
+            loaded.qz_server_lane.restype = ctypes.c_int
+            loaded.qz_server_lane.argtypes = [ctypes.c_void_p]
             loaded.qz_server_layer.argtypes = [
                 ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
                 ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_int,
@@ -497,7 +508,7 @@ def cores(n, root='/sys/devices/system/cpu', siblings=True, local_cpus=None):
 
 def default_threads():
     """Configured or auto-detected worker thread count for `Pool` / `Load`."""
-    given = (variables.get('QUANTEEZE_CPU_THREADS') or 'auto').strip().lower()
+    given = (variables.get('QUANTEEZE_CPU_THREADS', variables.at_load()) or 'auto').strip().lower()
     if given != 'auto':
         return max(1, int(given))
     allowed_n = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 2)
@@ -521,7 +532,7 @@ class Pool:
             lib().qz_pool_new(self.threads, self.priority, self.spin_us, held.ctypes.data, len(self.cpus))
             if lib() is not None else None
         )
-        self.q8 = (not variables.off('QUANTEEZE_CPU_Q8')) if q8 is None else bool(q8)
+        self.q8 = (not variables.off('QUANTEEZE_CPU_Q8', variables.at_load())) if q8 is None else bool(q8)
         if self._handle is not None:
             lib().qz_pool_q8(ctypes.c_void_p(self._handle), int(self.q8))
 
@@ -675,9 +686,11 @@ class Server:
     native = True
     COUNTS = ('requests', 'experts', 'failed', 'compute_ns')
 
-    def __init__(self, pool, layers, hidden_dim, spin_us=SERVE_SPIN_US, cpus=None, pinned=True):
+    def __init__(self, pool, layers, hidden_dim, spin_us=SERVE_SPIN_US, cpus=None, pinned=True, lanes=1):
         self.pool, self.D = pool, int(hidden_dim)
-        n = (max(layers) + 1) if layers else 1
+        self.lanes = max(1, int(lanes))
+        self.per_lane = (max(layers) + 1) if layers else 1
+        n = self.lanes * self.per_lane
         self.box_words, self.ans_words = SERVE_HEAD + SERVE_BMAX * self.D, SERVE_HEAD + SERVE_MMAX * self.D
         if pinned:
             from . import cuda_ple
@@ -692,15 +705,18 @@ class Server:
                 raise ValueError('no mapped pinned memory available for CPU expert mailbox')
             self.box[:], self.ans[:] = 0, 0
             import mlx.core as mx
-            self.addr = {
-                i: mx.array(np.array([b + i * self.box_words * 4, a + i * self.ans_words * 4], np.uint64))
-                for i in layers
-            }
-            mx.eval(list(self.addr.values()))
+            self._addr = {}
+            for lane in range(self.lanes):
+                for i in layers:
+                    q = lane * self.per_lane + i
+                    self._addr[(lane, i)] = mx.array(
+                        np.array([b + q * self.box_words * 4, a + q * self.ans_words * 4], np.uint64)
+                    )
+            mx.eval(list(self._addr.values()))
         else:
             self.box = np.zeros((n, self.box_words), np.int32)
             self.ans = np.zeros((n, self.ans_words), np.int32)
-            self.addr = {}
+            self._addr = {}
         self.specs = {}
         self._keep = []
         self.spin_us = int(spin_us)
@@ -716,15 +732,36 @@ class Server:
             ctypes.c_void_p(self.pool._handle),
             self.pool.isa,
             self.D,
-            self.box.shape[0],
+            self.per_lane,
             self.box.ctypes.data,
             self.box_words,
             self.ans.ctypes.data,
             self.ans_words,
             self.spin_us,
+            self.lanes,
         )
         held = np.array(self.cpus or [0], np.int32)
         lib().qz_server_cpus(ctypes.c_void_p(self._handle), held.ctypes.data, len(self.cpus))
+
+    @property
+    def addr(self):
+        """`addr[i]`: calling thread's lane mailbox address array, or `None` if all lanes are held."""
+        return self
+
+    def lane(self):
+        """Return calling thread's lane index in `[0, lanes)`, or `-1` if all lanes are busy."""
+        return int(lib().qz_server_lane(ctypes.c_void_p(self._handle))) if self._handle else -1
+
+    def __getitem__(self, i):
+        lane = self.lane()
+        return None if lane < 0 else self._addr.get((lane, i))
+
+    def __contains__(self, i):
+        return i in self.specs or any(layer == i for _, layer in self._addr)
+
+    def get(self, i, default=None):
+        val = self[i]
+        return default if val is None else val
 
     def add(self, i, spec, limit=0.0, activation='plain'):
         """Register layer `i`'s `HostCopy` slot pointers with the server."""
@@ -782,6 +819,7 @@ class Server:
         if self._handle:
             lib().qz_server_free(ctypes.c_void_p(self._handle))
             self._handle = None
+        self._keep = []
 
 
 # ---------------------------------------------------------------- background CPU load monitor
@@ -801,8 +839,9 @@ class Load:
 
     def __init__(self, threads, yield_at=None, cores=None, clock=time.monotonic, read=None, least=None, cpus=None):
         self.threads = threads
-        self.yield_at = float(variables.number('QUANTEEZE_CPU_YIELD_AT') if yield_at is None else yield_at)
-        self.least = max(1, int(variables.integer('QUANTEEZE_CPU_MIN_THREADS') if least is None else least))
+        snap = variables.at_start()
+        self.yield_at = float(variables.number('QUANTEEZE_CPU_YIELD_AT', snap) if yield_at is None else yield_at)
+        self.least = max(1, int(variables.integer('QUANTEEZE_CPU_MIN_THREADS', snap) if least is None else least))
         aff = set(cpus) if cpus is not None else _allowed_cpus()
         self.cores = cores or (len(aff) if aff else None) or os.cpu_count() or 1
         self.clock = clock
@@ -828,14 +867,17 @@ class Load:
         self._last = (now, total, own) if total is not None else self._last
         others_cores = self.others / 100.0 * self.cores
         ceiling = max(0, min(self.threads, int(self.cores - RESERVE_CORES - np.ceil(others_cores))))
-        if self.others >= self.yield_at or self.pressure >= PRESSURE_AT:
+        calm = self.others < self.yield_at / 2
+        if self.others >= self.yield_at or (not calm and self.pressure >= PRESSURE_AT):
             self.workers, self._calm_since = 0, None
-        elif self.others < self.yield_at / 2 and self.pressure < PRESSURE_AT / 5:
+        elif calm:
             if self._calm_since is None:
                 self._calm_since = now
             elif now - self._calm_since >= CALM_S and self.workers < ceiling:
                 self.workers = self.least if self.workers == 0 else self.workers + 1
                 self._calm_since = now
+        else:
+            self._calm_since = None
         self.workers = min(self.workers, ceiling)
         if self.workers < self.least:
             self.workers = 0
@@ -1051,3 +1093,9 @@ def cpu_wait(addr, token, y, inv, most=None):
         output_dtypes=[y.dtype, mx.int32],
     )
     return out.reshape(y.shape), status
+
+
+@per_load.on_let_go
+def _let_go_native():
+    """Reset the cached `cpu_experts` library handle on unload so the next load re-reads settings."""
+    _LIB[:] = [None, False]

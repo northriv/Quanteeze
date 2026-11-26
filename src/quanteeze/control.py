@@ -81,7 +81,7 @@ PAGE = Path(__file__).with_name('control.html')
 HOME = Path(__file__).with_name('home.html')
 LONGEST = 4096
 WORDS = ('auto', 'off')
-OWN = ('QUANTEEZE_CONTROL_TOKEN', 'QUANTEEZE_SETTINGS')
+OWN = ('QUANTEEZE_CONTROL_TOKEN', 'QUANTEEZE_SETTINGS', 'QUANTEEZE_APC_DISK_SECRET')
 SAMPLING = {'QUANTEEZE_TEMPERATURE': 'temperature', 'QUANTEEZE_SEED': 'seed'}
 CHOICES = {
     'QUANTEEZE_ALLOCATOR': ('auto', 'on', 'off'),
@@ -90,6 +90,9 @@ CHOICES = {
     'QUANTEEZE_APC_ENCRYPT': ('on', 'off'),
     'QUANTEEZE_CONTEXT_COMPRESS': ('off', 'recent', 'similar', 'h2o', 'snapkv'),
     'QUANTEEZE_CONTEXT_LAYERS': ('uniform', 'pyramid'),
+    'QUANTEEZE_KV_BITS': ('8', 'off'),
+    'QUANTEEZE_KV_BITS_SELECTED': ('on', 'off'),
+    'QUANTEEZE_KV_BITS_UNPACKED': ('auto', 'on', 'off'),
     'QUANTEEZE_COMPACT': ('on', 'off'),
     'QUANTEEZE_VISION_SSD': ('auto', 'on', 'off'),
     'QUANTEEZE_EMBED_SSD': ('on', 'off'),
@@ -103,7 +106,7 @@ CHOICES = {
     'QUANTEEZE_ENGRAM_IDS_ONCE': ('on', 'off'),
     'QUANTEEZE_MTP_TIMING': ('off', 'wall', 'sync', 'profile'),
     'QUANTEEZE_LOOPS': ('on', 'off'),
-    'QUANTEEZE_EXPERT_QMV': ('on', 'off'),
+    'QUANTEEZE_EXPERT_QMV': ('on', 'off'), 'QUANTEEZE_EXPERT_QMV_VERIFY_FUSED': ('on', 'off'),
     'QUANTEEZE_KQUANT_QMV': ('on', 'off'),
     'QUANTEEZE_HC_KERNELS': ('on', 'off'),
     'QUANTEEZE_V41_HEAD_KERNEL': ('on', 'off'),
@@ -127,7 +130,7 @@ CHOICES = {
     'QUANTEEZE_KEEP_PRESSURE': ('on', 'off'),
     'QUANTEEZE_KEEP_STRAIN': ('on', 'off'),
     'QUANTEEZE_REQUEST_LEASES': ('on', 'off'),
-    'QUANTEEZE_NATIVE': ('on', 'off'),
+    'QUANTEEZE_NATIVE': ('on', 'off'), 'QUANTEEZE_NVRTC_PCH': ('on', 'off'),
     'QUANTEEZE_NGRAM_TOUCH_NATIVE': ('on', 'off'),
     'QUANTEEZE_ENGRAM_HASHES_ON_HOST': ('on', 'off'),
     'QUANTEEZE_V41_ATTENTION_NATIVE': ('auto', 'on', 'off', 'compare'),
@@ -145,6 +148,7 @@ _CHANGED = set()
 _SWITCH = {
     'busy': False, 'inflight': 0, 'served': None, 'target': None,
     'state': 'idle', 'error': None, 'loader': None, 'check': None,
+    'unloader': None, 'held': None,
 }
 
 
@@ -229,8 +233,16 @@ def environ():
 
 
 def loaded():
-    """As the server loads a model: what it reads now ('load' settings take effect)."""
+    """As the server loads a model: what it reads now ('load' settings take effect) -- kept for
+    variables.at_load() so mid-load or mid-request env changes do not drift."""
     _LOADED[0] = _snapshot()
+    variables.take_load_snapshot()
+
+
+def unloaded():
+    """Clear the active model's settings snapshot on page unload."""
+    _LOADED[0] = None
+    variables._AT_LOAD[0] = None
 
 
 # ---------------------------------------------------------------- the settings, read and changed
@@ -246,7 +258,10 @@ def state():
     for s in served():
         now = _now(s.name)
         read = _STARTED if s.when == 'start' or _LOADED[0] is None else _LOADED[0]
-        effect = now if s.when == 'request' else read.get(s.name)
+        effect = (
+            now if s.when == 'request' or (s.when == 'load' and _LOADED[0] is None)
+            else read.get(s.name)
+        )
         out.append({
             'name': s.name, 'group': s.group, 'when': s.when, 'doc': s.doc, 'default': s.default,
             'choices': list(CHOICES.get(s.name, ())),
@@ -286,6 +301,10 @@ def check(name, value):
         return f'one line of at most {LONGEST} characters'
     if value and _numeric(setting.default) and not _numeric(value) and value.lower() not in WORDS:
         return f'a number, or {" or ".join(WORDS)} (the default is {setting.default})'
+    if value and name == 'QUANTEEZE_MTP_BITS' and value.lower() not in WORDS and not (
+        value.isdigit() and int(value) > 0
+    ):
+        return f'a positive whole number, or {" or ".join(WORDS)} (the default is {setting.default})'
     if value and name in CHOICES and value not in CHOICES[name]:
         return f'one of {", ".join(CHOICES[name])}'
     if value and name in ('QUANTEEZE_READ_THREADS', 'QUANTEEZE_CPU_THREADS') and value.lower() != 'auto' and not (
@@ -298,6 +317,8 @@ def check(name, value):
         value.isdigit() and int(value) > 0
     ):
         return 'a positive whole number, auto, or off'
+    if value and name == 'QUANTEEZE_WARM_UP_BATCH' and value.lower() != 'off' and not value.isdigit():
+        return 'a whole number (0 or higher), or off'
     if value and name in SAMPLING and not (_numeric(value) and (name != 'QUANTEEZE_SEED' or value.isdigit())):
         return 'a whole number' if name == 'QUANTEEZE_SEED' else 'a number'
     return None
@@ -368,6 +389,7 @@ def model_state():
     last = _SWITCH.get('last')
     return {
         'model': current(), 'served': chosen(), 'target': _SWITCH['target'], 'state': _SWITCH['state'],
+        'held': _SWITCH.get('held'),
         'error': _SWITCH['error'], 'inflight': _SWITCH['inflight'],
         'quiet_s': None if last is None else round(time.time() - last, 1), 'progress': progress.state(),
         'bits': _uniform_bits(), 'from_ssd_gb': variables.get('QUANTEEZE_FROM_SSD_GB'),
@@ -405,7 +427,10 @@ def switch_model(path, wait=0.2, undo=None):
     if _SWITCH['loader'] is None:
         raise ValueError('this server loads no model from the page (quanteeze.serve installs the loader)')
     if _SWITCH['busy']:
-        raise ValueError(f'loading {_SWITCH["target"]} already')
+        raise ValueError(
+            f'unloading {_SWITCH["held"]} already' if _SWITCH['state'] == 'unloading'
+            else f'loading {_SWITCH["target"]} already'
+        )
     target = str(target.resolve())
     _checked(target)
     _SWITCH.update(busy=True, state='waiting', error=None, target=target)
@@ -418,7 +443,7 @@ def switch_model(path, wait=0.2, undo=None):
                 time.sleep(wait)
             _SWITCH['state'] = 'loading'
             _SWITCH['loader'](target)
-            _SWITCH.update(served=target, state='idle')
+            _SWITCH.update(served=target, state='idle', held=None)
         except BaseException as e:
             _SWITCH.update(served=None, state='failed', error=f'{type(e).__name__}: {e}')
             back = {n: v for n, v in (undo or {}).items() if os.environ.get(n, '') == ours[n]}
@@ -428,6 +453,36 @@ def switch_model(path, wait=0.2, undo=None):
                       file=sys.stderr, flush=True)
             if progress.state()['loading']:
                 progress.end(_SWITCH['error'])
+        finally:
+            _SWITCH['busy'] = False
+
+    threading.Thread(target=run, name='quanteeze-model', daemon=True).start()
+    return model_state()
+
+
+def unload_model(wait=0.2):
+    """Unload the served model and refuse generation requests (503) until reloaded from the Home page."""
+    import threading
+    if _SWITCH['unloader'] is None:
+        raise ValueError('this server lets no model go from the page (quanteeze.serve installs the unloader)')
+    if _SWITCH['busy']:
+        raise ValueError(
+            f'unloading {_SWITCH["held"]} already' if _SWITCH['state'] == 'unloading'
+            else f'loading {_SWITCH["target"]} already'
+        )
+    target = chosen() or current()
+    if target is None:
+        raise ValueError('no model is loaded to let go')
+    _SWITCH.update(busy=True, state='unloading', error=None, target=None, held=target)
+
+    def run():
+        try:
+            while _SWITCH['inflight'] > 0:
+                time.sleep(wait)
+            _SWITCH['unloader']()
+            _SWITCH.update(served=None, state='unloaded')
+        except BaseException as e:                # noqa: BLE001 -- shown on the page; requests stay refused
+            _SWITCH.update(state='failed', error=f'{type(e).__name__}: {e}')
         finally:
             _SWITCH['busy'] = False
 
@@ -563,6 +618,8 @@ class Middleware:
             elif path == MODEL_PATH:
                 if method == 'GET':
                     out = model_state()
+                elif body.get('unload'):
+                    out = unload_model()
                 else:
                     if 'bits' in body:
                         change({'QUANTEEZE_BITS': str(body['bits']) if body['bits'] else ''})
@@ -577,9 +634,20 @@ class Middleware:
         return await _reply(send, 200, out)
 
     async def _generate(self, scope, receive, send):
-        """A request that generates: refused (503, with the progress) while a model loads; else
-        named the model served (serving()), whatever it names, its temperature and seed the
-        server's defaults where it names none (SAMPLING), and counted while it runs."""
+        """A request that generates: refused (503, with the progress) while a model loads or after
+        it is unloaded from the Home page; else named the model served (serving()), with defaults."""
+        if _SWITCH.get('held') and (not _SWITCH['busy'] or _SWITCH['state'] == 'unloading'):
+            data = json.dumps({
+                'error': {
+                    'message': f'the model ({_SWITCH["held"]}) was let go from the page: '
+                               'load it again there to serve',
+                    'type': 'unloaded',
+                },
+            }).encode()
+            await send({'type': 'http.response.start', 'status': 503,
+                        'headers': [(b'content-type', b'application/json'),
+                                    (b'content-length', str(len(data)).encode())]})
+            return await send({'type': 'http.response.body', 'body': data, 'more_body': False})
         if _SWITCH['busy']:
             from . import progress
             p = progress.state()
@@ -639,12 +707,12 @@ async def _named(scope, receive, model, defaults=None):
     return dict(scope, headers=headers + [(b'content-length', str(len(data)).encode())]), renamed
 
 
-def install(app, argv=None, loader=None, check=None):
+def install(app, argv=None, loader=None, check=None, unloader=None):
     """Guard `app`'s control routes and serve the page; returns the page's URL.  loader(path) loads
     a model in mlx-vlm's place (quanteeze.serve), check(path) refuses settings a load of the
-    checkpoint at `path` would refuse, before the model served is let go."""
+    checkpoint at `path` would refuse, before the model served is let go, and unloader() releases it."""
     argv = sys.argv[1:] if argv is None else argv
     secret = token()
-    _SWITCH.update(loader=loader, check=check, secret=secret)
+    _SWITCH.update(loader=loader, check=check, unloader=unloader, secret=secret)
     app.add_middleware(Middleware, secret=secret)
     return page_url(argument(argv, '--host'), argument(argv, '--port', DEFAULT_PORT), secret)

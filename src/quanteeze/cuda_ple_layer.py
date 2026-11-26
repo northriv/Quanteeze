@@ -13,12 +13,12 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from . import cuda_kernels, cuda_qmv
+from . import cuda_kernels, cuda_ple, cuda_qmv, kernel_checks, per_thread
 
 CHECKS = 3
-STATS = dict(served=0, checked=0, mismatched=0)
-CHOICE = {}                     # (shape, dtype): whether it matched mlx-vlm's
-CHECKED = {}
+BITS = (4, 8)                   # bits project() accepts (qz_qmv4_row, qz_qmv8_row)
+STATS = dict(served=0, checked=0, mismatched=0, put_off=0)
+CHOICE, CHECKED = kernel_checks.tables('cuda_ple_layer')  # (shape, dtype): whether it matched mlx-vlm's
 SAID = []
 
 _PROJECT = r"""
@@ -29,7 +29,12 @@ _PROJECT = r"""
     }
     const bool is_k = r < NK;
     const int row = is_k ? r : r - NK;
-    const float sum = is_k ? qz_qmv4_row<K_IN, GS>(x, wk, sk, bk, row) : qz_qmv4_row<K_IN, GS>(x, wv, sv, bv, row);
+    float sum;
+    if constexpr (BITS == 8) {
+      sum = is_k ? qz_qmv8_row<K_IN, GS, true>(x, wk, sk, bk, row) : qz_qmv8_row<K_IN, GS, true>(x, wv, sv, bv, row);
+    } else {
+      sum = is_k ? qz_qmv4_row<K_IN, GS>(x, wk, sk, bk, row) : qz_qmv4_row<K_IN, GS>(x, wv, sv, bv, row);
+    }
     if (warp.thread_rank() == 0) {
       (is_k ? k : v)[row] = __float2bfloat16_rn(sum);
     }
@@ -159,10 +164,13 @@ def _mix_kernel(eps, d):
 
 
 def _quantized(linear, rows, cols):
-    return (getattr(linear, 'bits', None) == 4 and getattr(linear, 'mode', 'affine') == 'affine'
+    bits = getattr(linear, 'bits', None)
+    return (bits in BITS and getattr(linear, 'mode', 'affine') == 'affine'
             and getattr(linear, 'biases', None) is not None and linear.group_size in (32, 64, 128)
-            and linear.weight.dtype == mx.uint32 and tuple(linear.weight.shape) == (rows, cols // 8)
-            and linear.scales.dtype == mx.bfloat16 and linear.biases.dtype == mx.bfloat16 and 'bias' not in linear)
+            and linear.weight.dtype == mx.uint32 and tuple(linear.weight.shape) == (rows, cols * bits // 32)
+            and cols % linear.group_size == 0 and tuple(linear.scales.shape) == (rows, cols // linear.group_size)
+            and linear.scales.dtype == mx.bfloat16 and linear.biases.dtype == mx.bfloat16
+            and linear.biases.shape == linear.scales.shape and 'bias' not in linear)
 
 
 def applies(module, hidden, cache, mask):
@@ -188,7 +196,10 @@ def applies(module, hidden, cache, mask):
     if not all(type(n) is Qwen4ExpRMSNorm and n.group_size == d and n.weight.shape == (c,)
                and n.weight.dtype == hidden.dtype and n.eps == module.norm_key.eps for n in norms):
         return False
-    embed = module.key_proj.weight.shape[-1] * 8
+    bits = getattr(module.key_proj, 'bits', None)
+    if bits not in BITS or getattr(module.value_proj, 'bits', None) != bits:
+        return False
+    embed = module.key_proj.weight.shape[-1] * 32 // bits
     return (_quantized(module.key_proj, c, embed) and _quantized(module.value_proj, d, embed)
             and module.key_proj.group_size == module.value_proj.group_size and d % (_threads(d) * 4) == 0)
 
@@ -206,7 +217,8 @@ def mixed(module, hidden, embeddings, state):
     kp, vp = module.key_proj, module.value_proj
     keys, values = _project_kernel()(
         inputs=[embeddings, kp.weight, kp.scales, kp.biases, vp.weight, vp.scales, vp.biases],
-        template=[('GS', int(kp.group_size)), ('K_IN', embeddings.shape[-1]), ('NK', c), ('NV', d)],
+        template=[('GS', int(kp.group_size)), ('K_IN', embeddings.shape[-1]), ('NK', c), ('NV', d),
+                  ('BITS', int(kp.bits))],
         grid=(32 * -(-(c + d) // 8), 8, 1), threadgroup=(32, 8, 1),
         output_shapes=[(1, 1, c), (1, 1, d)], output_dtypes=[hidden.dtype] * 2)
     threads = 640
@@ -226,35 +238,44 @@ def added(forward, module, hidden, input_ids, cache, mask):
     if not applies(module, hidden, cache, mask):
         return hidden + forward._ple(module, hidden, input_ids, cache, mask)
     state = cache[2]
-    key = (tuple(hidden.shape), str(hidden.dtype), tuple(state.shape))
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    key = (tuple(hidden.shape), str(hidden.dtype), tuple(state.shape),
+           int(module.key_proj.bits), int(module.key_proj.group_size))
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if not choice:
             return hidden + forward._ple(module, hidden, input_ids, cache, mask)
         STATS['served'] += 1
         out, cache[2] = mixed(module, hidden, module.ple_embedding(input_ids, cache), state)
         return out
-    STATS['checked'] += 1
-    embeddings = module.ple_embedding(input_ids, cache)
-    try:
-        got = mixed(module, hidden, embeddings, state)
-    except Exception as error:
-        got, differ = None, [f'{type(error).__name__}: {error}']
-    module.__dict__['ple_embedding'] = lambda *args: embeddings
-    try:
-        want = hidden + forward._ple(module, hidden, input_ids, cache, mask)
-    finally:
-        module.__dict__.pop('ple_embedding', None)
-    if got is not None:
-        differ = [name for name, x, y in (('streams', got[0], want), ('window', got[1], cache[2]))
-                  if not mx.array_equal(x, y).item()]
-    if differ and not SAID:
-        SAID.append(True)
-        print(f'quanteeze: the PLE layer\'s kernels differ from mlx-vlm\'s in {", ".join(differ)} ({key}); '
-              'mlx-vlm\'s serves it', file=sys.stderr, flush=True)
-    STATS['mismatched'] += bool(differ)
-    CHOICE[key], CHECKED[key] = not differ, (seen + 1 if not differ else CHECKS)
-    return want
+    made = []
+
+    def check():
+        STATS['checked'] += 1
+        embeddings = module.ple_embedding(input_ids, cache)
+        try:
+            got = mixed(module, hidden, embeddings, state)
+        except Exception as error:
+            got, differ = None, [f'{type(error).__name__}: {error}']
+        module.__dict__['ple_embedding'] = lambda *args: embeddings
+        try:
+            want = hidden + forward._ple(module, hidden, input_ids, cache, mask)
+        finally:
+            module.__dict__.pop('ple_embedding', None)
+        if got is not None:
+            differ = [name for name, x, y in (('streams', got[0], want), ('window', got[1], cache[2]))
+                      if not kernel_checks.same_bits(x, y)]
+        if differ and not SAID:
+            SAID.append(True)
+            print(f'quanteeze: the PLE layer\'s kernels differ from mlx-vlm\'s in {", ".join(differ)} ({key}); '
+                  'mlx-vlm\'s serves it', file=sys.stderr, flush=True)
+        STATS['mismatched'] += bool(differ)
+        per_thread.checked(CHOICE, CHECKED, key, not differ, CHECKS)
+        made.append(want)
+
+    if not cuda_ple._while_alone(check):
+        STATS['put_off'] += 1
+        return hidden + forward._ple(module, hidden, input_ids, cache, mask)
+    return made[0]
 
 
 def summary():

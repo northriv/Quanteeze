@@ -439,3 +439,34 @@ def test_q8_kernels_and_reference(kind, monkeypatch):
             assert _close(got, mlx(x, 10.0), 1e-3)
     finally:
         pool.close()
+
+
+def test_load_sample_ignores_self_psi_when_others_calm():
+    """`Load.sample()` ignores `/proc/pressure/cpu` when others use less than half of `yield_at`, and still
+    yields when others reach `yield_at / 2` under high pressure."""
+    now = [100.0]
+    ticks = {'total': (1000, 10000), 'own': 0, 'pressure': ce.PRESSURE_AT + 1.0}
+
+    load = ce.Load(
+        threads=8,
+        least=4,
+        yield_at=25.0,
+        cores=16,
+        clock=lambda: now[0],
+        read=lambda: (ticks['total'], ticks['own'], ticks['pressure']),
+    )
+
+    assert load.sample() == 0
+    ticks['total'] = (1001, 10100)  # others = 1% (< 12.5%) even with high machine PSI
+    now[0] += ce.CALM_S + 0.1
+    assert load.sample() == 4
+
+    ticks['total'] = (1016, 10200)  # others = 15% (>= 12.5%) with PSI >= PRESSURE_AT -> stops workers
+    assert load.sample() == 0
+
+    ticks['total'] = (1017, 10300)  # back under 12.5% starts calm window again
+    ticks['pressure'] = ce.PRESSURE_AT + 0.5
+    assert load.sample() == 0
+    ticks['total'] = (1018, 10400)
+    now[0] += ce.CALM_S + 0.1
+    assert load.sample() == 4

@@ -14,22 +14,28 @@ tensors.  `install()` wraps `mlx_vlm.apc` so that when `QUANTEEZE_APC_ENCRYPT` i
 2. Block shards and trimmable dense checkpoints seal each `block_size` slice under its
    own chained prefix key `K_i`, so a request sharing only an earlier prefix derives keys
    for and decrypts only that shared prefix without being able to decrypt later blocks.
-3. On-disk filenames and outer envelopes store only one-way SHA-256 locators and record
-   offsets (authenticated as GCM Associated Data), exposing zero token IDs, tensor shapes,
-   or unencrypted KV values at rest.  Unsealed legacy files or tampered ciphertexts are
+3. On-disk filenames and outer envelopes store only one-way HMAC-SHA-256 locators keyed by
+   this machine's secret (`QUANTEEZE_APC_DISK_SECRET`, 32 random bytes stored 0600 and excluded
+   from Time Machine on macOS; `off` falls back to plain SHA-256) and record offsets
+   (authenticated as GCM Associated Data), exposing zero token IDs, tensor shapes, or
+   unencrypted KV values at rest.  Unsealed legacy files or tampered ciphertexts are
    rejected cleanly on startup or lookup without crashing the server.
-4. Multi-length exact-prefix lookup runs in a single incremental SHA-256 pass (`h.copy()`),
+4. Multi-length exact-prefix lookup runs in a single incremental hash pass (`h.copy()`),
    and saving a longer conversation checkpoint prunes intermediate extended checkpoints
    while preserving the shortest shared prefix and the previous longest checkpoint.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import logging
 import os
+import secrets
+import stat
 import struct
+import subprocess
 import sys
 import threading
 from collections import OrderedDict
@@ -51,6 +57,9 @@ MAGIC = b'QZAPC01\x00'
 NONCE_BYTES = 12
 TAG_BYTES = 16
 PIECE = 64 << 20
+DELTA_MIN_BYTES = 1 << 20
+DELTA_DEPTH = 32
+_SYNTHETIC = 1 << 52
 MAX_ENVELOPE_BYTES = 4 * 1024 * 1024
 CHAIN_KEY_CAP = 65536
 UNLOCK_CAP = 512
@@ -88,6 +97,102 @@ _UNLOCK: OrderedDict[Tuple[int, int], tuple] = OrderedDict()
 
 _MEM_SAFES = threading.local()
 
+SECRET_BYTES = 32
+_SECRET = {'value': None, 'read': False}
+_SECRET_LOCK = threading.Lock()
+
+
+def use_secret(value):
+    """Set the in-process APC disk secret (`bytes`, or `None` for plain SHA-256), bypassing disk (tests)."""
+    with _SECRET_LOCK:
+        _SECRET['value'] = None if value is None else bytes(value)
+        _SECRET['read'] = True
+
+
+def secret():
+    """Return this machine's secret (`SECRET_BYTES`) for HMAC-SHA-256 disk locators/keys, or None when off."""
+    with _SECRET_LOCK:
+        if not _SECRET['read']:
+            if variables.off('QUANTEEZE_APC_DISK_SECRET'):
+                _SECRET['value'] = None
+            else:
+                path = variables.path('QUANTEEZE_APC_DISK_SECRET')
+                try:
+                    _SECRET['value'] = _secret_in(path)
+                except OSError as e:
+                    _SECRET['value'] = secrets.token_bytes(SECRET_BYTES)
+                    logger.error(
+                        'APC disk: no secret kept at %s (%s): this process seals under an ephemeral secret',
+                        path, e,
+                    )
+            _SECRET['read'] = True
+        return _SECRET['value']
+
+
+def _kept_secret(path):
+    """Return the secret bytes in `path` if regular (non-symlink), owned by uid, mode 0600-safe, and `SECRET_BYTES` hex."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            return None
+        value = bytes.fromhex(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return value if len(value) == SECRET_BYTES else None
+
+
+def _secret_in(path):
+    """Return or create the secret at `path` (mode 0600 via atomic link/replace) and exclude from Time Machine."""
+    kept = _kept_secret(path)
+    if kept is not None:
+        return kept
+    path.parent.mkdir(parents=True, exist_ok=True)
+    unsafe = path.exists() or path.is_symlink()
+    made = secrets.token_bytes(SECRET_BYTES)
+    part = path.with_name(f'.{path.name}.{os.getpid()}.{secrets.token_hex(4)}')
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(made.hex() + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+        if unsafe:
+            os.replace(part, path)
+            logger.warning(
+                'APC disk: %s was not readable by this user alone; a new secret is active and prior files age out',
+                path,
+            )
+        else:
+            try:
+                os.link(part, path)
+            except FileExistsError:
+                kept = _kept_secret(path)
+                if kept is not None:
+                    return kept
+                os.replace(part, path)
+    finally:
+        if part.exists():
+            part.unlink()
+    _exclude_from_backups(path)
+    return made
+
+
+def _exclude_from_backups(path):
+    """On macOS, exclude `path` from Time Machine backups."""
+    if sys.platform != 'darwin':
+        return
+    try:
+        subprocess.run(['tmutil', 'addexclusion', str(path)], check=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning('APC disk: %s not excluded from Time Machine (%s): exclude it manually', path, e)
+
+
+def _hash(data: bytes = b''):
+    """Incremental HMAC-SHA-256 under `secret()`, or plain SHA-256 when `QUANTEEZE_APC_DISK_SECRET=off`."""
+    key = secret()
+    return hashlib.sha256(data) if key is None else hmac.new(key, data, hashlib.sha256)
+
 _GATHERS: dict[int, tuple] = {}
 _GATHERS_LOCK = threading.Lock()
 _MINE = threading.local()
@@ -98,7 +203,7 @@ _WROTE_LOCK = threading.Lock()
 
 def write_cap() -> Optional[float]:
     """Return `QUANTEEZE_APC_DISK_WRITE_GB` in bytes, or None when unbounded."""
-    raw = variables.get('QUANTEEZE_APC_DISK_WRITE_GB')
+    raw = variables.get('QUANTEEZE_APC_DISK_WRITE_GB', variables.at_start())
     return None if raw in (None, '', 'off') else float(raw) * 1e9
 
 
@@ -196,12 +301,12 @@ def summary() -> str:
 
 def _precision_salt() -> bytes:
     own = PRECISION[0]() if PRECISION[0] is not None else ''
-    bits = (variables.get('QUANTEEZE_BITS') or 'off').strip().lower()
+    bits = (variables.get('QUANTEEZE_BITS', variables.at_load()) or 'off').strip().lower()
     return f'{own}|bits={bits}'.encode('utf-8')
 
 
 def _root_chain_key(salt: bytes) -> bytes:
-    h = hashlib.sha256()
+    h = _hash()
     h.update(b'quanteeze-apc-root-v1\x00')
     h.update(len(salt).to_bytes(4, 'little'))
     h.update(salt)
@@ -209,7 +314,7 @@ def _root_chain_key(salt: bytes) -> bytes:
 
 
 def _step_chain_key(parent_key: bytes, tokens: Sequence[int], extra_hash: int) -> Tuple[bytes, int]:
-    h = hashlib.sha256()
+    h = _hash()
     h.update(b'quanteeze-apc-blk-key-v1\x00')
     h.update(parent_key)
     h.update(int(extra_hash & ((1 << 64) - 1)).to_bytes(8, 'little'))
@@ -217,7 +322,7 @@ def _step_chain_key(parent_key: bytes, tokens: Sequence[int], extra_hash: int) -
     h.update(int(arr.size).to_bytes(4, 'little'))
     h.update(arr.tobytes())
     key = h.digest()
-    loc_digest = hashlib.sha256(b'quanteeze-apc-blk-loc-v1\x00' + key).digest()
+    loc_digest = _hash(b'quanteeze-apc-blk-loc-v1\x00' + key).digest()
     loc = int.from_bytes(loc_digest[:8], 'little', signed=True)
     if loc == _apc.SEED_PARENT_HASH:
         loc ^= 1
@@ -241,7 +346,7 @@ def _get_chain_key(loc: int) -> Optional[bytes]:
 
 
 def _derive_exact_locator(key: bytes) -> Tuple[int, str]:
-    d = hashlib.sha256(b'quanteeze-apc-exact-loc-v1\x00' + key).digest()
+    d = _hash(b'quanteeze-apc-exact-loc-v1\x00' + key).digest()
     loc_int = int.from_bytes(d[:8], 'little', signed=True)
     return loc_int, d[:16].hex()
 
@@ -261,7 +366,7 @@ def _derive_exact_digests(
     arr = np.ascontiguousarray(tokens[:max_n], dtype='<i4')
     raw = memoryview(arr).cast('B')
 
-    h = hashlib.sha256()
+    h = _hash()
     h.update(b'quanteeze-apc-exact-key-v1\x00')
     h.update(len(salt).to_bytes(4, 'little'))
     h.update(salt)
@@ -284,7 +389,7 @@ def _derive_exact_digests(
 def _derive_exact_key(tokens: Sequence[int], extra_hash: int, salt: bytes) -> bytes:
     n = len(tokens)
     if n <= 0:
-        h = hashlib.sha256()
+        h = _hash()
         h.update(b'quanteeze-apc-exact-key-v1\x00')
         h.update(len(salt).to_bytes(4, 'little'))
         h.update(salt)
@@ -760,6 +865,279 @@ def _decrypt_record_arrays(
     return out, metadata
 
 
+def _peek_record_metadata(path: Path, key: bytes) -> Optional[dict]:
+    """Decrypt only record 0's safetensors JSON metadata (unauthenticated; used solely on the write
+    path to inspect candidate delta parents — reads always verify full GCM tags across the chain)."""
+    parsed = _read_envelope(path)
+    if parsed is None:
+        return None
+    env, prefix_bytes, data_start = parsed
+    records = env.get('records') or []
+    if not records:
+        return None
+    try:
+        rel_off, rec_len = int(records[0][0]), int(records[0][1])
+    except (IndexError, TypeError, ValueError):
+        return None
+    ct_len = rec_len - NONCE_BYTES - TAG_BYTES
+    if rel_off < 0 or ct_len < 8:
+        return None
+    try:
+        with open(path, 'rb') as f:
+            f.seek(data_start + rel_off)
+            nonce = f.read(NONCE_BYTES)
+            if len(nonce) != NONCE_BYTES:
+                return None
+            f.seek(data_start + rel_off + NONCE_BYTES + ct_len)
+            tag = f.read(TAG_BYTES)
+            if len(tag) != TAG_BYTES:
+                return None
+            f.seek(data_start + rel_off + NONCE_BYTES)
+            dec = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+            dec.authenticate_additional_data(prefix_bytes + b':rec:0')
+            header_size = int.from_bytes(dec.update(f.read(8)), 'little')
+            if header_size <= 0 or header_size > min(64 * 1024 * 1024, ct_len - 8):
+                return None
+            header = json.loads(dec.update(f.read(header_size)))
+            if not isinstance(header, dict):
+                return None
+            return dict(header.get('__metadata__', {}) or {})
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _digest(a: mx.array, upto: Optional[int] = None) -> Tuple[str, Optional[str]]:
+    """Return `(sha256_whole_hex, sha256_first_upto_bytes_hex_or_None)` streamed over `_pieces(a)`."""
+    h = hashlib.sha256()
+    done = 0
+    head: Optional[str] = h.hexdigest() if upto == 0 else None
+    for piece in _pieces(a):
+        if head is None and upto is not None and done + piece.nbytes >= upto:
+            cut = upto - done
+            h.update(piece[:cut])
+            head = h.hexdigest()
+            h.update(piece[cut:])
+        else:
+            h.update(piece)
+        done += piece.nbytes
+    return h.hexdigest(), head
+
+
+def _grown(shape: Tuple[int, ...], before: Tuple[int, ...]) -> Optional[int]:
+    """Return the single axis along which `shape` extends `before` (`0` when identical), else `None`."""
+    if len(shape) != len(before):
+        return None
+    axes = [i for i, (s, b) in enumerate(zip(shape, before)) if s != b]
+    if len(axes) > 1 or (axes and shape[axes[0]] < before[axes[0]]):
+        return None
+    return axes[0] if axes else 0
+
+
+def _rows(axis: int, start: int, stop: Optional[int] = None):
+    """Slice index selecting `[start:stop]` along `axis`."""
+    return (slice(None),) * axis + (slice(start, stop),)
+
+
+def _delta_exact(
+    store,
+    token_ids: Sequence[int],
+    extra_hash: int,
+    salt: bytes,
+    arrays: dict[str, mx.array],
+    metadata: dict[str, str],
+) -> Optional[Tuple[int, int]]:
+    """Rewrite `exact_v1` `arrays` and `metadata` in place as a delta of the longest stored `exact_v1`
+    prefix of `token_ids` (up to `DELTA_DEPTH` deep). Returns `(parent_token_count, parent_locator)`
+    when written as a delta, or `None` when written whole."""
+    n_cur = len(token_ids)
+    parent = None
+    depth = 0
+    envs = getattr(store, '_quanteeze_envelopes', None)
+    with store._index_lock:
+        entries = list(store._exact_index.items())
+    by_len: dict[int, list[Tuple[int, Path]]] = {}
+    for loc_int, p in entries:
+        if not p.exists():
+            continue
+        env = envs.get(p) if isinstance(envs, dict) else None
+        if env is None:
+            parsed = _read_envelope(p)
+            env = parsed[0] if parsed is not None else None
+        if env is None or env.get('kind') != 'exact_v1':
+            continue
+        try:
+            tc = int(env.get('token_count', 0))
+        except (TypeError, ValueError):
+            continue
+        if 0 < tc < n_cur:
+            by_len.setdefault(tc, []).append((int(loc_int), p))
+
+    if by_len:
+        derived = _derive_exact_digests(token_ids, int(extra_hash), by_len.keys(), salt)
+        for tc in sorted(derived, reverse=True):
+            ekey, expected_loc, _ = derived[tc]
+            hit = next((p for loc_int, p in by_len.get(tc, ()) if loc_int == expected_loc), None)
+            if hit is not None:
+                seen = _peek_record_metadata(hit, ekey)
+                try:
+                    seen_depth = int((seen or {}).get('qz_depth', 0))
+                    seen_digests = json.loads(seen['qz_digests']) if seen and 'qz_digests' in seen else None
+                except (TypeError, ValueError):
+                    seen_depth, seen_digests = DELTA_DEPTH, None
+                if seen_digests is not None and seen_depth < DELTA_DEPTH:
+                    parent = (tc, int(expected_loc), seen_digests)
+                    depth = seen_depth
+                break
+
+    held: dict[str, list] = {}
+    plan: dict[str, list] = {}
+    for k, a in arrays.items():
+        if a.nbytes < DELTA_MIN_BYTES or gather_of(a) is not None:
+            continue
+        before = parent[2].get(k) if parent is not None else None
+        axis = None
+        if isinstance(before, list) and len(before) == 3 and before[0] == str(a.dtype):
+            axis = _grown(tuple(int(d) for d in a.shape), tuple(int(d) for d in before[1]))
+        leading = axis is not None and all(d == 1 for d in a.shape[:axis])
+        upto = int(np.prod(before[1], dtype=np.int64)) * a.itemsize if leading else None
+        whole, head = _digest(a, upto)
+        if axis is not None and not leading:
+            head = _digest(a[_rows(axis, 0, int(before[1][axis]))])[0]
+        held[k] = [str(a.dtype), [int(d) for d in a.shape], whole]
+        if axis is not None and head == before[2]:
+            plan[k] = [axis, int(before[1][axis]), before[2], int(a.shape[axis]) == int(before[1][axis])]
+
+    metadata['qz_digests'] = json.dumps(held, separators=(',', ':'))
+    metadata['qz_depth'] = str(depth + 1 if plan else 0)
+    if not plan or parent is None:
+        return None
+    for k, (axis, rows, _digest_hex, same) in plan.items():
+        if same:
+            del arrays[k]
+        else:
+            arrays[k] = arrays[k][_rows(axis, int(rows))]
+    metadata['qz_parent'] = str(parent[0])
+    metadata['qz_delta'] = json.dumps(plan, separators=(',', ':'))
+    return parent[0], parent[1]
+
+
+def _parent_paths(store) -> Tuple[set[int], set[Path]]:
+    """Return `(parent_locators, parent_paths)` referenced by any existing delta checkpoint in `store`."""
+    envs = getattr(store, '_quanteeze_envelopes', None)
+    with store._index_lock:
+        exact_map = dict(store._exact_index)
+    parent_locs: set[int] = set()
+    for p in exact_map.values():
+        if not p.exists():
+            continue
+        env = envs.get(p) if isinstance(envs, dict) else None
+        if env is None:
+            parsed = _read_envelope(p)
+            env = parsed[0] if parsed is not None else None
+        if env is not None and env.get('parent_locator') is not None:
+            try:
+                parent_locs.add(int(env['parent_locator']))
+            except (TypeError, ValueError):
+                pass
+    parent_paths = {exact_map[loc] for loc in parent_locs if loc in exact_map and exact_map[loc].exists()}
+    return parent_locs, parent_paths
+
+
+def evict(store, keep: Optional[Path] = None) -> int:
+    """Evict least-recently-used shards until `store._disk_bytes <= target`, evicting delta children
+    before their parents so retained prefix chains remain whole."""
+    if not store._ensure_dir():
+        return 0
+    if store.max_bytes is None:
+        return 0
+    with store._in_flight_lock:
+        in_flight_hashes = set(store._in_flight.keys())
+    with store._index_lock:
+        in_flight_paths = {store._index[h][0] for h in in_flight_hashes if h in store._index}
+        in_flight_paths.update(
+            store._exact_index[h] for h in in_flight_hashes if h in store._exact_index
+        )
+
+    candidates: list[dict[str, Any]] = []
+    disk_total = 0
+    for p in store.dir.glob(f'*{store.SUFFIX}'):
+        if not store._is_canonical_store_file(p):
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        disk_total += st.st_size
+        if p in in_flight_paths or p == keep:
+            continue
+        store_id = str(p)
+        segment_index = 0
+        meta = _apc._read_safetensors_metadata(p)
+        if meta is not None:
+            store_id = meta.get('store_id', store_id)
+            try:
+                segment_index = int(meta.get('segment_index', '0'))
+            except (TypeError, ValueError):
+                segment_index = 0
+        candidates.append({
+            'last_used': st.st_mtime,
+            'size': st.st_size,
+            'path': p,
+            'store_id': store_id,
+            'segment_index': segment_index,
+        })
+
+    total = max(int(store._disk_bytes), disk_total)
+    store._disk_bytes = total
+    if total <= store.max_bytes:
+        return 0
+    target = int(store.max_bytes * store._EVICT_LOW_WATERMARK)
+
+    store_last_used: dict[str, float] = {}
+    for c in candidates:
+        sid = c['store_id']
+        store_last_used[sid] = min(c['last_used'], store_last_used.get(sid, c['last_used']))
+    candidates.sort(key=lambda c: (store_last_used[c['store_id']], -int(c['segment_index']), c['last_used']))
+
+    evicted = 0
+    while store._disk_bytes > target and candidates:
+        _, protected_paths = _parent_paths(store)
+        went = 0
+        remaining: list[dict[str, Any]] = []
+        for idx, c in enumerate(candidates):
+            if store._disk_bytes <= target:
+                remaining.extend(candidates[idx:])
+                break
+            p = c['path']
+            if p in protected_paths or not p.exists():
+                if p.exists():
+                    remaining.append(c)
+                continue
+            try:
+                p.unlink()
+            except OSError as e:
+                logger.warning('APC disk: failed to evict %s: %s', p, e)
+                remaining.append(c)
+                continue
+            store._disk_bytes = max(0, store._disk_bytes - int(c['size']))
+            evicted += 1
+            went += 1
+            store._drop_index_for_path(p)
+        if not went:
+            break
+        candidates = remaining
+
+    if evicted:
+        store.evictions += evicted
+        logger.info(
+            'APC disk: evicted %d shard(s); now %.1f MB / %.1f MB cap',
+            evicted,
+            store._disk_bytes / 1e6,
+            store.max_bytes / 1e6,
+        )
+    return evicted
+
+
 def _query_block_chain(
     token_ids: Sequence[int],
     extra_hash: int,
@@ -782,14 +1160,14 @@ def _query_block_chain(
     out: list[Tuple[bytes, int]] = []
     parent_key = _root_chain_key(salt)
     for i in range(n_blocks):
-        h = hashlib.sha256()
+        h = _hash()
         h.update(b'quanteeze-apc-blk-key-v1\x00')
         h.update(parent_key)
         h.update(extra_bytes)
         h.update(size_bytes)
         h.update(raw[i * stride : (i + 1) * stride])
         key = h.digest()
-        loc_digest = hashlib.sha256(b'quanteeze-apc-blk-loc-v1\x00' + key).digest()
+        loc_digest = _hash(b'quanteeze-apc-blk-loc-v1\x00' + key).digest()
         loc = int.from_bytes(loc_digest[:8], 'little', signed=True)
         if loc == _apc.SEED_PARENT_HASH:
             loc ^= 1
@@ -816,6 +1194,8 @@ def install(store_cls=None, manager_cls=None) -> bool:
     orig_drop_index = store_cls._drop_index_for_path
     orig_clear_state = store_cls._clear_disk_state_after_external_delete
     orig_open_header = store_cls._open_shard_header
+    orig_maybe_evict = store_cls._maybe_evict
+    orig_exact_bytes = store_cls.exact_cache_bytes
     orig_find_exact = store_cls.find_exact_prefix
     orig_load_exact = store_cls.load_exact_cache
     orig_save_exact = store_cls.save_exact_cache
@@ -834,7 +1214,7 @@ def install(store_cls=None, manager_cls=None) -> bool:
         else:
             parent_key = _get_chain_key(parent)
             if parent_key is None:
-                parent_key = hashlib.sha256(
+                parent_key = _hash(
                     b'quanteeze-apc-fallback-v1\x00'
                     + _precision_salt()
                     + int(parent & ((1 << 64) - 1)).to_bytes(8, 'little')
@@ -1017,6 +1397,60 @@ def install(store_cls=None, manager_cls=None) -> bool:
             return None
         return orig_open_header(self, shard_path)
 
+    def _maybe_evict(self) -> int:
+        if not ON[0]:
+            return orig_maybe_evict(self)
+        return evict(self)
+
+    def exact_cache_bytes(self, cache_hash: int) -> int:
+        if not ON[0]:
+            return orig_exact_bytes(self, cache_hash)
+        with self._index_lock:
+            cur_path = self._exact_index.get(int(cache_hash))
+        total = 0
+        seen: set[Path] = set()
+        for _ in range(DELTA_DEPTH + 2):
+            if cur_path is None or cur_path in seen:
+                break
+            seen.add(cur_path)
+            try:
+                total += cur_path.stat().st_size
+            except OSError:
+                break
+            env = _get_store_envelope(self, cur_path)
+            p_loc = env.get('parent_locator') if env is not None else None
+            if p_loc is None:
+                break
+            try:
+                p_loc_int = int(p_loc)
+            except (TypeError, ValueError):
+                break
+            with self._index_lock:
+                cur_path = self._exact_index.get(p_loc_int)
+        return total
+
+    def _chain_on_disk(self, path: Path) -> bool:
+        cur_path = path
+        for _ in range(DELTA_DEPTH + 2):
+            if not cur_path.exists():
+                return False
+            env = _get_store_envelope(self, cur_path)
+            if env is None:
+                return False
+            p_loc = env.get('parent_locator')
+            if p_loc is None:
+                return True
+            try:
+                p_loc_int = int(p_loc)
+            except (TypeError, ValueError):
+                return False
+            with self._index_lock:
+                next_path = self._exact_index.get(p_loc_int)
+            if next_path is None or next_path == cur_path:
+                return False
+            cur_path = next_path
+        return False
+
     def _prune_extended_exact(
         self,
         written_path: Path,
@@ -1038,6 +1472,9 @@ def install(store_cls=None, manager_cls=None) -> bool:
 
         by_len: dict[int, list[Tuple[int, Path]]] = {}
         for loc_int, p in entries:
+            if not p.exists():
+                self._drop_index_for_path(p)
+                continue
             env = _get_store_envelope(self, p)
             if env is None:
                 continue
@@ -1068,21 +1505,37 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 }
 
         gone = 0
-        for _tc, loc_int, p in matched[1:-1]:
-            if loc_int in in_flight or p in in_flight_paths:
-                continue
-            try:
-                size = p.stat().st_size
-            except OSError:
-                size = 0
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                continue
-            if size:
-                self._disk_bytes = max(0, self._disk_bytes - size)
-            self._drop_index_for_path(p)
-            gone += 1
+        middle = list(reversed(matched[1:-1]))
+        while middle:
+            parent_locs, parent_paths = _parent_paths(self)
+            went = 0
+            remaining: list[Tuple[int, int, Path]] = []
+            for tc, loc_int, p in middle:
+                if (
+                    loc_int in in_flight
+                    or p in in_flight_paths
+                    or loc_int in parent_locs
+                    or p in parent_paths
+                ):
+                    remaining.append((tc, loc_int, p))
+                    continue
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    size = 0
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    remaining.append((tc, loc_int, p))
+                    continue
+                if size:
+                    self._disk_bytes = max(0, self._disk_bytes - size)
+                self._drop_index_for_path(p)
+                gone += 1
+                went += 1
+            if not went:
+                break
+            middle = remaining
 
         if gone:
             STATS['pruned'] += gone
@@ -1127,7 +1580,9 @@ def install(store_cls=None, manager_cls=None) -> bool:
         existing_path = self._shard_path(shard_id)
         if existing_path.exists():
             env = _get_store_envelope(self, existing_path)
-            if env is not None and env.get('kind') in ('exact_v1', 'exact_trim_v1'):
+            kind = env.get('kind') if env is not None else None
+            intact = kind == 'exact_trim_v1' or (kind == 'exact_v1' and _chain_on_disk(self, existing_path))
+            if intact:
                 try:
                     os.utime(existing_path, None)
                 except OSError:
@@ -1137,6 +1592,8 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 return True
             with self._write_lock:
                 _drop_corrupt_shard(self, existing_path)
+        else:
+            self._drop_index_for_path(existing_path)
         if over_cap():
             return False
         bs = max(1, int(getattr(self, '_quanteeze_block_size', _apc.DEFAULT_BLOCK_SIZE)))
@@ -1198,6 +1655,10 @@ def install(store_cls=None, manager_cls=None) -> bool:
             salt,
         ) = seal_info
         store_id = f'{self.EXACT_PREFIX}{loc_hex}'
+        try:
+            prior_size = path.stat().st_size if path.exists() else 0
+        except OSError:
+            prior_size = 0
 
         if not trimmable:
             metadata: dict[str, str] = {
@@ -1213,15 +1674,27 @@ def install(store_cls=None, manager_cls=None) -> bool:
             for i, c in enumerate(snapshot.prompt_cache):
                 if not self._snapshot_exact_cache_entry(c, f'c{i}', arrays, metadata):
                     raise ValueError(f'unsupported exact-cache entry at index {i}')
+            parent_info = _delta_exact(
+                self,
+                snapshot.token_ids,
+                int(snapshot.extra_hash),
+                salt,
+                arrays,
+                metadata,
+            )
+            envelope_dict: dict[str, Any] = {
+                'kind': 'exact_v1',
+                'store_id': store_id,
+                'locator': int(loc_int),
+                'token_count': len(snapshot.token_ids),
+                'segment_index': 0,
+            }
+            if parent_info is not None:
+                envelope_dict['parent_token_count'] = int(parent_info[0])
+                envelope_dict['parent_locator'] = int(parent_info[1])
             env = _write_sealed_records(
                 path,
-                {
-                    'kind': 'exact_v1',
-                    'store_id': store_id,
-                    'locator': int(loc_int),
-                    'token_count': len(snapshot.token_ids),
-                    'segment_index': 0,
-                },
+                envelope_dict,
                 [(arrays, metadata, exact_key)],
             )
         else:
@@ -1278,14 +1751,14 @@ def install(store_cls=None, manager_cls=None) -> bool:
             )
 
         written_size = _record_wrote(path)
-        if written_size:
-            self._disk_bytes += written_size
+        if written_size or prior_size:
+            self._disk_bytes = max(0, self._disk_bytes - prior_size + written_size)
         with self._index_lock:
             self._exact_index[int(loc_int)] = path
             _store_envelopes(self)[path] = env
         STATS['writes'] += 1
         _prune_extended_exact(self, path, snapshot.token_ids, int(snapshot.extra_hash), salt)
-        self._maybe_evict()
+        evict(self, keep=path)
         return [int(loc_int)]
 
     def find_exact_prefix(
@@ -1320,27 +1793,77 @@ def install(store_cls=None, manager_cls=None) -> bool:
 
         salt = _precision_salt()
         indexed_envs: list[Tuple[int, Path, dict]] = []
+        by_loc: dict[int, Tuple[Path, dict]] = {}
         candidate_lengths: set[int] = set()
         trim_block_sizes: set[int] = set()
         for loc_int, path in entries:
+            if not path.exists():
+                self._drop_index_for_path(path)
+                continue
             env = _get_store_envelope(self, path)
             if env is None:
                 self._drop_index_for_path(path)
                 continue
-            indexed_envs.append((int(loc_int), path, env))
-            try:
-                tc = int(env.get('token_count', 0))
-            except (TypeError, ValueError):
-                continue
-            if min_prefix_tokens < tc <= max_len:
-                candidate_lengths.add(tc)
+            loc_i = int(loc_int)
+            indexed_envs.append((loc_i, path, env))
+            by_loc[loc_i] = (path, env)
             if env.get('kind') == 'exact_trim_v1':
+                try:
+                    tc_trim = int(env.get('token_count', 0))
+                except (TypeError, ValueError):
+                    tc_trim = 0
+                if min_prefix_tokens < tc_trim <= max_len:
+                    candidate_lengths.add(tc_trim)
                 try:
                     ebs = int(env.get('block_size', block_size))
                 except (TypeError, ValueError):
                     ebs = int(block_size)
                 if ebs > 0 and max_len >= ebs:
                     trim_block_sizes.add(ebs)
+
+        exact_v1_chains: dict[int, list[Tuple[int, Path, int]]] = {}
+        for loc_i, path, env in indexed_envs:
+            if env.get('kind') != 'exact_v1':
+                continue
+            try:
+                tc = int(env.get('token_count', 0))
+            except (TypeError, ValueError):
+                continue
+            if not (min_prefix_tokens < tc <= max_len):
+                continue
+            chain: list[Tuple[int, Path, int]] = [(loc_i, path, tc)]
+            cur_env, cur_tc = env, tc
+            ok = True
+            for _ in range(DELTA_DEPTH + 1):
+                p_loc_raw = cur_env.get('parent_locator')
+                if p_loc_raw is None:
+                    break
+                try:
+                    p_loc = int(p_loc_raw)
+                    p_tc = int(cur_env['parent_token_count'])
+                except (KeyError, TypeError, ValueError):
+                    ok = False
+                    break
+                if not 0 < p_tc < cur_tc or p_loc not in by_loc:
+                    ok = False
+                    break
+                p_path, p_env = by_loc[p_loc]
+                try:
+                    actual_tc = int(p_env.get('token_count', 0))
+                except (TypeError, ValueError):
+                    actual_tc = 0
+                if p_env.get('kind') != 'exact_v1' or actual_tc != p_tc or not p_path.exists():
+                    ok = False
+                    break
+                chain.append((p_loc, p_path, p_tc))
+                cur_env, cur_tc = p_env, p_tc
+            else:
+                ok = False
+            if ok:
+                chain.reverse()
+                exact_v1_chains[loc_i] = chain
+                for _c_loc, _c_path, c_tc in chain:
+                    candidate_lengths.add(c_tc)
 
         exact_derived = _derive_exact_digests(
             token_tuple, int(extra_hash), candidate_lengths, salt
@@ -1366,9 +1889,17 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 ekey, dloc, _ = exact_derived[tc]
                 if dloc == loc_int and (best is None or tc > best[1]):
                     if kind == 'exact_v1':
-                        best = (loc_int, tc)
-                        best_grant = ('exact_v1', ekey)
-                        continue
+                        v1_chain = exact_v1_chains.get(loc_int)
+                        if v1_chain is not None and all(
+                            c_tc in exact_derived and exact_derived[c_tc][1] == c_loc
+                            for c_loc, _c_path, c_tc in v1_chain
+                        ):
+                            best = (loc_int, tc)
+                            best_grant = (
+                                'exact_v1',
+                                [(c_path, exact_derived[c_tc][0]) for _c_loc, c_path, c_tc in v1_chain],
+                            )
+                            continue
                     if kind == 'exact_trim_v1':
                         ebs = int(env.get('block_size', block_size))
                         chain = chains_by_bs.get(ebs)
@@ -1409,6 +1940,108 @@ def install(store_cls=None, manager_cls=None) -> bool:
         except OSError:
             pass
         self._drop_index_for_path(path)
+
+    def _rebuilt_exact(
+        self,
+        chain_links: Sequence[Tuple[Path, bytes]],
+    ) -> Optional[Tuple[dict, dict, int, dict[Tuple[int, int], mx.array]]]:
+        entries: dict = {}
+        metadata: dict = {}
+        st_data_start = 0
+        tensors: dict[Tuple[int, int], mx.array] = {}
+        parts: dict[str, Tuple[int, str, list[mx.array]]] = {}
+
+        for idx, (c_path, c_key) in enumerate(chain_links):
+            c_parsed = _read_envelope(c_path)
+            if c_parsed is None:
+                _drop_corrupt_shard(self, c_path)
+                return None
+            c_env, c_prefix, c_start = c_parsed
+            c_records = c_env.get('records', [])
+            if c_env.get('kind') != 'exact_v1' or len(c_records) != 1:
+                _drop_corrupt_shard(self, c_path)
+                return None
+            try:
+                with open(c_path, 'rb') as f:
+                    got = _decrypt_record_tensors(f, c_prefix, c_start, c_records, 0, c_key)
+            except OSError:
+                return None
+            if got is None:
+                _drop_corrupt_shard(self, c_path)
+                return None
+            c_entries, c_meta, c_st_start, c_tensors = got
+            if idx == 0:
+                if 'qz_delta' in c_meta:
+                    _drop_corrupt_shard(self, c_path)
+                    return None
+                entries, metadata, st_data_start, tensors = c_entries, c_meta, c_st_start, c_tensors
+                continue
+            try:
+                plan = json.loads(c_meta['qz_delta'])
+                recorded = json.loads(metadata.get('qz_digests', '{}'))
+            except (KeyError, TypeError, ValueError):
+                for stale_p, _ in chain_links[idx:]:
+                    _drop_corrupt_shard(self, stale_p)
+                return None
+            next_parts: dict[str, Tuple[int, str, list[mx.array]]] = {}
+            for k, spec in plan.items():
+                try:
+                    axis, rows, digest_hex, same = int(spec[0]), int(spec[1]), spec[2], bool(spec[3])
+                except (IndexError, TypeError, ValueError):
+                    for stale_p, _ in chain_links[idx:]:
+                        _drop_corrupt_shard(self, stale_p)
+                    return None
+                if (recorded.get(k) or [None, None, None])[2] != digest_hex:
+                    for stale_p, _ in chain_links[idx:]:
+                        _drop_corrupt_shard(self, stale_p)
+                    return None
+                if k in parts:
+                    p_axis, dtype, before = parts[k]
+                    if p_axis != axis:
+                        for stale_p, _ in chain_links[idx:]:
+                            _drop_corrupt_shard(self, stale_p)
+                        return None
+                else:
+                    bounds = _apc._safetensors_tensor_bounds(entries.get(k) or {})
+                    whole = None if bounds is None else tensors.get(bounds[:2])
+                    if whole is None:
+                        for stale_p, _ in chain_links[idx:]:
+                            _drop_corrupt_shard(self, stale_p)
+                        return None
+                    dtype, before = entries[k]['dtype'], [whole]
+                if sum(int(x.shape[axis]) for x in before) != rows:
+                    for stale_p, _ in chain_links[idx:]:
+                        _drop_corrupt_shard(self, stale_p)
+                    return None
+                if not same:
+                    bounds = _apc._safetensors_tensor_bounds(c_entries.get(k) or {})
+                    tail = None if bounds is None else c_tensors.get(bounds[:2])
+                    if tail is None:
+                        for stale_p, _ in chain_links[idx:]:
+                            _drop_corrupt_shard(self, stale_p)
+                        return None
+                    before = before + [tail]
+                next_parts[k] = (axis, dtype, before)
+            entries, metadata, st_data_start, tensors, parts = (
+                c_entries,
+                c_meta,
+                c_st_start,
+                c_tensors,
+                next_parts,
+            )
+
+        at = _SYNTHETIC
+        for k, (axis, dtype, pieces) in parts.items():
+            whole = pieces[0] if len(pieces) == 1 else mx.concatenate(pieces, axis=axis)
+            nbytes = int(whole.nbytes)
+            entries[k] = {
+                'dtype': dtype,
+                'shape': [int(d) for d in whole.shape],
+                'data_offsets': [at, at + nbytes],
+            }
+            tensors[(at, at + nbytes)] = whole
+            at += nbytes
+        return entries, metadata, st_data_start, tensors
 
     def load_exact_cache(
         self,
@@ -1460,15 +2093,17 @@ def install(store_cls=None, manager_cls=None) -> bool:
         if mode == 'exact_v1':
             if env.get('kind') != 'exact_v1' or len(records) != 1:
                 return None
-            try:
-                with open(path, 'rb') as f:
-                    got = _decrypt_record_tensors(f, prefix_bytes, data_start, records, 0, grant[1])
-            except OSError:
+            chain_links = (
+                [(path, bytes(grant[1]))]
+                if isinstance(grant[1], (bytes, bytearray))
+                else list(grant[1])
+            )
+            if not chain_links or chain_links[-1][0] != path:
                 return None
-            if got is None:
-                _drop_corrupt_shard(self, path)
+            rebuilt = _rebuilt_exact(self, chain_links)
+            if rebuilt is None:
                 return None
-            header, metadata, st_data_start, tensors = got
+            header, metadata, st_data_start, tensors = rebuilt
             active = getattr(_MEM_SAFES, 'active', None)
             if active is None:
                 active = {}
@@ -1481,6 +2116,11 @@ def install(store_cls=None, manager_cls=None) -> bool:
             finally:
                 active.pop(path, None)
             if loaded is not None:
+                for c_path, _ in chain_links[:-1]:
+                    try:
+                        os.utime(c_path, None)
+                    except OSError:
+                        pass
                 STATS['hits'] += 1
             return loaded
 
@@ -1589,7 +2229,7 @@ def install(store_cls=None, manager_cls=None) -> bool:
                 else:
                     p_key = _get_chain_key(int(b.parent_hash))
                 if p_key is None:
-                    p_key = hashlib.sha256(
+                    p_key = _hash(
                         b'quanteeze-apc-fallback-v1\x00'
                         + salt
                         + int(b.parent_hash & ((1 << 64) - 1)).to_bytes(8, 'little')
@@ -1779,6 +2419,8 @@ def install(store_cls=None, manager_cls=None) -> bool:
     store_cls._drop_index_for_path = _drop_index_for_path
     store_cls._clear_disk_state_after_external_delete = _clear_disk_state_after_external_delete
     store_cls._open_shard_header = _open_shard_header
+    store_cls._maybe_evict = _maybe_evict
+    store_cls.exact_cache_bytes = exact_cache_bytes
     store_cls.find_exact_prefix = find_exact_prefix
     store_cls.load_exact_cache = load_exact_cache
     store_cls.save_exact_cache = save_exact_cache

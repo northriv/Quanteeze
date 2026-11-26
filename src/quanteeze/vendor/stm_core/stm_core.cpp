@@ -104,7 +104,7 @@ using RoomTx = Transactional::Transaction<RoomNode>;
 using RoomSnap = Transactional::Snapshot<RoomNode>;
 
 struct TurnHeld {
-    const void* owner{nullptr};
+    uint64_t owner{0};
     int kind{0};
     int64_t birth{0};
     double timeout_ms{0.0};
@@ -112,6 +112,7 @@ struct TurnHeld {
     bool paused{false};
 };
 
+std::atomic<uint64_t> next_model_id{1};
 thread_local TurnHeld tl_turn;
 
 template <typename T>
@@ -467,7 +468,7 @@ public:
     ~Model() {
         stop_lander();
         destroy_sync_stream();
-        if (tl_turn.owner == this) {
+        if (tl_turn.owner == id_) {
             tl_turn = TurnHeld{};
         }
     }
@@ -996,26 +997,25 @@ public:
         std::thread to_join;
         {
             std::lock_guard<std::mutex> lk(lander_mu_);
-            if (!running_.load(std::memory_order_acquire) && !lander_thread_.joinable()) {
-                return;
+            if (running_.load(std::memory_order_acquire) || lander_thread_.joinable()) {
+                stop_requested_.store(true, std::memory_order_release);
+                running_.store(false, std::memory_order_release);
+                lander_cv_.notify_all();
+                {
+                    std::lock_guard<std::mutex> hlk(hub_->mu);
+                    hub_->cv.notify_all();
+                }
+                {
+                    std::lock_guard<std::mutex> tlk(turn_mu_);
+                    turn_cv_.notify_all();
+                }
+                {
+                    std::lock_guard<std::mutex> rlk(room_mu_);
+                    room_seq_.fetch_add(1, std::memory_order_release);
+                }
+                room_cv_.notify_all();
+                to_join = std::move(lander_thread_);
             }
-            stop_requested_.store(true, std::memory_order_release);
-            running_.store(false, std::memory_order_release);
-            lander_cv_.notify_all();
-            {
-                std::lock_guard<std::mutex> hlk(hub_->mu);
-                hub_->cv.notify_all();
-            }
-            {
-                std::lock_guard<std::mutex> tlk(turn_mu_);
-                turn_cv_.notify_all();
-            }
-            {
-                std::lock_guard<std::mutex> rlk(room_mu_);
-                room_seq_.fetch_add(1, std::memory_order_release);
-            }
-            room_cv_.notify_all();
-            to_join = std::move(lander_thread_);
         }
         if (to_join.joinable()) {
             if (PyGILState_Check()) {
@@ -1026,6 +1026,9 @@ public:
             }
         }
         destroy_sync_stream();
+        for (int k = 0; k < nlayers_; ++k) {
+            drop_layer_arrays(k);
+        }
     }
 
     bool submit_landing(
@@ -1491,7 +1494,7 @@ public:
         if (birth <= 0) {
             birth = monotonic_ns();
         }
-        if (tl_turn.owner == this && tl_turn.holding) {
+        if (tl_turn.owner == id_ && tl_turn.holding) {
             turn_give();
         }
         const int64_t start = monotonic_ns();
@@ -1518,7 +1521,7 @@ public:
                 turn_cv_.wait_until(lk, wake_at);
             }
         }
-        tl_turn = TurnHeld{this, kind, birth, timeout_ms, true, false};
+        tl_turn = TurnHeld{id_, kind, birth, timeout_ms, true, false};
         const int64_t took = std::max<int64_t>(0, monotonic_ns() - start);
         turn_counts_[kind == TURN_PROMPT ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
         if (waited) {
@@ -1535,20 +1538,20 @@ public:
         if (birth <= 0) {
             birth = monotonic_ns();
         }
-        if (tl_turn.owner == this && tl_turn.holding) {
+        if (tl_turn.owner == id_ && tl_turn.holding) {
             turn_give();
         }
         int slot = -1;
         if (!turn_attempt(kind, birth, slot, false, false)) {
             return false;
         }
-        tl_turn = TurnHeld{this, kind, birth, 0.0, true, false};
+        tl_turn = TurnHeld{id_, kind, birth, 0.0, true, false};
         turn_counts_[kind == TURN_PROMPT ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
     void turn_give() {
-        if (tl_turn.owner != this || !(tl_turn.holding || tl_turn.paused)) {
+        if (tl_turn.owner != id_ || !(tl_turn.holding || tl_turn.paused)) {
             return;
         }
         if (tl_turn.holding) {
@@ -2228,7 +2231,7 @@ private:
     }
 
     void turn_pause() {
-        if (tl_turn.owner != this || !tl_turn.holding) {
+        if (tl_turn.owner != id_ || !tl_turn.holding) {
             return;
         }
         turn_let_go(tl_turn.kind);
@@ -2237,7 +2240,7 @@ private:
     }
 
     void turn_resume() {
-        if (tl_turn.owner != this || !tl_turn.paused) {
+        if (tl_turn.owner != id_ || !tl_turn.paused) {
             return;
         }
         const TurnHeld was = tl_turn;
@@ -2249,7 +2252,7 @@ private:
         Model* self{nullptr};
         bool paused{false};
         void pause(Model* m) {
-            if (!paused && m && tl_turn.owner == m && tl_turn.holding) {
+            if (!paused && m && tl_turn.owner == m->id_ && tl_turn.holding) {
                 self = m;
                 paused = true;
                 self->turn_pause();
@@ -2262,6 +2265,7 @@ private:
         }
     };
 
+    const uint64_t id_{next_model_id.fetch_add(1, std::memory_order_relaxed)};
     int nlayers_{0};
     Vec64 hints_;
     std::vector<LayerPtr> layers_;

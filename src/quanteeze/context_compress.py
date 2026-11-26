@@ -31,7 +31,7 @@ def _patch(owner, name, value):
 
 
 def method():
-    got = (variables.get('QUANTEEZE_CONTEXT_COMPRESS') or 'off').strip().lower()
+    got = (variables.get('QUANTEEZE_CONTEXT_COMPRESS', variables.at_load()) or 'off').strip().lower()
     if got not in METHODS:
         raise ValueError(f'QUANTEEZE_CONTEXT_COMPRESS: one of {", ".join(METHODS)}, not {got!r}')
     return got
@@ -39,19 +39,20 @@ def method():
 
 def settings():
     """Return `(method, layers, keep, recent, sink, min_tokens)`."""
-    layers = (variables.get('QUANTEEZE_CONTEXT_LAYERS') or 'uniform').strip().lower()
+    snap = variables.at_load()
+    layers = (variables.get('QUANTEEZE_CONTEXT_LAYERS', snap) or 'uniform').strip().lower()
     if layers not in LAYERS:
         raise ValueError(f'QUANTEEZE_CONTEXT_LAYERS: one of {", ".join(LAYERS)}, not {layers!r}')
-    keep = variables.number('QUANTEEZE_CONTEXT_KEEP')
+    keep = variables.number('QUANTEEZE_CONTEXT_KEEP', snap)
     if not 0.0 <= keep <= 1.0:
         raise ValueError(f'QUANTEEZE_CONTEXT_KEEP: a share from 0 to 1, not {keep}')
     return (
         method(),
         layers,
         keep,
-        variables.integer('QUANTEEZE_CONTEXT_RECENT'),
-        variables.integer('QUANTEEZE_CONTEXT_SINK'),
-        variables.integer('QUANTEEZE_CONTEXT_MIN_TOKENS'),
+        variables.integer('QUANTEEZE_CONTEXT_RECENT', snap),
+        variables.integer('QUANTEEZE_CONTEXT_SINK', snap),
+        variables.integer('QUANTEEZE_CONTEXT_MIN_TOKENS', snap),
     )
 
 

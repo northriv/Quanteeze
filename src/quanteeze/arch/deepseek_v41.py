@@ -23,7 +23,7 @@ from mlx_vlm.models.deepseek_v41.language import (Compressor, DeepseekV41Block, 
                                                    make_identity_pre_mix)
 from mlx_vlm.models.deepseek_v41.fakequant import fake_quant_fp8_ue8m0
 
-from .. import per_thread
+from .. import kernel_checks, per_load, per_thread
 
 
 
@@ -155,14 +155,14 @@ HEAD_KERNEL_STATE = {}
 
 
 def _on_cuda():
-    from .. import cuda_kernels
-    return cuda_kernels.available()
+    from .. import cuda_v41
+    return cuda_v41._gpu()
 
 
 def _head_kernel_on():
     if HEAD_KERNEL[0] is None:
         from .. import variables
-        HEAD_KERNEL[0] = not variables.off('QUANTEEZE_V41_HEAD_KERNEL')
+        HEAD_KERNEL[0] = not variables.off('QUANTEEZE_V41_HEAD_KERNEL', variables.at_load())
     return HEAD_KERNEL[0]
 
 
@@ -704,8 +704,15 @@ EXACT = [True]                  # a verify pass as one-token decodes, bit for bi
                                 # together but for the rows and experts (by_rows, expert_qmv: as fast).  A pass of
                                 # 2 tokens 58 -> 53 ms, 4 78 -> 69, 6 108 -> 91, its build 13 -> 7 at 6; with the
                                 # attention alone together 57, 72 and 99.
-GROUP_CHOICE, GROUP_CHECKED = {}, {}
+GROUP_CHOICE, GROUP_CHECKED = kernel_checks.tables('arch.deepseek_v41.group')
 GROUP_STATS = dict(served=0, checked=0, mismatched=0, declined=0, alone=0)
+
+
+@per_load.on_let_go
+def let_go():
+    """Clear per-model cached image embeddings and reloadable head kernel preference on unload."""
+    IMAGES.clear()
+    HEAD_KERNEL[0] = None
 
 
 def _shapes(keys):
@@ -716,24 +723,28 @@ def _shapes(keys):
     return list(groups.items())
 
 
+def group_key(g, keys, topk, source, given, q_shape):
+    """Key `_grouped` by `keys.bit_length()` size class instead of exact position so cache stays bounded."""
+    return 'index', g, keys.bit_length(), keys > topk, source, given, tuple(q_shape[2:])
+
+
 def _grouped(key, together, apart):
     """A group of a verify pass's queries of one shape, its outputs (arrays, each [G, ...]):
     `together` computes them with the queries in the batch, as many one-query decodes at once;
     `apart` a query at a time, as the decodes do.  A key is served together once its first
     verify_qmv.CHECKS groups gave apart's bits; a key that did not, apart from then on."""
     from .. import verify_qmv
-    choice = GROUP_CHOICE.get(key)
+    choice, seen = kernel_checks.read(GROUP_CHOICE, GROUP_CHECKED, key)
     if not GROUPED[0] or choice is False:
         GROUP_STATS['declined'] += 1
         return apart()
-    seen = GROUP_CHECKED.get(key, 0)
     if choice and seen >= verify_qmv.CHECKS:
         GROUP_STATS['served'] += 1
         return together()
     want, got = apart(), together()
     GROUP_STATS['checked'] += 1
-    same = all(mx.array_equal(a, b).item() for a, b in zip(want, got))
-    GROUP_CHOICE[key], GROUP_CHECKED[key] = same, seen + 1
+    same = kernel_checks.same_bits(tuple(want), tuple(got))
+    per_thread.checked(GROUP_CHOICE, GROUP_CHECKED, key, same, verify_qmv.CHECKS)
     if not same:
         GROUP_STATS['mismatched'] += 1
     return want
@@ -822,8 +833,8 @@ def _indexer(self, x, qr, latent, start_pos, offset, cache):
             GROUP_STATS['alone'] += 1
             out = apart(queries)
         else:
-            out = _grouped(('index', len(queries), keys, min(self.index_topk, keys), self.is_candidate_source,
-                            given is not None, tuple(q.shape[2:])),
+            out = _grouped(group_key(len(queries), keys, self.index_topk, self.is_candidate_source,
+                                     given is not None, q.shape),
                            lambda queries=queries: together(queries), lambda queries=queries: apart(queries))
         outs.append(out[0])
         for i, s in enumerate(queries):
@@ -1048,7 +1059,8 @@ def install(model):
     split_in_one = cuda_v41.choose(v41_blocks, lm.config) if hasattr(lm, 'config') else False
     cuda_v41.install_fp8()
     cuda_v41.install_prepost()
-    if cuda_kernels.available():
+    cuda_v41.install_attention()
+    if cuda_v41._gpu():
         cuda_engram.install()
     language.hc_mix_coeffs = hc_mix_kernel if split_in_one else hc_mix_rows   # DeepseekV41Block.hc_mixes reads it by name
     expert_qmv.ROWS[0] = EXPERT_ROWS
@@ -1095,11 +1107,11 @@ class SpecCompressor(Compressor):
 
 def _host_ids(engram):
     """Whether `engram`'s offloaded embedding accepts host `np.ndarray` row IDs (`QUANTEEZE_ENGRAM_IDS_ONCE`)."""
-    from .. import cuda_engram, cuda_kernels, cuda_ple, variables
+    from .. import cuda_engram, cuda_ple, cuda_v41, variables
     embed = getattr(engram, 'embed', None)
     if getattr(embed, '_arrays', None) is None or variables.off('QUANTEEZE_ENGRAM_IDS_ONCE'):
         return False
-    if cuda_ple.ON[0] and cuda_kernels.available() and cuda_engram._table(embed) is not None:
+    if cuda_ple.ON[0] and cuda_v41._gpu() and cuda_engram._table(embed) is not None:
         return False
     return True
 

@@ -82,6 +82,7 @@ V41 = Format('deepseek_v41', 'DeepSeek V4.1', 'encoding.py', VENDOR / 'deepseek_
              image='[an image the user sent: images are not served to this model here]')
 FORMATS = {f.model_type: f for f in (V4, V41)}
 SYSTEM_TOKEN = '<｜System｜>'                        # in V4.1's vocabulary, not V4's
+USER_TOKEN = '<｜User｜>'                            # a user turn's first token, V4's and V4.1's (APC checkpoints)
 
 _ENCODING = {}
 
@@ -345,6 +346,12 @@ def use_model(model, processor):
         notes.append(f'images are left out ({why}; the prompt marks each with {fmt.image})')
     elif sees:
         notes.append('a user turn\'s images read, each placed as its image token (QUANTEEZE_V41_READS_IMAGES)')
+    tok = getattr(processor, 'tokenizer', processor)
+    user = tok.convert_tokens_to_ids(USER_TOKEN) if hasattr(tok, 'convert_tokens_to_ids') else None
+    if user is not None and user != getattr(tok, 'unk_token_id', None):
+        for m in (model, getattr(model, 'language_model', None)):
+            if m is not None:
+                object.__setattr__(m, '_quanteeze_turn_starts', frozenset({int(user)}))
     encoding = load(model_type=fmt.model_type)
     if encoding is None:
         return '; '.join([f'no {fmt.name} encoding at {variables.get(fmt.variable) or fmt.default}: '

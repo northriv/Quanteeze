@@ -18,7 +18,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from . import cuda_kernels
+from . import cuda_kernels, kernel_checks, metal_kernels
 
 CHECKS = 3
 ROWS_MOST = 8                   # concurrent requests at most that decode_batch() takes (2 to 8)
@@ -26,8 +26,7 @@ ON = [True]                     # QUANTEEZE_LINEAR_ATTN_KERNELS
 DELTA = [True]                  # QUANTEEZE_CUDA_DELTA: the delta rule's step on CUDA
 STATS = dict(conv=0, slide=0, norm=0, delta=0, gating=0, conv_rows=0, delta_rows=0, gating_rows=0, norm_rows=0,
              conv_batch=0, slide_batch=0, delta_batch=0, gating_batch=0, norm_batch=0, checked=0, mismatched=0, few=0)
-CHOICE = {}                     # (part, shape, dtype): whether it matched the original
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('linear_attn')  # (part, shape, dtype): whether it matched the original
 SAID = []
 
 SHARED = dict(fused=0)          # share_fused_linears(): projections now slices of their fused copy
@@ -69,14 +68,6 @@ def share_fused_linears(ops=None):
     fused._quanteeze_shared = True
     ops._decode_quantized_linears_fused = fused
 
-
-_SIGMOID = """
-template <typename X>
-inline X mlx_sigmoid(X x) {
-  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
-  return (x < 0) ? y : 1 - y;
-}
-"""
 
 _CONV = r"""
     uint head = threadgroup_position_in_grid.x;
@@ -415,7 +406,7 @@ def _conv_rows_kernel(scale):
     name = f'quanteeze_la_conv_rows_{scale!r}'.replace('.', '_').replace('-', 'm')
     if not cuda_kernels.available():
         return mx.fast.metal_kernel(name=name, input_names=['state', 'x', 'w'], output_names=['y'], source=_CONV_ROWS,
-                                    header=_SIGMOID + f'constant constexpr float SCALE = {float(scale)!r}f;\n')
+                                    header=metal_kernels.SIGMOID + f'constant constexpr float SCALE = {float(scale)!r}f;\n')
     return cuda_kernels.kernel(name, ['state', 'x', 'w'], ['y'], _CONV_ROWS_CUDA,
                                f'constexpr float SCALE = {float(scale)!r}f;\n')
 
@@ -464,7 +455,7 @@ def _conv_kernel(scale, sliding=False):
                                    _CONV_CUDA.replace('/*STATE*/', _STATE if sliding else ''),
                                    f'constexpr float SCALE = {float(scale)!r}f;\n')
     return mx.fast.metal_kernel(name=name, input_names=['state', 'x', 'w'], output_names=['y'], source=_CONV,
-                                header=_SIGMOID + f'constant constexpr float SCALE = {float(scale)!r}f;\n')
+                                header=metal_kernels.SIGMOID + f'constant constexpr float SCALE = {float(scale)!r}f;\n')
 
 
 @lru_cache(maxsize=None)
@@ -474,7 +465,7 @@ def _gated_norm_kernel(eps):
         return cuda_kernels.kernel(name, ['x', 'z', 'w'], ['y'], _GATED_NORM_CUDA,
                                    f'constexpr float EPS = {float(eps)!r}f;\n')
     return mx.fast.metal_kernel(name=name, input_names=['x', 'z', 'w'], output_names=['y'], source=_GATED_NORM,
-                                header=_SIGMOID + f'constant constexpr float EPS = {float(eps)!r}f;\n')
+                                header=metal_kernels.SIGMOID + f'constant constexpr float EPS = {float(eps)!r}f;\n')
 
 
 FEW = 64                        # tokens up to which a pass's gated delta rule goes token by token on CUDA (few())
@@ -859,28 +850,8 @@ def decode_batch(forward, layer, inputs, cache):
 def _served(part, key, mine, theirs):
     """mine() where this part's shape matched theirs() bit for bit the first CHECKS times it was
     met, else theirs()."""
-    key = (part,) + key
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
-    if choice is not None and seen >= CHECKS:
-        if choice:
-            STATS[part] += 1
-            return mine()
-        return theirs()
-    want = theirs()
-    STATS['checked'] += 1
-    try:
-        got = mine()
-        pairs = zip(got, want) if isinstance(want, tuple) else [(got, want)]
-        same = all(mx.array_equal(a, b).item() for a, b in pairs)
-    except Exception as error:
-        if not SAID:
-            SAID.append(True)
-            print(f'quanteeze: linear attention kernels unavailable ({type(error).__name__}: {error})',
-                  file=sys.stderr, flush=True)
-        same = False
-    STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
-    return want
+    return kernel_checks.served(sys.modules[__name__], (part,) + key, mine, theirs,
+                                'linear attention kernels', stat=part)
 
 
 def summary():

@@ -12,13 +12,12 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from . import cuda_kernels
+from . import cuda_kernels, kernel_checks, per_thread
 
 CHECKS = 3
 ON = [True]                     # QUANTEEZE_CUDA_EXPERTS
 STATS = dict(served=0, checked=0, mismatched=0)
-CHOICE = {}                     # (k, hidden, inner, group size): whether it matched the original
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('cuda_experts')  # (k, hidden, inner, group size): whether it matched the original
 SAID = []
 
 MXFP4_DECODE_HEADER = r"""
@@ -577,7 +576,7 @@ def decode(switch, x, indices, fallback):
     bits_pair = (int(gate.bits), int(dn.bits))
     if bits_pair != (4, 4):
         key = key + bits_pair
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS['served'] += 1
@@ -586,7 +585,7 @@ def decode(switch, x, indices, fallback):
     want = fallback()
     try:
         got = mine()
-        same = mx.array_equal(got, want).item()
+        same = kernel_checks.same_bits(got, want)
     except Exception as error:
         if 'transformations' in str(error):                 # traced (mx.compile): nothing to compare yet
             return want
@@ -597,7 +596,7 @@ def decode(switch, x, indices, fallback):
         same = False
     STATS['checked'] += 1
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 

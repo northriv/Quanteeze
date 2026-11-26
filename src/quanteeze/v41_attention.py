@@ -12,7 +12,7 @@ import sys
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import native_ext, variables
+from . import cuda_kernels, kernel_checks, native_ext, per_load, variables
 
 CHECKS = 3
 MOST = 128
@@ -21,7 +21,7 @@ _SPECS = {}
 
 
 def _mode():
-    return (variables.get('QUANTEEZE_V41_ATTENTION_NATIVE') or 'auto').strip().lower()
+    return (variables.get('QUANTEEZE_V41_ATTENTION_NATIVE', variables.at_load()) or 'auto').strip().lower()
 
 
 def _ext():
@@ -29,7 +29,7 @@ def _ext():
     if mode == 'off':
         return None
     if _STATE['ext'] is None:
-        use = mode in ('on', 'compare') or (mode == 'auto' and mx.metal.is_available())
+        use = mode in ('on', 'compare') or (mode == 'auto' and (mx.metal.is_available() or cuda_kernels.available()))
         ext = (
             native_ext.extension('v41_attention', with_mlx=True, with_stm=False, quiet=(mode == 'auto'))
             if use else None
@@ -95,16 +95,22 @@ def _make_spec(ext, attn):
     lins = [_lin(ext, getattr(attn, n)) for n in ('wq_a', 'wq_b', 'wkv', 'wo_a', 'wo_b')]
     norms = [_norm(attn.q_norm), _norm(attn.kv_norm)]
     rope = attn.rope
+    fp8 = glue = None
+    if not mx.metal.is_available():
+        from . import cuda_v41
+        fp8, glue = cuda_v41.cpp_kernels(ext)
     if (None in lins or None in norms or type(rope) is not DeepseekV4RoPE or rope.freq_scale != 1
             or fakequant.DISABLE or fakequant._fp8_roundtrip_kernel is None
+            or (fp8 is None and not mx.metal.is_available())
             or attn.head_dim % 32 or (attn.o_groups * attn.config.o_lora_rank) % 32
             or attn.config.hidden_size % 32 or attn.config.q_lora_rank % 32):
         return None
-    return ext.layer(
+    layer = ext.layer(
         lins[0], norms[0][0], norms[0][1], lins[1], lins[2], norms[1][0], norms[1][1], lins[3], lins[4],
         rope._get_freqs(attn.head_dim, False), rope._get_freqs(attn.head_dim, True), attn.attn_sink,
         float(attn.scale), int(attn.n_heads), int(attn.head_dim), int(attn.o_groups), int(attn.window_size),
     )
+    return layer if mx.metal.is_available() else ext.layer_on_cuda(layer, fp8, glue)
 
 
 def front_python(attn, x, start_pos, buffer, history, writes):
@@ -152,7 +158,7 @@ def back_python(attn, q, part, valid, pool, idxs, start_pos):
 
 
 def _same(got, want):
-    return all(a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(a, b).item() for a, b in zip(got, want))
+    return kernel_checks.same_bits(tuple(got), tuple(want))
 
 
 def _parted(what):
@@ -206,3 +212,10 @@ def attend(attn, cache, x, window_indices):
 
 def stats():
     return {k: _STATE[k] for k in ('served', 'compared', 'declined', 'off')}
+
+
+@per_load.on_let_go
+def let_go():
+    """Clear per-model module specs and reset extension handle on unload."""
+    _SPECS.clear()
+    _STATE['ext'] = None

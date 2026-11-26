@@ -130,7 +130,7 @@ textarea { width: 100%; font: inherit; color: var(--ink); background: var(--page
   <div class="bar">
     <div class="grow">
       <h1>quanteeze</h1>
-      <div class="sub">Choose a model and its uniform expert precision on <span class="here">this Mac</span>.</div>
+      <div class="sub">Choose a model and its expert precision on <span class="here">this Mac</span>.</div>
     </div>
     <a href="#" id="lang-switch" lang="ja">日本語</a>
     <a href="/quanteeze/settings">Every setting →</a>
@@ -155,13 +155,18 @@ textarea { width: 100%; font: inherit; color: var(--ink); background: var(--page
       </div>
       <div class="meter" id="now-meter" hidden><div id="now-bar"></div></div>
       <div id="now-msg" class="note"></div>
+      <div class="bar" style="margin-top:6px">
+        <button id="unload" hidden title="Unload the model and return its memory; generation requests are refused until loaded again here">Unload</button>
+        <button class="primary" id="load-again" hidden>Load it again</button>
+        <span id="unload-msg" class="note"></span>
+      </div>
       <div id="live" class="livegrid"></div>
       <div id="stm-warn"></div>
       <div id="phases" class="list" style="margin-top:8px"></div>
     </section>
 
     <section class="card">
-      <h2>Model &amp; uniform precision</h2>
+      <h2>Model &amp; expert precision</h2>
       <p class="note">Pick a checkpoint found on <span class="here">this Mac</span> (in LM Studio or Hugging Face's cache), or fetch one from Hugging Face.</p>
       <div id="models" class="models"></div>
 
@@ -356,23 +361,26 @@ function renderPhases(R) {
 function renderNow() {
   if (!MODEL) return;
   const fullModel = (MODEL.target && MODEL.state !== 'idle') ? MODEL.target : MODEL.model;
-  $('now-model').textContent = fullModel ? shortPath(fullModel) : 'No model loaded';
-  $('now-model').title = fullModel || '';
+  $('now-model').textContent = fullModel ? shortPath(fullModel)
+    : MODEL.held ? `${shortPath(MODEL.held)} (unloaded)` : 'No model loaded';
+  $('now-model').title = fullModel || MODEL.held || '';
   const stateLabel = {
     idle: MODEL.model ? 'ready' : 'idle',
     waiting: 'waiting for requests to finish',
     loading: 'loading',
+    unloading: 'unloading',
+    unloaded: 'unloaded: requests refused',
     failed: 'failed',
   }[MODEL.state] || MODEL.state;
   $('now-state').textContent = stateLabel;
-  $('now-state').className = 'tag' + (MODEL.state === 'failed' ? ' warn' : MODEL.state === 'idle' ? ' good' : ' warn');
+  $('now-state').className = 'tag' + (MODEL.state === 'failed' || MODEL.state === 'unloaded' ? ' warn' : MODEL.state === 'idle' ? ' good' : ' warn');
 
   const s = (LIVE && LIVE.serving) || {};
   const parts = [];
   const fmtBits = b => typeof b === 'string' && isNaN(b) ? b.toUpperCase() : `${b}-bit`;
   if (s.model_type) parts.push(s.model_type);
   if (s.bits) parts.push(`${fmtBits(s.bits)} experts` + (s.stock_bits && s.bits !== s.stock_bits ? ` (lowered from ${s.stock_bits}-bit${typeof s.bits === 'number' || !isNaN(s.bits) ? ' by least squares' : ''})` : ''));
-  else if (MODEL.bits) parts.push(`${fmtBits(MODEL.bits)} uniform requested`);
+  else if (MODEL.bits) parts.push(`${fmtBits(MODEL.bits)} requested`);
   const dStm = LIVE && LIVE.demand && LIVE.demand.stm;
   if (s.mode === 'on_demand') {
     parts.push(`streaming on demand from SSD (${s.experts_gb ?? '?'} of ${s.total_experts_gb ?? '?'} GB kept in memory)`);
@@ -380,19 +388,25 @@ function renderNow() {
   } else if (s.mode === 'in_memory') parts.push('all weights in memory');
   $('now-how').textContent = parts.join(' · ');
 
-  const p = MODEL.progress, busy = MODEL.state === 'waiting' || MODEL.state === 'loading';
+  const p = MODEL.progress, busy = MODEL.state === 'waiting' || MODEL.state === 'loading' || MODEL.state === 'unloading';
   $('start-btn').disabled = busy;
+  $('unload').hidden = !MODEL.model || !!MODEL.held || busy;
+  $('load-again').hidden = !MODEL.held || busy;
+  $('load-again').title = MODEL.held ? `Load ${shortPath(MODEL.held)} again with the saved settings` : '';
+  if (MODEL.state === 'unloaded' || MODEL.state === 'idle') $('unload-msg').textContent = '';
   $('now-meter').hidden = !(busy || (p && p.loading));
   if (busy || (p && p.loading)) {
     const detail = MODEL.state === 'waiting'
       ? `Waiting for ${MODEL.inflight} request${MODEL.inflight === 1 ? '' : 's'} to finish…`
+      : MODEL.state === 'unloading'
+      ? `Unloading model (${MODEL.inflight} running)…`
       : `${p.percent}% · ${LOAD_PHASES[p.phase] || p.phase || ''}` + (p.unit === 'bytes' ? ` (${bytes(p.done)} of ${bytes(p.total)})` : p.unit ? ` (${p.done} of ${p.total} ${p.unit})` : '')
         + (p.seconds != null ? ` · ${fmt(p.seconds, 0)} s` : '');
-    $('now-bar').style.width = `${MODEL.state === 'waiting' ? 0 : p.percent}%`;
+    $('now-bar').style.width = `${MODEL.state === 'waiting' || MODEL.state === 'unloading' ? 0 : p.percent}%`;
     $('now-msg').className = 'note';
     $('now-msg').textContent = detail;
     $('start-msg').className = 'note';
-    $('start-msg').textContent = `Loading model… ${detail}`;
+    $('start-msg').textContent = MODEL.state === 'unloading' ? 'Unloading model…' : `Loading model… ${detail}`;
   } else {
     $('now-msg').className = 'note' + (MODEL.state === 'failed' ? ' err' : '');
     $('now-msg').textContent = MODEL.error || '';
@@ -440,8 +454,11 @@ function renderNow() {
     if (LIVE.mtp) {
       const m = LIVE.mtp;
       if (typeof m === 'object') {
-        grid.append(tile(m.label || 'MTP', m.acceptance == null ? 'no rounds yet' : `${pct(m.acceptance)} accepted`,
-          `${m.tokens_a_round != null ? fmt(m.tokens_a_round, 2) : '–'} tokens a round · ${(m.rounds || 0).toLocaleString()} rounds`));
+        const kind = m.drafter || m.label || 'MTP head';
+        const title = `Speculative decoding (${kind})`;
+        const bitTag = m.bits && m.bits !== '?' ? (/^\d/.test(String(m.bits)) ? `${m.bits}-bit · ` : `${m.bits} · `) : '';
+        grid.append(tile(title, m.acceptance == null ? 'no rounds yet' : `${pct(m.acceptance)} accepted`,
+          `${bitTag}${m.tokens_a_round != null ? fmt(m.tokens_a_round, 2) : '–'} tokens a round · ${(m.rounds || 0).toLocaleString()} rounds`));
       } else {
         grid.append(tile('MTP', String(m), null));
       }
@@ -488,6 +505,7 @@ function renderCatalog() {
     if (m.moe && m.experts) tags.append(el('span', {class: 'tag'}, `${m.layers || '?'}L × ${m.experts}E`));
     if (m.stock_bits) tags.append(el('span', {class: 'tag'}, `${m.stock_bits}-bit stock`));
     if (m.mtp && m.mtp.head) tags.append(el('span', {class: 'tag good'}, 'MTP head'));
+    for (const d of (m.mtp && m.mtp.drafters) || []) if (d.path) tags.append(el('span', {class: 'tag'}, d.name));
     if (m.ple && m.ple.gb) tags.append(el('span', {class: 'tag'}, `PLE ${m.ple.gb} GB${m.ngram_ssd ? ' (SSD)' : ''}`));
     if (m.engram && m.engram.gb) tags.append(el('span', {class: 'tag'}, `Engram ${m.engram.gb} GB (SSD)`));
     if (isServed(m)) tags.append(el('span', {class: 'tag good'}, 'serving'));
@@ -495,7 +513,7 @@ function renderCatalog() {
     btn.addEventListener('click', () => {
       pickedModel = m.path;
       if (!wasBusy) { $('start-msg').textContent = ''; $('start-msg').className = 'note'; }
-      renderCatalog(); renderPrecision();
+      renderCatalog(); renderPrecision(); renderPresets();
     });
     box.append(btn);
   }
@@ -523,14 +541,14 @@ function renderPrecision() {
   ];
   if (m.uniform_gb) {
     const ladder = [
-      {bits: '4', minStock: 5, title: '4 bits (least-squares)', desc: 'All routed experts lowered uniformly to 4-bit'},
-      {bits: 'mxfp4', minStock: 5, title: 'MXFP4 (microscaling FP4)', desc: 'All routed experts quantized uniformly to MXFP4 (4.25 bpw)'},
+      {bits: '4', minStock: 5, title: '4 bits (least-squares)', desc: 'All routed experts lowered to 4-bit'},
+      {bits: 'mxfp4', minStock: 5, title: 'MXFP4 (microscaling FP4)', desc: 'All routed experts quantized to MXFP4 (4.25 bpw)'},
       {bits: 'q3_k', minStock: 4, title: 'Q3_K (ggml K-quant)', desc: 'Intermediate size (3.44 bpw); slower at load, from SSD, and on CUDA', kquant: true},
-      {bits: '3', minStock: 4, title: '3 bits (least-squares)', desc: 'All routed experts lowered uniformly to 3-bit'},
+      {bits: '3', minStock: 4, title: '3 bits (least-squares)', desc: 'All routed experts lowered to 3-bit'},
       {bits: 'q2_k', minStock: 3, title: 'Q2_K (ggml K-quant)', desc: 'Intermediate size (2.63 bpw); slower at load, from SSD, and on CUDA', kquant: true},
       {bits: 'iq2_xs', minStock: 3, title: 'IQ2_XS (ggml importance grid)', desc: 'Intermediate size (2.31 bpw); slower at load, from SSD, and on CUDA', kquant: true},
-      {bits: '2', minStock: 3, title: '2 bits (least-squares)', desc: 'All routed experts lowered uniformly to 2-bit'},
-      {bits: '1', minStock: 2, title: '1 bit (least-squares)', desc: 'All routed experts lowered uniformly to 1-bit'},
+      {bits: '2', minStock: 3, title: '2 bits (least-squares)', desc: 'All routed experts lowered to 2-bit'},
+      {bits: '1', minStock: 2, title: '1 bit (least-squares)', desc: 'All routed experts lowered to 1-bit'},
     ];
     for (const item of ladder) {
       if (m.stock_bits && m.stock_bits < item.minStock) continue;
@@ -575,28 +593,55 @@ $('start-btn').addEventListener('click', async () => {
   }
 });
 
+$('unload').addEventListener('click', async () => {
+  if (!confirm('Unload the model? Requests running finish first; then generation requests are refused until loaded again here.')) return;
+  try {
+    MODEL = await call('POST', '/v1/quanteeze/model', {unload: true});
+    wasBusy = true;
+    $('unload-msg').textContent = 'Letting it go…';
+    renderNow();
+    schedulePoll(400);
+  } catch (e) { $('unload-msg').textContent = `Not unloaded: ${e.message}`; }
+});
+$('load-again').addEventListener('click', async () => {
+  if (!MODEL || !MODEL.held) return;
+  try {
+    MODEL = await call('POST', '/v1/quanteeze/model', {path: MODEL.held});
+    wasBusy = true;
+    $('unload-msg').textContent = '';
+    renderNow();
+    schedulePoll(800);
+  } catch (e) { $('unload-msg').textContent = `Not loaded: ${e.message}`; }
+});
+
 // ---------------------------------------------------------------- presets
 const GROUP_TITLES = {
   memory: 'Memory reserve',
   wired: 'Wired memory',
   ngram: 'PLE n-gram table',
+  kv: 'KV cache',
   mtp: 'MTP speculative decoding',
+  drafter: 'Speculative drafter',
   heat: 'Thermal throttle',
 };
 
 function renderPresets() {
   if (!PRESETS) return;
   const box = $('presets'); box.replaceChildren();
+  const picked = CATALOG && CATALOG.models && CATALOG.models.find(x => x.path === pickedModel);
+  const offered = (picked && picked.mtp && picked.mtp.drafters) || [];
   for (const [group, title] of Object.entries(GROUP_TITLES)) {
     const g = PRESETS[group];
     if (!g) continue;
+    if (group === 'kv' && !(picked && picked.kv_bits)) continue;
+    if (group === 'drafter' && !offered.length) continue;
     const wrap = el('div');
     wrap.append(el('h3', {style: 'margin-top:0'}, title));
     const seg = el('div', {class: 'seg'});
     let activeAbout = '';
     for (const c of g.choices) {
       const on = g.now === c.key;
-      if (on) activeAbout = c.about;
+      if (on) activeAbout = (group === 'kv' && picked && picked.kv_bits === 'plain' && c.plain) || c.about;
       const b = el('button', {class: on ? 'on' : ''}, c.label);
       b.addEventListener('click', async () => {
         try {
@@ -608,7 +653,48 @@ function renderPresets() {
       });
       seg.append(b);
     }
-    wrap.append(seg, el('div', {class: 'note', style: 'margin-top:6px'}, g.note || activeAbout || 'Custom value set in settings'));
+    let noteText = g.note || activeAbout || 'Custom value set in settings';
+    if (group === 'drafter') {
+      const d = offered[0];
+      if (PRESETS.mtp && PRESETS.mtp.now === 'off') {
+        wrap.append(el('div', {class: 'note', style: 'margin-top:6px'}, 'No drafter while MTP is Off.'));
+        box.append(wrap);
+        continue;
+      }
+      if (g.now === d.key && !d.path) {
+        noteText = `${d.name} is not on ${CATALOG && CATALOG.machine ? CATALOG.machine : 'this machine'}: the bundled MTP head drafts until it is.`;
+      }
+      wrap.append(seg, el('div', {class: 'note', style: 'margin-top:6px'}, noteText));
+      if (!d.path) {
+        const askRow = el('div', {class: 'bar', style: 'margin-top:8px'});
+        const getBtn = el('button', {}, `Get ${d.name}`);
+        getBtn.addEventListener('click', async () => {
+          getBtn.disabled = true;
+          try {
+            const info = await call('POST', '/v1/quanteeze/home/download/info', {repo: d.repo});
+            if (info.local) {
+              askRow.replaceChildren(el('span', {class: 'ok'}, `${info.repo} is already at ${info.local}`));
+              CATALOG = await call('GET', '/v1/quanteeze/home/catalog');
+              renderCatalog(); renderPresets();
+              return;
+            }
+            const go = el('button', {class: 'primary'}, `Download ${info.gb} GB`);
+            go.addEventListener('click', async () => {
+              askRow.replaceChildren(el('span', {class: 'note'}, `Downloading ${info.repo}…`));
+              await call('POST', '/v1/quanteeze/home/download', {repo: info.repo, gb: info.gb, kind: 'drafter'});
+              pollDownload();
+            });
+            askRow.replaceChildren(el('span', {class: 'note'}, `${info.repo}: ${info.files} files, ${info.gb} GB`), go);
+          } catch (e) {
+            askRow.replaceChildren(el('span', {class: 'err'}, e.message));
+          }
+        });
+        askRow.append(getBtn);
+        wrap.append(askRow);
+      }
+    } else {
+      wrap.append(seg, el('div', {class: 'note', style: 'margin-top:6px'}, noteText));
+    }
     box.append(wrap);
   }
 }
@@ -650,7 +736,10 @@ function pollDownload() {
       if (d.state !== 'downloading') {
         clearInterval(dlTimer); dlTimer = null;
         CATALOG = await call('GET', '/v1/quanteeze/home/catalog');
-        renderCatalog();
+        renderCatalog(); renderPresets();
+        if (d.state === 'done' && d.kind === 'drafter') {
+          $('preset-msg').textContent = 'Downloaded drafter; it activates on the next model load.';
+        }
       }
     } catch (e) {}
   }, 1500);
@@ -800,19 +889,22 @@ async function pollOnce() {
   try {
     const [mod, live] = await Promise.all([call('GET', '/v1/quanteeze/model'), call('GET', '/v1/quanteeze/home/live')]);
     MODEL = mod; LIVE = live;
-    const busyNow = mod.state === 'waiting' || mod.state === 'loading';
+    const busyNow = mod.state === 'waiting' || mod.state === 'loading' || mod.state === 'unloading';
     if (wasBusy && !busyNow) {
       if (mod.state === 'idle') {
         const secs = mod.progress && mod.progress.seconds != null ? ` (${mod.progress.seconds}s)` : '';
         $('start-msg').className = 'note ok';
         $('start-msg').textContent = `Ready — serving model${secs}.`;
+      } else if (mod.state === 'unloaded') {
+        $('start-msg').className = 'note';
+        $('start-msg').textContent = 'Model unloaded; generation requests are refused until loaded again.';
       } else {
         $('start-msg').className = 'note err';
         $('start-msg').textContent = mod.error || 'Model load failed.';
       }
       const [cat, conn] = await Promise.all([call('GET', '/v1/quanteeze/home/catalog'), call('GET', '/v1/quanteeze/home/connect')]);
       CATALOG = cat;
-      renderCatalog(); renderConnect(conn);
+      renderCatalog(); renderPresets(); renderConnect(conn);
     }
     wasBusy = busyNow;
     renderNow();
@@ -821,7 +913,7 @@ async function pollOnce() {
 
 function schedulePoll(ms) {
   if (pollTimer) clearTimeout(pollTimer);
-  const activeReq = Boolean(TRY || (MODEL && (MODEL.state === 'waiting' || MODEL.state === 'loading'))
+  const activeReq = Boolean(TRY || (MODEL && (MODEL.state === 'waiting' || MODEL.state === 'loading' || MODEL.state === 'unloading'))
     || (LIVE && LIVE.requests && LIVE.requests.now && LIVE.requests.now.length));
   const wait = ms != null ? ms : (activeReq ? 1000 : 2000);
   pollTimer = setTimeout(async () => {
@@ -840,7 +932,7 @@ async function init() {
       call('GET', '/v1/quanteeze/home/connect'),
     ]);
     CATALOG = cat; MODEL = mod; LIVE = live; PRESETS = pre;
-    wasBusy = Boolean(mod && (mod.state === 'waiting' || mod.state === 'loading'));
+    wasBusy = Boolean(mod && (mod.state === 'waiting' || mod.state === 'loading' || mod.state === 'unloading'));
     $('locked').hidden = true;
     $('app').hidden = false;
     renderNow(); renderCatalog(); renderPresets(); renderConnect(conn);
@@ -885,7 +977,7 @@ init();
 
   const JA = {
     'Every setting →': '詳細設定 →',
-    'Choose a model and its uniform expert precision on': 'モデルと均一エキスパート量子化精度を',
+    'Choose a model and its expert precision on': 'モデルとエキスパートの量子化精度を',
     'this Mac': 'この Mac', 'this machine': 'このマシン',
     '.': 'で選びます。',
     'Token': 'トークン',
@@ -897,6 +989,13 @@ init();
     'No model loaded': 'モデル未読み込み',
     'ready': '待機中（配信可）', 'idle': '待機中', 'loading': '読み込み中', 'failed': '失敗',
     'waiting for requests to finish': '実行中リクエストの完了待ち',
+    'unloading': '解放中', 'unloaded: requests refused': '解放済み（リクエスト拒否中）',
+    'Unload': 'モデルを解放', 'Load it again': 'もう一度読み込む',
+    'Unload the model and return its memory; generation requests are refused until loaded again here':
+      'モデルを解放してメモリを返します（ここからもう一度読み込むまで生成リクエストは拒否されます）',
+    'Letting it go…': '解放しています…',
+    'Unloading model…': 'モデルを解放しています…',
+    'Model unloaded; generation requests are refused until loaded again.': 'モデルを解放しました（再度読み込むまで生成リクエストは拒否されます）。',
     'serving': '配信中',
     'Memory (MLX)': 'メモリ（MLX）',
     'Memory (the server)': 'メモリ（サーバー全体）',
@@ -914,7 +1013,7 @@ init();
     'Requests now and lately': '実行中・直近のリクエスト',
     'None since the server started.': 'サーバー起動以降、まだリクエストはありません。',
     'now': '実行中',
-    'Model & uniform precision': 'モデルと均一量子化精度',
+    'Model & expert precision': 'モデルと量子化精度',
     'Fetch from Hugging Face: org/model-name': 'Hugging Face から取得: org/model-name',
     'Check size': 'サイズ確認',
     'Routed expert precision': 'ルーティング・エキスパートの精度',
@@ -943,10 +1042,29 @@ init();
     'Memory reserve': 'メモリ確保枠',
     'Wired memory': 'メモリの固定',
     'PLE n-gram table': 'PLE n-gram 表',
+    'KV cache': 'KV キャッシュ',
+    '8 bits': '8 ビット',
+    "the default: the full attention layers' keys and values kept as the model computes them, 24.6 kB a token (1.7 GB at 70k tokens, 6.4 GB at 262k)":
+      '既定：フルアテンション層のキーと値をモデルが計算した bfloat16 のまま保持します（1トークン 24.6 kB：70k トークンで 1.7 GB、262k で 6.4 GB）',
+    "the full attention layers' keys and values at 8 bits, 0.53 of the memory (0.9 GB at 70k tokens, 3.4 GB at 262k): more room for long conversations and the experts. Not the same bits -- a key off by ~0.7% -- though the served KL showed no difference on a CUDA GPU or a Mac, nor did long-prompt prefill or decode speed":
+      'フルアテンション層のキーと値を 8 ビットで保持し、メモリ使用量を約 0.53 倍に抑えます（70k トークンで 0.9 GB、262k で 3.4 GB）。長い会話やエキスパートにより多くの余裕を残せます。ビット完全一致ではありませんが（キーあたり約 0.7% の差）、Mac と CUDA GPU のいずれでも配信 KL や長文プリフィル・デコード速度に差は見られませんでした',
+    "the default: the full attention layers' keys and values kept as the model computes them (Qwen3.8-27B: 65.5 kB a token, 8.6 GB at 128k tokens)":
+      '既定：フルアテンション層のキーと値をモデルが計算した bfloat16 のまま保持します（Qwen3.8-27B：1トークン 65.5 kB、128k トークンで 8.6 GB）',
+    "the full attention layers' keys and values at 8 bits in mlx-vlm's own cache, the last of them left at bfloat16: 0.56 of the memory (Qwen3.8-27B: 36.7 kB a token, 4.8 GB at 128k tokens). Not the same bits; on a Mac decode is 1-3% slower":
+      'フルアテンション層のキーと値を mlx-vlm 自身のキャッシュで 8 ビット保持します（最終層のみ bfloat16 のまま：メモリ使用量は 0.56 倍、Qwen3.8-27B で 1トークン 36.7 kB・128k トークンで 4.8 GB）。ビット完全一致ではなく、Mac ではデコードが 1〜3% 遅くなります',
     'MTP speculative decoding': 'MTP 投機デコード',
+    'Speculative drafter': '下書き役（Drafter）',
+    'MTP head': 'MTP ヘッド',
+    'No drafter while MTP is Off.': 'MTP がオフの間は下書き役を使用しません。',
+    'Downloaded drafter; it activates on the next model load.': '下書き役をダウンロードしました（次のモデル読み込みから有効になります）。',
     'Thermal throttle': '発熱による減速',
-    'Roomy': 'ゆったり', 'Standard': '標準', 'Most experts': 'エキスパート最大',
-    'Quiet': '静か', 'Full speed': '全速', 'Auto': '自動', 'SSD': 'SSD', 'Off': 'オフ', 'On': 'オン', 'On (exact)': 'オン（完全一致）',
+    'Roomy': 'ゆったり', 'Standard': '標準', 'Most for experts': 'エキスパート最大',
+    'Quiet': '静か', 'Full speed': '全速', 'Auto': '自動', 'SSD': 'SSD', 'Off': 'オフ', 'On': 'オン',
+    'On (exact)': 'オン（完全一致）', 'On (fast)': 'オン（高速）',
+    "the default: the model's own bundled MTP / DSpark head drafts as MTP says":
+      '既定：MTP 設定に従い、モデル同梱の MTP / DSpark ヘッドで下書きします',
+    'standalone block-diffusion drafter (DFlash2, ~0.3 GB in memory) when present on this machine for this model type; falls back to the bundled MTP head otherwise':
+      '独立型ブロック拡散ドラフター（DFlash2、メモリ約 0.3 GB）。対応モデルのドラフターが保存済みの場合に使用し、未保存・非対応時はモデル同梱 MTP ヘッドへフォールバックします',
     "the default: MLX's memory wired only while it generates, as mlx-vlm wires it":
       '既定：MLX のメモリを固定するのは、生成している間だけです（mlx-vlm がもともと固定します）',
     'wired from the load on, up to the working set Metal recommends (what mlx-vlm wires while it generates): less of the model compressed before the first request. macOS still lets it go within 30 s of the GPU falling idle, so the idle model is not kept from the compressor; while it loads, other apps have less room':
@@ -975,8 +1093,10 @@ init();
     [/^at most (.+) · keeps to (.+?)(?: · stops at (.+) GB)?$/,
       (m, pk, lim, st) => `最大 ${pk} · 目安 ${lim}${st ? ` · ${st} GB で停止` : ''}`],
     [/^slows from (.+) · rested (.+) s$/, (m, lv, s) => `${JA[lv] || lv} から減速 · 休止計 ${s} 秒`],
+    [/^Speculative decoding \((.+)\)$/, (m, k) => `投機デコード（${JA[k] || k}）`],
     [/^(.+) accepted$/, '$1 受理'],
-    [/^(.+) tokens a round · (.+) rounds$/, '1ラウンド $1 トークン · 計 $2 ラウンド'],
+    [/^(?:(.+?)(?:-bit)? · )?(.+) tokens a round · (.+) rounds$/,
+      (m, b, tok, r) => `${b ? (/^\d/.test(b) ? `${b}ビット · ` : `${b} · `) : ''}1ラウンド ${tok} トークン · 計 ${r} ラウンド`],
     [/^(\d+) answered · (\d+) running now$/, '完了 $1 · 実行中 $2'],
     [/^(\d+) running$/, '実行中 $1'], [/^(\d+) recent$/, '直近 $1'], [/^(\d+) ended lately$/, '直近完了 $1'],
     [/^(.+) in memory$/, 'メモリ内ヒット $1'],
@@ -986,8 +1106,8 @@ init();
     [/^(Q3_K|Q2_K) \(ggml K-quant\)$/, '$1（ggml K-quant）'],
     [/^MXFP4 \(microscaling FP4\)$/, 'MXFP4（マイクロスケール FP4）'],
     [/^IQ2_XS \(ggml importance grid\)$/, 'IQ2_XS（ggml 格子量子化）'],
-    [/^All routed experts lowered uniformly to (\d+)-bit$/, '全ルーティング・エキスパートを均一に $1 ビットへ量子化'],
-    [/^All routed experts quantized uniformly to (.+)$/, '全ルーティング・エキスパートを均一に $1 へ量子化'],
+    [/^All routed experts lowered to (\d+)-bit$/, '全ルーティング・エキスパートを $1 ビットへ量子化'],
+    [/^All routed experts quantized to (.+)$/, '全ルーティング・エキスパートを $1 へ量子化'],
     [/^Intermediate size \((.+)\); slower at load, from SSD, and on CUDA$/, '中間サイズ（$1）・初回読込／SSD配信／CUDAでは低速'],
     [/^(.+) GB of experts · fits in memory$/, 'エキスパート $1 GB · メモリに収まる'],
     [/^(.+) GB of experts · streams from SSD$/, 'エキスパート $1 GB · SSD からオンデマンド読込'],
@@ -995,6 +1115,18 @@ init();
       'モデル本体と確保枠を除き、エキスパートに使えるメモリ余裕：$1 GB。'],
     [/^Not answered: (.+)$/, '応答エラー：$1'],
     [/^Could not start: (.+)$/, '起動できませんでした：$1'],
+    [/^Unloading model \((\d+) running\)…$/, 'モデル解放待ち（実行中 $1 件）…'],
+    [/^Waiting for (\d+) requests? to finish…$/, '実行中の $1 件のリクエスト完了を待っています…'],
+    [/^Load (.+) again with the saved settings$/, '保存済み設定で $1 をもう一度読み込む'],
+    [/^Not unloaded: (.+)$/, '解放できませんでした：$1'],
+    [/^Not loaded: (.+)$/, '読み込めませんでした：$1'],
+    [/^Downloading (.+)…$/, '$1 をダウンロード中…'],
+    [/^Download (.+) GB$/, '$1 GB をダウンロード'],
+    [/^(.+) is already at (.+)$/, '$1 はすでに $2 にあります'],
+    [/^(.+) \(unloaded\)$/, '$1（解放済み）'],
+    [/^Get (.+)$/, '$1 を取得'],
+    [/^(.+) is not on (.+): the bundled MTP head drafts until it is\.$/,
+      (m, name, host) => `${name} は${JA[host] || host}に未保存のため、取得されるまでモデル同梱の MTP ヘッドで下書きします。`],
     [/^C\+\+ STM on-demand engine is not active \(QUANTEEZE_DEMAND_STM=on\): (.+)\. Python on-demand streaming is serving instead\.$/,
       'C++ STM オンデマンドエンジンは有効になっていません（QUANTEEZE_DEMAND_STM=on）：$1。Python 版のオンデマンド配信で動作しています。'],
   ];
@@ -1002,7 +1134,7 @@ init();
   const FRAGMENTS = [
     ['all weights in memory', '全重みをメモリ保持'],
     [/(\d+)-bit experts \(lowered from (\d+)-bit by least squares\)/, '$1ビット・エキスパート（$2ビットから最小二乗で量子化）'],
-    [/(MXFP4|Q3_K|Q2_K|IQ2_XS) experts \(lowered from (\d+)-bit\)/, '$1 エキスパート（$2ビットから均一量子化）'],
+    [/(MXFP4|Q3_K|Q2_K|IQ2_XS) experts \(lowered from (\d+)-bit\)/, '$1 エキスパート（$2ビットから量子化）'],
     [/(\d+)-bit experts/, '$1ビット・エキスパート'],
     [/(MXFP4|Q3_K|Q2_K|IQ2_XS) experts/, '$1 エキスパート'],
     [/streaming on demand from SSD \((.+?) of (.+?) GB kept in memory\)/, 'SSD オンデマンド配信（$2 GB 中 $1 GB をメモリ保持）'],

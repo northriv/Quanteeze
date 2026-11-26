@@ -44,6 +44,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
@@ -51,13 +52,13 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import fitting, guards, q2_experts, variables
+from . import fitting, guards, per_load, per_thread, q2_experts, variables
 
 GROUP = [None]       # the NCCL group of the ranks, once init() made it
 _OWNED = [None]      # this rank's decoder layer range, once split() made it
 _PEERS = []          # rank 0: a connection to each other rank, in order; the others: the one to rank 0
 _SENT = {}           # rank 0: the variables as last sent
-_LAST = [None]       # the last collective this rank issued (_collective)
+_LAST = per_thread.Field('collective')   # the last collective this thread issued (_collective)
 _ON_HOST = [None]    # how many ranks run on this rank's host, once init() asked them all
 _HOSTS = [None]      # every rank's host (its _host_id), once init() asked them all
 _CUT = [None]        # the runs' first layers and the end, once split() made them
@@ -90,7 +91,8 @@ def owned():
 # of another rank asked for is a crossing: refused, counted (crossings()), and logged once -- or
 # raised as Crossing under QUANTEEZE_PARALLEL_CROSSING=raise.
 
-_CROSSED = {}        # what: how many times a layer of another rank was asked for it
+_CROSSED = []        # each thread's own {what: how many times a layer of another rank was asked for it}
+_MINE = threading.local()
 
 
 class Crossing(RuntimeError):
@@ -121,8 +123,13 @@ def require(j, what):
 
 def refuse(what, why):
     """Record a split crossing in crossings(), log once, or raise Crossing under QUANTEEZE_PARALLEL_CROSSING=raise."""
-    n = _CROSSED[what] = _CROSSED.get(what, 0) + 1
-    if (variables.get('QUANTEEZE_PARALLEL_CROSSING') or 'refuse').lower() == 'raise':
+    own = getattr(_MINE, 'counts', None)
+    if own is None or not any(own is c for c in _CROSSED):
+        own = _MINE.counts = {}
+        _CROSSED.append(own)
+    own[what] = own.get(what, 0) + 1
+    n = crossings()[what]
+    if (variables.get('QUANTEEZE_PARALLEL_CROSSING', variables.at_start()) or 'refuse').lower() == 'raise':
         raise Crossing(f'quanteeze: rank {rank()}: {what} crosses the split: {why}')
     if n == 1:
         print(f'quanteeze: rank {rank()}: {what} refused, it crosses the split: {why} (counted; '
@@ -131,7 +138,11 @@ def refuse(what, why):
 
 def crossings():
     """`{what: times refused}` in this process (empty when nothing crossed)."""
-    return dict(_CROSSED)
+    out = {}
+    for counts in list(_CROSSED):
+        for what, n in list(counts.items()):
+            out[what] = out.get(what, 0) + n
+    return out
 
 
 def runs_here():
@@ -355,13 +366,13 @@ def _model_argument(argv):
 
 def plan(argv, gpus=None):
     """The GPUs to split the model over, [(name, bytes)], or None for one process; and why, a line."""
-    mode = (variables.get('QUANTEEZE_PARALLEL') or 'auto').strip().lower()
+    mode = (variables.get('QUANTEEZE_PARALLEL', variables.at_start()) or 'auto').strip().lower()
     if mode == 'off':
         return None, 'QUANTEEZE_PARALLEL=off'
     if mode not in ('auto', 'layers'):
         raise SystemExit(f'quanteeze: QUANTEEZE_PARALLEL is auto, layers or off, not {mode!r} '
                          '(experts apart over the GPUs is not yet)')
-    want = (variables.get('QUANTEEZE_GPUS') or 'auto').strip().lower()
+    want = (variables.get('QUANTEEZE_GPUS', variables.at_start()) or 'auto').strip().lower()
     if gpus is None:
         entries = _gpus_with_free() or [(n, t, t) for n, t in _gpus()]
     else:
@@ -449,7 +460,7 @@ def launch(argv=None):
         if len(seen) > 1:
             _alone(seen[0][0], argv)
         return
-    logs = variables.path('QUANTEEZE_PARALLEL_LOGS')
+    logs = variables.path('QUANTEEZE_PARALLEL_LOGS', variables.at_start())
     logs.mkdir(parents=True, exist_ok=True)
     common = dict(os.environ, MLX_WORLD_SIZE=str(len(gpus)), NCCL_HOST_IP='127.0.0.1', NCCL_PORT=str(_free_port()),
                   QUANTEEZE_PARALLEL='layers', QUANTEEZE_PARALLEL_PORT=str(_free_port()),
@@ -509,6 +520,22 @@ def _supervise(children, poll=1.0, grace=60.0):
 
 # -- each rank -------------------------------------------------------------------------------------
 
+def no_delay(conn):
+    """Enable TCP_NODELAY on a connection's socket to avoid Nagle/delayed-ACK stalls on multi-write messages."""
+    try:
+        sock = socket.socket(fileno=os.dup(conn.fileno()))
+    except (OSError, ValueError):
+        return conn
+    try:
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    return conn
+
+
 def init(backend='nccl'):
     """In a rank (MLX_WORLD_SIZE set by launch()): the group (NCCL's; the tests' on the CPU, ring's),
     and the connections over which rank 0 hands on its requests.  Returns the group, or None in
@@ -517,19 +544,19 @@ def init(backend='nccl'):
         return None
     group = mx.distributed.init(backend=backend, strict=True)
     host = os.environ.get('NCCL_HOST_IP', '127.0.0.1')
-    address = (host, variables.integer('QUANTEEZE_PARALLEL_PORT'))
-    key = (variables.get('QUANTEEZE_PARALLEL_KEY') or '').encode()
+    address = (host, variables.integer('QUANTEEZE_PARALLEL_PORT', variables.at_start()))
+    key = (variables.get('QUANTEEZE_PARALLEL_KEY', variables.at_start()) or '').encode()
     if group.rank() == 0:
         peers = {}
         with Listener(address, authkey=key) as listener:
             while len(peers) < group.size() - 1:
-                conn = listener.accept()
+                conn = no_delay(listener.accept())
                 peers[conn.recv()] = conn
         _PEERS[:] = [peers[r] for r in range(1, group.size())]
     else:
         for attempt in range(600):
             try:
-                conn = Client(address, authkey=key)
+                conn = no_delay(Client(address, authkey=key))
                 break
             except OSError:
                 time.sleep(0.5)
@@ -557,6 +584,24 @@ def _collective(x, op):
         x = mx.depends(x, _LAST[0])
     _LAST[0] = out = op(x)
     return out
+
+
+@per_load.on_let_go
+def forget_chain():
+    """Forget the calling thread's collective chain (_collective) on pass failure or model unload."""
+    _LAST[0] = None
+
+
+def _forgetting(call):
+    """Wrap `call` so an exception forgets the calling thread's collective chain before propagating."""
+    def forgetting(*args, **kwargs):
+        try:
+            return call(*args, **kwargs)
+        except BaseException:
+            forget_chain()
+            raise
+    forgetting.__wrapped__ = call
+    return forgetting
 
 
 def least(value):
@@ -622,6 +667,7 @@ def _qwen4_exp(model, holder, layers, cut, own, ends):
         return hand_on(out, True) if getattr(layer, 'quanteeze_hands_on', False) else out
     _layer.quanteeze = True
     forward._layer = _layer
+    forward.__call__ = _forgetting(forward.__call__)
 
 
 class _AbsentAttn:
@@ -786,6 +832,13 @@ def _deepseek_v41(model, holder, layers, cut, own, ends):
 _ADAPTERS = {'qwen4_exp': _qwen4_exp, 'glm5_next': _glm5_next, 'deepseek_v41': _deepseek_v41}
 
 
+def _passes_forgetting(lm):
+    """Wrap `lm`'s class so an exception in a pass forgets the thread's collective chain."""
+    cls = type(lm)
+    if not getattr(cls, '_quanteeze_forgetting', False):
+        lm.__class__ = type(cls.__name__, (cls,), {'__call__': _forgetting(cls.__call__), '_quanteeze_forgetting': True})
+
+
 def split(model):
     """This rank's run of `model`'s decoder layers, the others' absent (nothing of them read);
     its range, or None in one process."""
@@ -820,6 +873,7 @@ def split(model):
                     caches[i] = ArraysCache(0)
         return caches
     lm.make_cache = own_caches
+    _passes_forgetting(lm)
     print(f'quanteeze: rank {rank()} of {size()}: layers {own.start}-{own.stop - 1} of {len(layers)} '
           f'(runs from {cut[:-1]})', file=sys.stderr, flush=True)
     _CROSSED.clear()

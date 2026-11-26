@@ -22,16 +22,21 @@ import sys
 import mlx.core as mx
 import numpy as np
 
-from . import requant, verify_qmv
+from . import kernel_checks, per_load, requant, verify_qmv
 
 CHECKS = verify_qmv.CHECKS
 ON = [True]                       # QUANTEEZE_EXPERT_QMV
 PAIR = [True]                     # gate and up in one kernel (run_pair)
 ROWS = [None]                     # max rows naming an expert a threadgroup computes at once (None: T)
 STATS = dict(served=0, fused=0, checked=0, mismatched=0)
-CHOICE = {}
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('expert_qmv')
 SAID = []
+
+
+@per_load.on_let_go
+def _let_go():
+    """Clear per-load `ROWS` setting override on model unload."""
+    ROWS[0] = None
 
 
 def weighs(activation):
@@ -567,6 +572,7 @@ _DOWN = r"""
     }
 """
 FUSED = [True]
+VERIFY = [True]
 
 
 @lru_cache(maxsize=None)
@@ -582,10 +588,10 @@ def _fused_kernels():
 
 
 def fusable(switch, x):
-    """Whether `fused()` computes this decode step: one token, affine `gate_proj`, `up_proj`,
-    and `down_proj` with `bits in (1, 2, 4, 8)`."""
+    """Whether `fused()` computes this step: one-token decode or multi-token verify (`VERIFY[0]`),
+    with affine `gate_proj`, `up_proj`, and `down_proj` with `bits in (1, 2, 4, 8)`."""
     projs = (switch.gate_proj, switch.up_proj, switch.down_proj)
-    return (x.shape[1] == 1 and verify_qmv.helpers() is not None
+    return ((x.shape[1] == 1 or VERIFY[0]) and verify_qmv.helpers() is not None
             and len({(getattr(p, 'bits', None), getattr(p, 'group_size', None)) for p in projs}) == 1
             and getattr(switch.gate_proj, 'bits', None) in (1, 2, 4, 8)
             and all(getattr(p, 'mode', 'affine') == 'affine' for p in projs)
@@ -593,9 +599,10 @@ def fusable(switch, x):
 
 
 def fused(switch, x, indices):
-    """A `SwitchGLU`'s experts for a 1-token decode step `x [1, 1, D]` on `indices [1, 1, k]`:
-    `[1, 1, k, D]` in two Metal kernels (`gate+up+swiglu`, then `down`)."""
-    d, k = x.shape[-1], indices.shape[-1]
+    """A `SwitchGLU`'s experts for `x [B, T, D]` on `indices [B, T, k]`: `[B, T, k, D]` in two
+    Metal kernels (`gate+up+swiglu`, then `down`), with each token's `k` slots dispatched as rows."""
+    b0, t0, k, d = x.shape[0], x.shape[1], indices.shape[-1], x.shape[-1]
+    t = b0 * t0
     flat_idx = indices.reshape(-1).astype(mx.int32)
     gp, up, dp = switch.gate_proj, switch.up_proj, switch.down_proj
     i_size = gp.weight.shape[1]
@@ -608,13 +615,13 @@ def fused(switch, x, indices):
     hidden = gate_up(
         inputs=[mx.contiguous(x.reshape(-1, d)), flat_idx,
                 gp.weight, gp.scales, gp.biases, up.weight, up.scales, up.biases],
-        template=template, grid=(32, 2 * (i_size // 8), k), threadgroup=(32, 2, 1),
-        output_shapes=[(k, i_size)], output_dtypes=[x.dtype])[0]
+        template=template, grid=(32, 2 * (i_size // 8), t * k), threadgroup=(32, 2, 1),
+        output_shapes=[(t * k, i_size)], output_dtypes=[x.dtype])[0]
     y = down(
         inputs=[hidden, flat_idx, dp.weight, dp.scales, dp.biases],
-        template=template, grid=(32, 2 * (d // 8), k), threadgroup=(32, 2, 1),
-        output_shapes=[(k, d)], output_dtypes=[x.dtype])[0]
-    return y.reshape(1, 1, k, d)
+        template=template, grid=(32, 2 * (d // 8), t * k), threadgroup=(32, 2, 1),
+        output_shapes=[(t * k, d)], output_dtypes=[x.dtype])[0]
+    return y.reshape(b0, t0, k, d)
 
 
 def eligible(switch, x, indices):
@@ -771,26 +778,7 @@ def decode(switch, x, indices, weights=None):
 
 
 def _checked(k, mine, theirs, stat):
-    choice, seen = CHOICE.get(k), CHECKED.get(k, 0)
-    if choice is not None and seen >= CHECKS:
-        if not choice:
-            return theirs()
-        STATS[stat] += 1
-        return mine()
-    want = theirs()
-    STATS['checked'] += 1
-    try:
-        same = mx.array_equal(mine(), want).item()
-    except Exception as error:
-        if not SAID:
-            SAID.append(True)
-            print(f'quanteeze: experts\' kernel unavailable ({type(error).__name__}: {error})',
-                  file=sys.stderr, flush=True)
-        same = False
-    if not same:
-        STATS['mismatched'] += 1
-    CHOICE[k], CHECKED[k] = bool(same), (seen + 1 if same else CHECKS)
-    return want
+    return kernel_checks.served(sys.modules[__name__], k, mine, theirs, "experts' kernel", stat=stat)
 
 
 def install_switch(switch):

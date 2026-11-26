@@ -70,12 +70,14 @@ from . import (
     home,
     hyper,
     kquant_qmv,
+    kv_bits,
     leases,
     linear_attn,
     loops,
     mtp,
     ngram_prefetch,
     parallel,
+    per_load,
     phases,
     prefill,
     progress,
@@ -97,6 +99,7 @@ _load = generation.load
 UNIFORM_BITS = (1, 2, 3, 4, 8)
 _SERVING = {}                # active model metadata & Demand instance for status/cleanup
 _AT_EXIT = {}
+_SERVER_EXITS = ('admission', 'broken')
 _LOADED = []
 _SPLIT = []
 _ADMISSION = [None]
@@ -118,7 +121,7 @@ def _precision():
     """The served model's precision settings that change what a prompt computes, '' when none."""
     info = _SERVING.get('info') or {}
     base = f'{info.get("mode", "")}:{info.get("bits", "")}' if info else ''
-    return '; '.join(t for t in (base, context_compress.tag()) if t)
+    return '; '.join(t for t in (base, context_compress.tag(), kv_bits.tag()) if t)
 
 
 WARM_TEXT = ('A model warms up before its first request: the kernels it compiles at their first use are '
@@ -158,13 +161,33 @@ def _warm_up(model, processor):
             y = last(lm(y[:, None], cache=cache))
             mx.eval(y)
         del cache
+        rounds = _warm_batch(lm, ids[prefill_n:prefill_n + more], last)
         print(f'quanteeze: warmed up in {time.time() - start:.0f} s, its kernels compiled before the first request '
-              '(QUANTEEZE_WARM_UP)', file=sys.stderr, flush=True)
+              f'(QUANTEEZE_WARM_UP){rounds}', file=sys.stderr, flush=True)
     except Exception as e:                                # noqa: BLE001 -- a warm-up that fails leaves the first request to it
         print(f'quanteeze: the warm-up did not run ({type(e).__name__}: {e}); the first request compiles the '
               'kernels', file=sys.stderr, flush=True)
     finally:
         mx.clear_cache()
+
+
+def _warm_batch(lm, ids, last):
+    """Run batch prompts and decode steps for 2..QUANTEEZE_WARM_UP_BATCH rows to precompile batch shapes."""
+    if variables.off('QUANTEEZE_WARM_UP_BATCH'):
+        return ''
+    most = max(0, variables.integer('QUANTEEZE_WARM_UP_BATCH'))
+    if most < 2 or not ids:
+        return ''
+    from mlx_vlm.generate.ar import _make_cache
+    for rows in range(2, most + 1):
+        caches = _make_cache(lm, [0] * rows)
+        y = last(lm(mx.array([list(ids)] * rows), cache=caches))
+        mx.eval(y)
+        for _ in range(2):
+            y = last(lm(y[:, None], cache=caches))
+            mx.eval(y)
+        del caches
+    return f', batches of 2 to {most} requests'
 
 
 def _switch_nbytes(switch):
@@ -228,8 +251,29 @@ def _load_whole():
     return value in ('on', '1', 'true', 'yes')
 
 
+class LoadRefused(RuntimeError):
+    """A load Quanteeze refused (`SystemExit` raised by setting checks during model load), carried out of
+    `mlx-vlm`'s generation thread as an `Exception` (`_load_hooked`)."""
+
+
 def _load_hooked(*args, **kwargs):
-    """`mlx_vlm`'s load with Quanteeze's uniform quantization, kernel hooks, and progress reporting."""
+    """`mlx_vlm`'s load with Quanteeze's uniform quantization, kernel hooks, and progress reporting.
+
+    Converts any `SystemExit` raised during model load into `LoadRefused` (`Exception`) so `mlx-vlm`'s
+    generation thread (`ResponseGenerator._run_impl` and `request_threads._dispatch`, which catch `Exception`
+    only) records `_load_error` and sets `_ready` rather than terminating silently and leaving `wait_until_ready`
+    waiting indefinitely."""
+    try:
+        return _load_told(*args, **kwargs)
+    except SystemExit as e:
+        reason = e.code if isinstance(e.code, str) else f'SystemExit({e.code!r})'
+        print(f'quanteeze: the load was refused: {reason}', file=sys.stderr, flush=True)
+        raise LoadRefused(reason) from e
+
+
+def _load_told(*args, **kwargs):
+    """`_load_hooked` implementation before converting `SystemExit` to `LoadRefused`."""
+    control.loaded()
     guards.note_others()
     _wire()
     path = _checkpoint_path(args, kwargs)
@@ -295,6 +339,10 @@ def _load_serving(*args, **kwargs):
         if kind == 'qwen4_exp' and hyper.ON[0] and hyper.install():
             print('quanteeze: Flash-Next\'s hyper-connections a decode token in fewer kernels (quanteeze.hyper), '
                   'each shape checked bit for bit first', file=sys.stderr, flush=True)
+        if kind == 'qwen4_exp' and kv_bits.install(arch.language_model(model)):
+            print(f'quanteeze: the full attention layers\' keys and values kept at {kv_bits.BITS} bits, a scale '
+                  f'and a bias a group of {kv_bits.GROUP} (QUANTEEZE_KV_BITS: quanteeze.kv_bits)',
+                  file=sys.stderr, flush=True)
         if kind == 'glm5_next' and sigmoid_router.ON[0]:
             print('quanteeze: GLM-5.3\'s routing a decode token in two kernels (quanteeze.sigmoid_router), '
                   'each shape checked bit for bit first', file=sys.stderr, flush=True)
@@ -309,6 +357,10 @@ def _load_serving(*args, **kwargs):
                   '(quanteeze.glm_indexer), each path checked bit for bit first', file=sys.stderr, flush=True)
     else:
         print(f'quanteeze: serving dense / standard model {kind!r}', file=sys.stderr, flush=True)
+    if kind != 'qwen4_exp' and kv_bits.install_plain(arch.language_model(model)):
+        print(f'quanteeze: the full attention layers\' keys and values kept at {kv_bits.BITS} bits, a scale and a '
+              f'bias a group of {kv_bits.GROUP}, in mlx-vlm\'s own 8-bit caches (QUANTEEZE_KV_BITS: '
+              f'quanteeze.kv_bits.install_plain)', file=sys.stderr, flush=True)
 
     readings = efforts.use_model(kind)
     if readings:
@@ -318,6 +370,8 @@ def _load_serving(*args, **kwargs):
     chat_format = dsml.use_model(model, processor)
     if chat_format:
         print(f'quanteeze: {chat_format}', file=sys.stderr, flush=True)
+    if not turn_starts(model):
+        _mark_turn_starts(model, processor)
     throttle = guards.Throttle.from_env()
     if throttle is not None:
         guards.install_throttle(arch.language_model(model), throttle)
@@ -338,6 +392,8 @@ def _load_serving(*args, **kwargs):
                 f'no routed experts found in {kind!r}'
             )
         _evaluate(model)
+        from . import request_threads
+        request_threads.WHOLE[0] = True
         _enable(drafter, 'from the start', in_memory=True)
         _SERVING['info'] = {
             'model': path, 'model_type': kind, 'mode': 'in_memory',
@@ -366,9 +422,12 @@ def _load_serving(*args, **kwargs):
         experts_bytes = sum(_switch_nbytes(s) for s in switches)
 
     fits_in_memory = _load_whole() or space is None or experts_bytes <= space
+    working_set = guards.recommended_budget()
     if not fits_in_memory or on_demand is not None:
         _apc_off_the_gpu()
         _prefill_short()
+    elif working_set and resident + experts_bytes > working_set // 2:
+        _apc_off_the_gpu()
     if on_demand is None and not fits_in_memory:
         if parallel.size() > 1:
             _parallel_failed(
@@ -445,6 +504,7 @@ def _load_serving(*args, **kwargs):
         if layered:
             prefill.install(layers, enabled=lambda: True)
             prefill.widen(PromptProcessingBatch, layered)
+            mark(model, PROMPT_STEP, layered)
             print(f'quanteeze: on demand, a prompt goes through the model a layer at a time, up to '
                   f'{layered} tokens at once', file=sys.stderr, flush=True)
         if isinstance(source, (q2_experts.Checkpoint, gguf_experts.ExpertGGUF)):
@@ -462,6 +522,8 @@ def _load_serving(*args, **kwargs):
             file=sys.stderr, flush=True,
         )
         _at_exit('demand', lambda: print(f'quanteeze: on demand, {served.summary()}', file=sys.stderr, flush=True))
+        from . import request_threads
+        request_threads.WHOLE[0] = False
         return model, processor
 
     # Whole in memory (pre-distributed GGUF, lowered uniformly to `target_bits`, or at checkpoint precision)
@@ -506,6 +568,8 @@ def _load_serving(*args, **kwargs):
             file=sys.stderr, flush=True,
         )
 
+    from . import request_threads
+    request_threads.WHOLE[0] = (experts_gguf is None)
     _SERVING['info'] = {
         'model': path, 'model_type': kind, 'mode': 'in_memory',
         'bits': effective_bits, 'stock_bits': stock_bits,
@@ -525,6 +589,63 @@ def _parallel_failed(why):
     raise RuntimeError(f'quanteeze: {why}')
 
 
+def _verify_exactness():
+    from . import dspark
+    from .arch import deepseek_v41
+    exact = (variables.get('QUANTEEZE_MTP_EXACT') or 'bits').strip().lower()
+    deepseek_v41.EXACT[0] = exact != 'distribution'
+    dspark.GATE[0] = None
+    if exact == 'distribution':
+        print('quanteeze: QUANTEEZE_MTP_EXACT=distribution: verify pass computes tokens together',
+              file=sys.stderr, flush=True)
+
+
+def _external_drafter(got, kind, model):
+    where, asked = got
+    head = 'the checkpoint\'s MTP head as QUANTEEZE_MTP says'
+    if where is None and not mtp.known_drafter(kind):
+        print(f'quanteeze: QUANTEEZE_DRAFTER: {asked}; {head}', file=sys.stderr, flush=True)
+        return None
+    if where is None:
+        print(f'quanteeze: {asked} is not on this machine (a directory, Hugging Face cache, LM Studio '
+              f'folders); fetch it first (hf download {asked}, or Get in the Browser UI); {head}',
+              file=sys.stderr, flush=True)
+        return None
+    if parallel.size() > 1:
+        print(f'quanteeze: QUANTEEZE_DRAFTER: the model split over GPUs: not this drafter (it reads layers '
+              f'another rank holds); {head}', file=sys.stderr, flush=True)
+        return None
+    _IN_MEMORY[0] = True
+    _verify_exactness()
+    bits = mtp.drafter_bits(kind)
+    if bits is not None and not requant.native(bits):
+        print(f'quanteeze: QUANTEEZE_MTP_BITS={bits}: MLX computes no {bits}-bit experts on CUDA; using 2 bits',
+              file=sys.stderr, flush=True)
+        bits = 2
+    t = time.time()
+    try:
+        drafter = mtp.load_external(where, bits, target_model=model)
+    except Exception as e:
+        print(f'quanteeze: QUANTEEZE_DRAFTER={where}: failed to load ({type(e).__name__}: {e}); {head}',
+              file=sys.stderr, flush=True)
+        return None
+    block = mtp.block_for(variables.get('QUANTEEZE_MTP_BLOCK'), kind)
+    if block is not None:
+        eff_block = mtp.set_block(drafter[0], block)
+    else:
+        mtp.OVERRIDE_BLOCK[0] = None
+        eff_block = getattr(drafter[0].config, 'runtime_block_size', None) or getattr(
+            drafter[0], 'default_runtime_block_size', None
+        )
+    print(f'quanteeze: {mtp.label_of(drafter[0])} drafter ({where}) read in {time.time() - t:.0f} s: '
+          f'{mtp.nbytes(drafter[0]) / 1e9:.1f} GB, at {mtp.bits_of(drafter[0])} bits, '
+          + (f'{eff_block} tokens a round' if eff_block is not None else 'mlx-vlm\'s tokens a round'),
+          file=sys.stderr, flush=True)
+    _at_exit('mtp', lambda: print(f'quanteeze: {mtp.label_of(drafter[0])}, {mtp.summary(drafter[0])}',
+                                   file=sys.stderr, flush=True))
+    return drafter
+
+
 def _drafter(path, kind, model=None):
     mode = (variables.get('QUANTEEZE_MTP') or 'auto').strip().lower()
     if variables.compact():
@@ -539,53 +660,22 @@ def _drafter(path, kind, model=None):
         print('quanteeze: DeepSeek V4.1 split over GPUs: no drafting yet (its drafter reads what enters layers '
               'another rank holds)', file=sys.stderr, flush=True)
         return None
-    external = None if variables.compact() else mtp.resolve_external(path, kind)
-    if external is not None or mode == 'dflash2':
-        if external is None:
-            print(f'quanteeze: QUANTEEZE_MTP=dflash2: no DFlash2 drafter configured for {kind!r} '
-                  f'(set QUANTEEZE_DRAFTER)', file=sys.stderr, flush=True)
-            return None
-        _IN_MEMORY[0] = True
-        bits = None if variables.off('QUANTEEZE_MTP_BITS') else variables.integer('QUANTEEZE_MTP_BITS')
-        t = time.time()
-        try:
-            drafter = mtp.load_external(external, bits, target_model=model)
-        except Exception as e:
-            print(f'quanteeze: QUANTEEZE_DRAFTER={external}: failed to load ({type(e).__name__}: {e}); '
-                  f'decoding 1 token/pass', file=sys.stderr, flush=True)
-            return None
-        block = mtp.block_for(variables.get('QUANTEEZE_MTP_BLOCK'), kind)
-        if block is not None:
-            eff_block = mtp.set_block(drafter[0], block)
-        else:
-            mtp.OVERRIDE_BLOCK[0] = None
-            eff_block = getattr(drafter[0].config, 'runtime_block_size', None) or getattr(
-                drafter[0], 'default_runtime_block_size', None
-            )
-        print(f'quanteeze: {mtp.label_of(drafter[0])} drafter ({external}) read in {time.time() - t:.0f} s: '
-              f'{mtp.nbytes(drafter[0]) / 1e9:.1f} GB, at {mtp.bits_of(drafter[0])} bits, '
-              + (f'{eff_block} tokens a round' if eff_block is not None else 'mlx-vlm\'s tokens a round'),
-              file=sys.stderr, flush=True)
-        _at_exit('mtp', lambda: print(f'quanteeze: {mtp.label_of(drafter[0])}, {mtp.summary(drafter[0])}',
-                                       file=sys.stderr, flush=True))
-        return drafter
+    got = mtp.external(kind)
+    if got is not None:
+        drafter = _external_drafter(got, kind, model)
+        if drafter is not None:
+            return drafter
     _IN_MEMORY[0] = True
-    if mode != 'on':
+    eff_mode = 'auto' if mode == 'dflash2' else mode
+    if eff_mode != 'on':
         drafts, why = mtp.auto(path, kind)
         print(f'quanteeze: QUANTEEZE_MTP=auto: {"drafting" if drafts else "no drafting"}: {why}',
               file=sys.stderr, flush=True)
         if not drafts:
             return None
         _IN_MEMORY[0] = mtp.pays_in_memory(kind)
-    from .arch import deepseek_v41
-    exact = (variables.get('QUANTEEZE_MTP_EXACT') or 'bits').strip().lower()
-    deepseek_v41.EXACT[0] = exact != 'distribution'
-    from . import dspark
-    dspark.GATE[0] = None
-    if exact == 'distribution':
-        print('quanteeze: QUANTEEZE_MTP_EXACT=distribution: verify pass computes tokens together',
-              file=sys.stderr, flush=True)
-    bits = None if variables.off('QUANTEEZE_MTP_BITS') else variables.integer('QUANTEEZE_MTP_BITS')
+    _verify_exactness()
+    bits = mtp.drafter_bits(kind)
     if bits is not None and not requant.native(bits):
         print(f'quanteeze: QUANTEEZE_MTP_BITS={bits}: MLX computes no {bits}-bit experts on CUDA; using 2 bits',
               file=sys.stderr, flush=True)
@@ -637,7 +727,18 @@ def _at_exit(name, fn):
 
 
 def _let_go():
-    if not _AT_EXIT and not _SERVING and not _LOADED:
+    per_load.let_go()
+    _PREFILL['short'] = False
+    if _APC.get('off_gpu'):
+        if _APC.get('was') is None:
+            os.environ.pop('APC_MEMORY_MAX_GB', None)
+        else:
+            os.environ['APC_MEMORY_MAX_GB'] = _APC['was']
+        for m in list(_APC_MANAGERS):
+            _apc_restore_kept(m)
+        _APC['off_gpu'] = False
+    non_server = [k for k in _AT_EXIT if k not in _SERVER_EXITS]
+    if not non_server and not _SERVING and not _LOADED:
         return
     held = []
     if _SERVING.get('demand') is not None:
@@ -649,7 +750,10 @@ def _let_go():
     vision_ssd.IMAGES.clear()
     fitting.MODEL[0] = None
     leases.reset()
-    _AT_EXIT.clear()
+    from . import request_threads
+    request_threads.WHOLE[0] = False
+    for k in non_server:
+        _AT_EXIT.pop(k, None)
     _SERVING.clear()
     gc.collect()
     kept = set()
@@ -720,9 +824,15 @@ def _failures_let_go(gen):
         return
 
     def _notify_queues(queues, *items):
+        failed = False
         for item in items:
-            if isinstance(item, BaseException) and item.__traceback__ is not None:
-                traceback.clear_frames(item.__traceback__)
+            if isinstance(item, BaseException):
+                failed = True
+                if item.__traceback__ is not None:
+                    traceback.clear_frames(item.__traceback__)
+        if failed:
+            from . import request_threads
+            request_threads.passes_failed()
         return notify(queues, *items)
     _notify_queues.quanteeze = True
     gen._notify_queues = _notify_queues
@@ -776,7 +886,7 @@ def _hold_experts(source_or_path, passing=0):
         if (mx.metal.is_available() or mx.default_device() != mx.gpu or cuda_ple.integrated()
                 or q2_experts.in_memory(check_path)):
             return None
-        budget = (_room_kept() or 0) - ngram_prefetch.unread() - passing - HELD_AFTER
+        budget = (_room_kept() or 0) - ngram_prefetch.unread() // parallel.on_this_host() - passing - HELD_AFTER
         if budget <= 0:
             return None
     else:
@@ -832,27 +942,37 @@ def _room_kept(readings=None):
     """Host memory the server's copies may take: `fitting.host_room()`, and no more than the keeper's
     limit (`QUANTEEZE_KEEP_GB`) leaves beside the server's current footprint. Returns None where unknown."""
     room = fitting.host_room() if readings is None else fitting.host_room(readings)
+    left = _keeper_left(readings)
+    if left is None:
+        return room
+    return left if room is None else min(room, left)
+
+
+def _keeper_left(readings=None):
+    """What the keeper's limit (`QUANTEEZE_KEEP_GB`) leaves beside the server's current footprint, or
+    None when there is no limit or footprint cannot be read."""
     keeper = _KEEPER[0]
     if keeper is None or not keeper.limit:
-        return room
+        return None
     held = (readings or guards.Readings()).footprint()
     if held is None:
-        return room
-    left = max(0, int(keeper.limit - held))
-    return left if room is None else min(room, left)
+        return None
+    return max(0, int(keeper.limit - held))
 
 
 def _tables_room(path):
     """Host room auto allocates to n-gram tables: `_room_kept()` less every routed expert of `path`
     (`home.experts_bytes`) and `HELD_AFTER`; 0 when unavailable. Across multiple GPUs (`_tables_room_split`),
-    the host's shared room less what each rank on this host keeps for its own layer run."""
-    room = _room_kept() or 0
+    the host's shared room less what each rank on this host keeps for its own layer run, reading
+    `fitting.host_room()` once."""
+    share, left = fitting.host_room(), _keeper_left()
+    room = share if left is None else left if share is None else min(share, left)
     if not room or not path or not os.path.exists(str(path)):
         return 0
     try:
         runs = parallel.runs_here()
         if runs:
-            return _tables_room_split(path, runs, room)
+            return _tables_room_split(path, runs, share or 0, left)
         from .home import experts_bytes
         experts = experts_bytes(path)
     except Exception:
@@ -860,10 +980,10 @@ def _tables_room(path):
     return max(0, room - experts - HELD_AFTER)
 
 
-def _tables_room_split(path, runs, room):
+def _tables_room_split(path, runs, share=None, left=None, *, room=None):
     """`_tables_room` across multiple GPUs for ranks on this host owning `runs`: subtract the largest
-    per-rank expert + spare buffer need from `fitting.host_room()`, scaled by ranks sharing the host,
-    and bounded by `room` less this rank's own need."""
+    per-rank expert + spare buffer need from `share` (`fitting.host_room()`, read once), scaled by
+    ranks sharing the host, and bounded by `left` (`_keeper_left()`) less this rank's own need."""
     from .home import layer_experts_bytes
     by = layer_experts_bytes(path)
 
@@ -871,12 +991,24 @@ def _tables_room_split(path, runs, room):
         sizes = [by.get(layer, 0) for layer in run]
         return sum(sizes) + 2 * max(sizes, default=0) + HELD_AFTER
 
-    share = fitting.host_room() or 0
-    table = len(runs) * (share - max(need(run) for run in runs))
+    if share is None:
+        share = fitting.host_room() or 0
+        left = room
+    most = max(need(run) for run in runs)
+    table = len(runs) * (share - most)
     mine = need(parallel.owned() or runs[0])
-    if room < share:
-        table = min(table, room - mine)
+    if left is not None and left < share:
+        table = min(table, left - mine)
+    print(f'quanteeze: the n-gram tables\' room over {len(runs)} ranks: a rank\'s share of the host\'s memory '
+          f'{share / 1e9:.1f} GB, the most a rank\'s own copy needs {most / 1e9:.1f}'
+          + (f', the keeper\'s limit leaving {left / 1e9:.1f}' if left is not None else '')
+          + f': {max(0, table) / 1e9:.1f} GB', file=sys.stderr, flush=True)
     return max(0, int(table))
+
+
+def _gb_up(nbytes):
+    """`nbytes` in GB at one decimal, rounded up."""
+    return f'{-(-int(nbytes) // 100_000_000) / 10:.1f}'
 
 
 def _hold_tables(model, path=None):
@@ -897,6 +1029,10 @@ def _hold_tables(model, path=None):
         return None
     print(f'quanteeze: reading {held.bytes / 1e9:.1f} GB of the n-gram tables\' {held.total / 1e9:.1f} into '
           f'host memory (QUANTEEZE_HOST_NGRAM_GB {value})', file=sys.stderr, flush=True)
+    if held.left:
+        print(f'quanteeze: {held.left} array(s) of the n-gram tables, {held.left_bytes / 1e9:.3f} GB, left on '
+              f'disk: budget holds {held.bytes / 1e9:.3f} GB of {held.total / 1e9:.3f}; '
+              f'QUANTEEZE_HOST_NGRAM_GB={_gb_up(held.total)} holds them all', file=sys.stderr, flush=True)
 
     def done():
         try:
@@ -939,15 +1075,33 @@ def _load_from_page(path):
     vlm.get_cached_model(path, model_kind='text_generation')
 
 
+def _unload_from_page():
+    """Unload the active model and release host/accelerator caches until reloaded from the Home page."""
+    vlm = importlib.import_module('mlx_vlm.server.app')
+    unload = getattr(vlm, '_unload_model_cache_group', None)
+    if unload is not None:
+        unload('text_generation')
+    else:
+        vlm.unload_model_sync()
+    mtp.disable()
+    _let_go()
+    control.unloaded()
+    gc.collect()
+    mx.clear_cache()
+    allocator.trim()
+    print('quanteeze: the model was unloaded from the page: every generating request is refused until one is loaded there',
+          file=sys.stderr, flush=True)
+
+
 CACHE_SHARE = 0.03
 
 
 def _cache_limit():
     """MLX's limit on freed buffers it keeps, in bytes: QUANTEEZE_CACHE_GB (auto: 2 GB, and on a GPU
     no more than CACHE_SHARE of its working set)."""
-    text = (variables.get('QUANTEEZE_CACHE_GB') or 'auto').strip().lower()
+    text = (variables.get('QUANTEEZE_CACHE_GB', variables.at_start()) or 'auto').strip().lower()
     if text != 'auto':
-        return int(variables.number('QUANTEEZE_CACHE_GB') * 1e9)
+        return int(variables.number('QUANTEEZE_CACHE_GB', variables.at_start()) * 1e9)
     limit = int(2e9)
     if mx.default_device() == mx.gpu:
         budget = guards.recommended_budget()
@@ -956,10 +1110,37 @@ def _cache_limit():
     return limit
 
 
+LONG_CHECKPOINT_STEP = 16384
+
+
+def _safe_checkpoint_boundary(token_ids, desired, media_token_ids, *, max_prefix_tokens=None,
+                              allow_before_media=False):
+    """Return a checkpoint boundary near `desired` within `max_prefix_tokens` (`0` if none).
+
+    When `allow_before_media` is True (`apc_images` salts each prefix with the images inside it),
+    prefixes may end before later images as long as they do not split a media-token span in half.
+    """
+    from mlx_vlm import apc as _apc
+    if not allow_before_media:
+        return _apc.adjust_prefix_to_text_suffix_boundary(
+            token_ids, desired, media_token_ids, max_prefix_tokens=max_prefix_tokens
+        )
+    max_len = len(token_ids) - 1 if max_prefix_tokens is None else int(max_prefix_tokens)
+    pos = int(desired)
+    if max_len <= 0 or pos <= 0:
+        return 0
+    for start, end in _apc.media_token_spans(token_ids, media_token_ids):
+        if start < pos < end:
+            pos = end if end <= max_len else start
+            break
+    return pos if 0 < pos <= max_len else 0
+
+
 def _checkpoints_a_prompt(coordinator_cls=None):
-    """mlx-vlm's checkpoints of a prompt (APCCoordinator.checkpoint_lengths) as with two entries
-    kept: its end and the last interval before it, however many APC_CHECKPOINT_ENTRIES keeps."""
-    from mlx_vlm.apc import adjust_prefix_to_text_suffix_boundary
+    """mlx-vlm's checkpoints of a prompt (`APCCoordinator.checkpoint_lengths`): its end, the last
+    interval before it, multiples of `PROMPT_STEP` (or `LONG_CHECKPOINT_STEP` on long in-memory
+    prompts), and the opening of the last two user turns (`TURN_STARTS`) at least an interval
+    before the end."""
     if coordinator_cls is None:
         from mlx_vlm.apc_coordinator import APCCoordinator as coordinator_cls
     if getattr(coordinator_cls, '_quanteeze_two', False):
@@ -975,9 +1156,22 @@ def _checkpoints_a_prompt(coordinator_cls=None):
             return [final]
         interval = ((interval + m.block_size - 1) // m.block_size) * m.block_size
         last = ((final - 1) // interval) * interval
+        allow = apc_images.INSTALLED[0]
         lengths = {final}
         if last >= interval:
-            boundary = adjust_prefix_to_text_suffix_boundary(token_ids, last, media_token_ids, max_prefix_tokens=final)
+            boundary = _safe_checkpoint_boundary(
+                token_ids, last, media_token_ids, max_prefix_tokens=final, allow_before_media=allow
+            )
+            if m.exact_cache_min_tokens <= boundary < final:
+                lengths.add(boundary)
+        model = getattr(self, 'model', None)
+        step = _attribute(model, PROMPT_STEP) or LONG_CHECKPOINT_STEP
+        starts = list(range(step, final - interval + 1, step)) if step and step >= interval else []
+        starts += _turns_before(token_ids, turn_starts(model), interval, final - interval)
+        for start in starts:
+            boundary = _safe_checkpoint_boundary(
+                token_ids, start, media_token_ids, max_prefix_tokens=final, allow_before_media=allow
+            )
             if m.exact_cache_min_tokens <= boundary < final:
                 lengths.add(boundary)
         return sorted(lengths)
@@ -985,12 +1179,131 @@ def _checkpoints_a_prompt(coordinator_cls=None):
     coordinator_cls._quanteeze_two = True
 
 
+TURN_STARTS = '_quanteeze_turn_starts'
+PROMPT_STEP = '_quanteeze_prompt_step'
+USER_TURN_OPENINGS = ('<|user|>', '<｜User｜>', '<|im_start|>user', '<start_of_turn>user')
+
+
+def _mark_turn_starts(model, processor):
+    """Mark 1- or 2-token user-turn opening sequences on `model` (Qwen ChatML, GLM, Gemma)."""
+    tok = getattr(processor, 'tokenizer', processor)
+    encode = getattr(tok, 'encode', None)
+    if not callable(encode):
+        return
+    unk = getattr(tok, 'unk_token_id', None)
+    found = set()
+    for text in USER_TURN_OPENINGS:
+        try:
+            ids = [int(i) for i in encode(text, add_special_tokens=False)]
+        except Exception:
+            continue
+        if not ids or (unk is not None and unk in ids):
+            continue
+        if len(ids) == 1:
+            found.add(ids[0])
+        elif len(ids) == 2:
+            found.add((ids[0], ids[1]))
+    if found:
+        mark(model, TURN_STARTS, frozenset(found))
+
+
+def mark(model, name, value):
+    """Set attribute `name` on `model` and `model.language_model` (which mlx-vlm batches and APC hold)."""
+    for m in (model, getattr(model, 'language_model', None)):
+        if m is not None:
+            object.__setattr__(m, name, value)
+
+
+def _attribute(model, name):
+    """Read attribute `name` from `model` or `model.language_model`, or None."""
+    for m in (model, getattr(model, 'language_model', None)):
+        found = getattr(m, name, None) if m is not None else None
+        if found:
+            return found
+    return None
+
+
+def turn_starts(model):
+    """Token IDs (or 2-token tuples) that open user turns on `model`, or empty frozenset."""
+    return _attribute(model, TURN_STARTS) or frozenset()
+
+
+def _turns_before(token_ids, starts, least, most, count=2):
+    """Positions of the last `count` user-turn openings in `starts` within `token_ids[least : most + 1]`."""
+    if not starts or most < least:
+        return []
+    found = []
+    n = len(token_ids)
+    for i in range(min(most, n - 1), least - 1, -1):
+        tok = token_ids[i]
+        if tok in starts or (i + 1 < n and (tok, token_ids[i + 1]) in starts):
+            found.append(i)
+            if len(found) == count:
+                break
+    return found
+
+
+def _cut_prefills_kept(batch_cls=None):
+    """When a chunked prefill row is removed before completion (request cancelled), store its already
+    processed tokens as an APC checkpoint so a retry resumes from where it stopped."""
+    batch_cls = batch_cls or PromptProcessingBatch
+    if getattr(batch_cls, '_quanteeze_kept', False):
+        return
+    remove = batch_cls.remove
+
+    def kept(self, uid):
+        try:
+            _keep_the_read(self, self.uids.index(uid))
+        except Exception as e:
+            print(f'quanteeze: APC: a cancelled prefill\'s tokens not kept: {e}', file=sys.stderr, flush=True)
+        return remove(self, uid)
+    batch_cls.remove = kept
+    batch_cls._quanteeze_kept = True
+
+
+def _keep_the_read(batch, index):
+    """Store row `index`'s tokens processed so far as an APC checkpoint; return stored length or 0."""
+    from mlx_vlm import apc as _apc
+    metas = getattr(batch, '_apc_meta', None) or []
+    manager = getattr(batch, '_apc_manager', None)
+    if manager is None or not batch._apc_uses_checkpoints() or index >= len(metas) or metas[index] is None:
+        return 0
+    meta = metas[index]
+    ids = meta.get('full_input_ids')
+    lengths = meta.get('checkpoint_lengths') or [int(meta.get('checkpoint_len') or 0)]
+    if ids is None:
+        return 0
+    if batch._right_pad_per_row is not None and batch._processed_prompt_columns >= batch._suffix_lens[index]:
+        return 0
+    read = batch._row_real_tokens_processed(index)
+    stored = max(int(meta.get('prefix_len') or 0), int(meta.get('checkpoint_stored') or 0))
+    least = int(getattr(manager, 'exact_cache_min_tokens', 1) or 1)
+    if not (max(stored, least - 1) < read < max(lengths)):
+        return 0
+    media = _apc.multimodal_token_ids_from_config(getattr(batch.model, 'config', None))
+    allow = apc_images._plan(meta.get('extra_hash', 0)) is not None
+    if _safe_checkpoint_boundary(ids, read, media, max_prefix_tokens=read, allow_before_media=allow) != read:
+        return 0
+    coordinator = getattr(batch, '_apc_coordinator', None)
+    if coordinator is not None:
+        kept = coordinator.store_checkpoint(ids[:read], batch.prompt_cache, batch_idx=index,
+                                            extra_hash=meta.get('extra_hash', 0))
+    else:
+        cache = _apc.snapshot_prompt_cache_row(batch.prompt_cache, index)
+        kept = cache is not None and manager.store_exact_cache(ids[:read], cache, extra_hash=meta.get('extra_hash', 0))
+    if not kept:
+        return 0
+    meta['checkpoint_stored'] = read
+    print(f'quanteeze: APC: a cancelled prefill kept {read} of its {len(ids)} tokens', file=sys.stderr, flush=True)
+    return read
+
+
 def _out_of_memory(error):
     text = str(error)
     return 'Insufficient Memory' in text or 'OutOfMemory' in text
 
 
-_APC = dict(given=False, off_gpu=False)
+_APC = dict(given=False, off_gpu=False, was=None)
 _APC_MANAGERS = weakref.WeakSet()
 
 
@@ -1003,7 +1316,7 @@ def _apc_seen(manager_cls=APCManager):
         init(self, *args, **kwargs)
         _APC_MANAGERS.add(self)
         if _APC['off_gpu']:
-            self.memory_max_bytes = 0
+            _apc_none_kept(self)
     manager_cls.__init__ = __init__
     manager_cls._quanteeze_seen = True
 
@@ -1069,13 +1382,40 @@ def _prefill_short():
     return True
 
 
+APC_RESERVE_NONE_KEPT = 1 << 30   # APC reserve when keeping no prompts in memory (mlx-vlm's minimum)
+
+
+def _apc_none_kept(manager):
+    """Set `manager.memory_max_bytes = 0` and cap `manager.memory_reserve_bytes` at `APC_RESERVE_NONE_KEPT`
+    (unless `APC_MEMORY_RESERVE_GB` was explicitly set in `os.environ`) so disk restores do not demand 10%
+    of Metal's recommended working set alongside `2 * restore_bytes` when the memory tier is disabled."""
+    if not hasattr(manager, '_quanteeze_apc_was'):
+        manager._quanteeze_apc_was = (manager.memory_max_bytes, getattr(manager, 'memory_reserve_bytes', None))
+    manager.memory_max_bytes = 0
+    if 'APC_MEMORY_RESERVE_GB' not in os.environ and hasattr(manager, 'memory_reserve_bytes'):
+        manager.memory_reserve_bytes = min(manager.memory_reserve_bytes, APC_RESERVE_NONE_KEPT)
+
+
+def _apc_restore_kept(manager):
+    """Restore `manager`'s memory-tier limits saved by `_apc_none_kept` when unloading a large model."""
+    was = getattr(manager, '_quanteeze_apc_was', None)
+    if was is None:
+        return
+    manager.memory_max_bytes = was[0]
+    if was[1] is not None and hasattr(manager, 'memory_reserve_bytes'):
+        manager.memory_reserve_bytes = was[1]
+    delattr(manager, '_quanteeze_apc_was')
+
+
 def _apc_off_the_gpu():
     if _APC['given'] or mx.default_device() != mx.gpu:
         return False
+    if not _APC['off_gpu']:
+        _APC['was'] = os.environ.get('APC_MEMORY_MAX_GB')
     _APC['off_gpu'] = True
     os.environ['APC_MEMORY_MAX_GB'] = '0'
     for m in list(_APC_MANAGERS):
-        m.memory_max_bytes = 0
+        _apc_none_kept(m)
     if os.environ.get('APC_ENABLED', '0').lower() in ('1', 'true', 'yes'):
         disk = os.environ.get('APC_DISK_ENABLED', '1').lower() in ('1', 'true', 'yes')
         print('quanteeze: the prompt cache (APC) keeps none in the GPU, whose memory the experts fill: '
@@ -1338,6 +1678,7 @@ def main():
         print(f'quanteeze: {line}', file=sys.stderr, flush=True)
     for line in control.start():
         print(f'quanteeze: {line}', file=sys.stderr, flush=True)
+    variables.take_start_snapshot()
     _numpy_huge_pages()
     _warn_other_servers()
     parallel.launch()
@@ -1356,6 +1697,7 @@ def main():
     os.environ.setdefault('APC_DISK_ENABLED', '1')
     os.environ.setdefault('APC_HASH', 'sha256')
     _APC['given'] = 'APC_MEMORY_MAX_GB' in os.environ
+    _APC['was'] = os.environ.get('APC_MEMORY_MAX_GB')
     os.environ.setdefault('APC_MEMORY_MAX_GB', '4')
     os.environ.setdefault('APC_CHECKPOINT_ENTRIES', '32')
     apc_disk.ON[0] = not variables.off('QUANTEEZE_APC_ENCRYPT')
@@ -1367,6 +1709,7 @@ def main():
             if any(apc_disk.STATS.values()) else None
         )
     _checkpoints_a_prompt()
+    _cut_prefills_kept()
     _apc_seen()
     _apc_reads_free_memory()
     if not any(a == '--host' or a.startswith('--host=') for a in sys.argv[1:]):
@@ -1430,6 +1773,7 @@ def main():
         atexit.register(lambda: print(f'quanteeze: V4.1 verify indexer, {deepseek_v41.GROUP_STATS}',
                                       file=sys.stderr, flush=True) if deepseek_v41.GROUP_CHOICE else None)
     expert_qmv.ON[0] = not variables.off('QUANTEEZE_EXPERT_QMV')
+    expert_qmv.VERIFY[0] = not variables.off('QUANTEEZE_EXPERT_QMV_VERIFY_FUSED')
     kquant_qmv.ON[0] = not variables.off('QUANTEEZE_KQUANT_QMV')
     gguf_qmv.ON[0] = kquant_qmv.ON[0]
     hyper.ON[0] = not variables.off('QUANTEEZE_HC_KERNELS')
@@ -1455,11 +1799,14 @@ def main():
     cuda_experts.ON[0] = not variables.off('QUANTEEZE_CUDA_EXPERTS')
     cuda_kernels.FUSE[0] = not variables.off('QUANTEEZE_CUDA_FUSE')
     cuda_attn.ON[0] = not variables.off('QUANTEEZE_CUDA_ATTN')
+    cuda_v41.ATTN_ON[0] = cuda_attn.ON[0]
     cuda_attn.ROWS_ON[0] = not variables.off('QUANTEEZE_CUDA_ATTN_ROWS')
     if cuda_attn.ON[0] and cuda_attn.ROWS_ON[0]:
         cuda_attn.install_masks()
     atexit.register(lambda: print(f'quanteeze: the PLE layer\'s kernels, {cuda_ple_layer.summary()}', file=sys.stderr,
                                   flush=True) if cuda_ple_layer.CHOICE else None)
+    atexit.register(lambda: print(f'quanteeze: the 8-bit keys\' attention, {kv_bits.summary()}', file=sys.stderr,
+                                  flush=True) if kv_bits.CHOICE else None)
     atexit.register(lambda: print(f'quanteeze: the full attention\'s kernels, {cuda_attn.summary()}', file=sys.stderr,
                                   flush=True) if cuda_attn.CHOICE or cuda_attn.DECLINED else None)
     cuda_head.ON[0] = not variables.off('QUANTEEZE_CUDA_HEAD')
@@ -1479,7 +1826,7 @@ def main():
         atexit.register(lambda: print(f'quanteeze: the Engram\'s and embedding\'s row kernels, {cuda_engram.summary()}',
                                       file=sys.stderr, flush=True) if cuda_engram.CHOICE else None)
     atexit.register(lambda: print(f'quanteeze: DeepSeek V4.1 CUDA kernels, {cuda_v41.summary()}', file=sys.stderr,
-                                  flush=True) if cuda_v41.STATS['checked'] or cuda_v41.ROUTE[0] or cuda_v41.FP8_CHOICE else None)
+                                  flush=True) if cuda_v41.STATS['checked'] or cuda_v41.ROUTE[0] or cuda_v41.FP8_CHOICE or cuda_v41.ATTN.get('installed') else None)
     atexit.register(lambda: print(f'quanteeze: the MoE blocks\' kernels, {cuda_moe.summary()}', file=sys.stderr,
                                   flush=True) if cuda_moe.CHOICE else None)
     atexit.register(lambda: print(f'quanteeze: CUDA experts, {cuda_experts.summary()}', file=sys.stderr,
@@ -1522,8 +1869,10 @@ def main():
     _experts_gguf(_uniform_bits()), _demand_variant()
     print('quanteeze: each request\'s tokens through ' + ', '.join(stream.stages(generation.ResponseGenerator))
           + ' (innermost first)', file=sys.stderr, flush=True)
-    page = control.install(_server.app, loader=_load_from_page, check=_check_load)
+    page = control.install(_server.app, loader=_load_from_page, check=_check_load, unloader=_unload_from_page)
     parallel.install(generation.ResponseGenerator)
+    from . import forced
+    forced.install()
     print(f'quanteeze: control routes ask for a token; Browser UI at '
           f'{page.replace(control.PAGE_PATH, control.HOME_PATH, 1)}, all settings at {page}',
           file=sys.stderr, flush=True)

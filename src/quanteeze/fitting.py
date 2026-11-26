@@ -72,13 +72,13 @@ def quantized_bytes(weights, bits):
 
 def reserve():
     if (
-        not variables.is_set('QUANTEEZE_MEMORY_RESERVE')
+        not variables.is_set('QUANTEEZE_MEMORY_RESERVE', variables.at_load())
         and MODEL[0] in RESERVE_ON_CUDA
         and not mx.metal.is_available()
         and mx.default_device() == mx.gpu
     ):
         return RESERVE_ON_CUDA[MODEL[0]]
-    return variables.number('QUANTEEZE_MEMORY_RESERVE')
+    return variables.number('QUANTEEZE_MEMORY_RESERVE', variables.at_load())
 
 
 HOST_RESERVE = 0.1               # share of the host's memory (or the job's cgroup limit) host_room() leaves

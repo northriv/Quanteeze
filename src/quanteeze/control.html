@@ -124,7 +124,7 @@ label { color: var(--ink-2); }
 
   <section class="card" id="model-card" hidden>
     <h2>Model</h2>
-    <p class="note">Load another model or change uniform expert bit-width without a restart. Requests that generate meanwhile are asked to come back (503) once the running ones finish.</p>
+    <p class="note">Load another model or change expert bit-width without a restart. Requests that generate meanwhile are asked to come back (503) once the running ones finish.</p>
     <div id="model-now"></div>
     <div id="model-progress" hidden>
       <div class="meter"><div id="model-bar"></div></div>
@@ -133,17 +133,17 @@ label { color: var(--ink-2); }
     <div class="bar" style="margin-top:10px">
       <input type="text" id="model-path" list="models-found" placeholder="a checkpoint's directory (or pick one)" aria-label="Model checkpoint" style="flex:1 1 320px">
       <datalist id="models-found"></datalist>
-      <select id="model-bits" aria-label="Uniform expert bits">
+      <select id="model-bits" aria-label="Expert bits">
         <option value="">Original precision</option>
-        <option value="8">8 bits (uniform least-squares)</option>
-        <option value="4">4 bits (uniform least-squares)</option>
+        <option value="8">8 bits (least-squares)</option>
+        <option value="4">4 bits (least-squares)</option>
         <option value="mxfp4">MXFP4 (microscaling FP4)</option>
         <option value="q3_k">Q3_K (ggml K-quant)</option>
-        <option value="3">3 bits (uniform least-squares)</option>
+        <option value="3">3 bits (least-squares)</option>
         <option value="q2_k">Q2_K (ggml K-quant)</option>
         <option value="iq2_xs">IQ2_XS (ggml importance grid)</option>
-        <option value="2">2 bits (uniform least-squares)</option>
-        <option value="1">1 bit (uniform least-squares)</option>
+        <option value="2">2 bits (least-squares)</option>
+        <option value="1">1 bit (least-squares)</option>
       </select>
       <button class="primary" id="model-load">Load</button>
     </div>
@@ -315,7 +315,7 @@ function showModel() {
   const line = el('div', {class: 'tags'});
   line.append(el('span', {class: 'name'}, m.model || m.target || '(no model loaded)'));
   line.append(el('span', {class: 'tag' + (m.state === 'idle' ? '' : ' wait')}, m.state));
-  if (m.bits) line.append(el('span', {class: 'tag'}, `${m.bits}-bit uniform`));
+  if (m.bits) line.append(el('span', {class: 'tag'}, /^\d+$/.test(String(m.bits)) ? `${m.bits}-bit experts` : `${String(m.bits).toUpperCase()} experts`));
   if (m.from_ssd_gb) line.append(el('span', {class: 'tag'}, `SSD on-demand (${m.from_ssd_gb} GB)`));
   if (m.served) line.append(el('span', {class: 'tag', title: 'Every request is served by it, whatever model it names'}, 'chosen here'));
   now.append(line);

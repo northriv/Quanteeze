@@ -28,7 +28,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from . import requant, variables
+from . import per_load, requant, variables
 
 ACTIVE = [None]                       # (drafter, kind) once enabled
 CHUNK = 32                            # experts lowered at a time
@@ -45,13 +45,25 @@ SLOWER_IN_MEMORY = ()                 # not enabled under auto once every expert
 SLOWER_IN_MEMORY_CUDA = ('qwen4_exp',)   # not enabled on CUDA once every expert is in memory
 SLOWER_IN_MEMORY_WHY = ('its rounds cost more than the tokens they win with every expert in memory; '
                         'on demand from SSD, where the reads wait, it drafts')
+AUTO_BITS = {'qwen4_exp': 4}          # QUANTEEZE_MTP_BITS=auto: routed experts' bits by target model type
+AUTO_BITS_ELSE = 2
+
+
+def drafter_bits(kind):
+    """Return target bit-width for the drafter's routed experts (`None` when off)."""
+    if variables.off('QUANTEEZE_MTP_BITS', variables.at_load()):
+        return None
+    value = (variables.get('QUANTEEZE_MTP_BITS', variables.at_load()) or 'auto').strip().lower()
+    return AUTO_BITS.get(kind, AUTO_BITS_ELSE) if value == 'auto' else int(value)
+
+
 GATHER_MS = 2000                      # requests gathered before a drafting batch starts (MLX_VLM_SPEC_BATCH_COALESCE_MS
                                       # unset): bursts can arrive over a second, and a batch takes none later
-BURST_S = 300                         # ... only within this of two requests coming GATHER_MS apart or less: one
-                                      # asked alone, as in a chat, starts at once
+BURST_S = 300                         # ... only within this of a request coming while another was generating: one
+                                      # asked alone, or each after the last's answer, starts at once
 WAIT_S = 3600                         # a request waiting for a drafting batch to end: given up after this with no
                                       # token (mlx-vlm's 600 s otherwise)
-_COMING = {'last': None, 'burst': None}    # when the last request came, and the last two together (monotonic)
+_COMING = {'flying': set(), 'burst': None}    # in-flight request keys, and when one arrived while another ran
 
 
 def head(path):
@@ -94,8 +106,8 @@ def pays_in_memory(kind):
     return mx.metal.is_available() or kind not in SLOWER_IN_MEMORY_CUDA
 
 
-def _local_external(repo):
-    """Return local checkpoint path for `repo` if present in model roots or HF cache, else `repo`."""
+def _local(repo):
+    """Local checkpoint directory for `repo` (path, model roots, or HF cache), else None."""
     from . import home
     expanded = Path(repo).expanduser()
     if expanded.is_dir():
@@ -112,21 +124,83 @@ def _local_external(repo):
         )
         if snaps:
             return str(snaps[-1])
-    return repo
+    return None
+
+
+def _local_external(repo):
+    """Return local checkpoint path for `repo` if present in model roots or HF cache, else `repo`."""
+    return _local(repo) or repo
+
+
+def external(kind):
+    """Return `(local_dir_or_None, asked_name)` for `QUANTEEZE_DRAFTER` / `QUANTEEZE_MTP=dflash2`, else None."""
+    explicit = (variables.get('QUANTEEZE_DRAFTER', variables.at_load()) or '').strip()
+    if explicit and explicit.lower() not in ('off', 'none'):
+        if explicit.lower() == 'dflash2':
+            repo = DFLASH2_REPOS.get(kind)
+            if repo is None:
+                return None, f'no DFlash2 drafter configured for {kind!r}'
+            return _local(repo), repo
+        return _local(explicit), explicit
+    mode = (variables.get('QUANTEEZE_MTP', variables.at_load()) or 'auto').strip().lower()
+    if mode == 'dflash2':
+        repo = DFLASH2_REPOS.get(kind)
+        if repo is None:
+            return None, f'no DFlash2 drafter configured for {kind!r}'
+        return _local(repo), repo
+    return None
+
+
+def known_drafter(kind):
+    """Whether `QUANTEEZE_DRAFTER` (or `QUANTEEZE_MTP=dflash2`) names a drafter for model type `kind`."""
+    asked = (variables.get('QUANTEEZE_DRAFTER', variables.at_load()) or 'off').strip().lower()
+    if asked not in ('off', 'none', ''):
+        return asked != 'dflash2' or kind in DFLASH2_REPOS
+    mode = (variables.get('QUANTEEZE_MTP', variables.at_load()) or 'auto').strip().lower()
+    return mode == 'dflash2' and kind in DFLASH2_REPOS
+
+
+def drafters_for(kind):
+    """External drafters offered on the Home page for model type `kind` (`path` is None when not local)."""
+    repo = DFLASH2_REPOS.get(kind)
+    return [] if repo is None else [{'key': 'dflash2', 'name': 'DFlash2', 'repo': repo, 'path': _local(repo)}]
+
+
+def drafter_checkpoint(path):
+    """Whether `path` is a speculative drafter checkpoint rather than a standalone target model or judge."""
+    try:
+        cfg = json.loads((Path(path) / 'config.json').read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    mtype = str(cfg.get('model_type', '')).lower()
+    archs = [str(a) for a in (cfg.get('architectures') or ())]
+    return (
+        mtype.endswith('_mtp')
+        or mtype in ('dflash', 'dflash2', 'dspark', 'eagle3')
+        or 'dflash_config' in cfg
+        or any('DraftModel' in a or 'DSparkModel' in a for a in archs)
+    )
+
+
+def name(drafter):
+    """Human-facing drafter name for the Home page live tile and catalog."""
+    cls = f'{type(drafter).__module__}.{type(drafter).__name__}'.lower()
+    for token, label in (('dflash2', 'DFlash2'), ('dspark', 'DSpark'), ('dflash', 'DFlash'), ('eagle', 'EAGLE-3')):
+        if token in cls:
+            return label
+    return 'MTP head'
 
 
 def resolve_external(path, kind):
     """Return external drafter source (`repo` or path) for `QUANTEEZE_DRAFTER` / `QUANTEEZE_MTP=dflash2`, else None."""
     del path
-    explicit = (variables.get('QUANTEEZE_DRAFTER') or '').strip()
-    if explicit and explicit.lower() not in ('off', 'none'):
-        target = DFLASH2_REPOS.get(kind) if explicit.lower() == 'dflash2' else explicit
-        return None if not target else _local_external(target)
-    mode = (variables.get('QUANTEEZE_MTP') or 'auto').strip().lower()
-    if mode == 'dflash2':
-        target = DFLASH2_REPOS.get(kind)
-        return None if not target else _local_external(target)
-    return None
+    got = external(kind)
+    if got is None:
+        return None
+    where, asked = got
+    return where or asked
 
 
 def _quantize_dense_drafter(drafter, bits):
@@ -164,6 +238,9 @@ def load_external(source, bits=2, target_model=None):
     else:
         _quantize_dense_drafter(drafter, bits)
     mx.eval(drafter.parameters())
+    from . import expert_qmv
+    for sw in switches(drafter):
+        expert_qmv.install_switch(sw)
     filter_caches(drafter)
     return drafter, kind
 
@@ -173,7 +250,7 @@ def load(path, bits=2):
     (None: as the checkpoint stores them).  Returns (drafter, kind)."""
     from mlx_vlm.speculative.drafters import load_drafter
     from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
-    from . import dspark
+    from . import dspark, expert_qmv
     if dspark.available(path):                         # DeepSeek V4.1's DSpark, mlx-vlm's DFlash rounds
         return dspark.load(path, bits)
     config = json.loads((Path(path) / 'config.json').read_text())
@@ -184,6 +261,8 @@ def load(path, bits=2):
     if bits is not None:
         lower(drafter, bits)
     mx.eval(drafter.parameters())
+    for sw in switches(drafter):
+        expert_qmv.install_switch(sw)
     filter_caches(drafter)
     return drafter, kind
 
@@ -357,6 +436,19 @@ def _leaves(tree, prefix=''):
         yield prefix[:-1], tree
 
 
+STRUCTURED = '_quanteeze_structured'
+
+
+class Structured(list):
+    """Logits processors carrying structured output (`response_format`): never drafted (`install_batches`)."""
+
+
+def structured(row):
+    """Whether a `BatchGenerator` queued row `(uid, prompt, max_tokens, kwargs, logits_processors, ...)`
+    carries structured output."""
+    return isinstance(row, tuple) and len(row) > 4 and isinstance(row[4], Structured)
+
+
 def install(generator_cls):
     """The server's generator (mlx-vlm's ResponseGenerator) drafts with the drafter once enabled,
     and a request's thinking budget is taken off while it does.
@@ -369,8 +461,11 @@ def install(generator_cls):
     request: 2 s a turn).  Setting MLX_VLM_SPEC_BATCH_COALESCE_MS gathers the first batch too.
     A request waiting for a drafting batch to end is given up after WAIT_S with no token, not
     mlx-vlm's 600 s, nor never, which a generation stuck for any other cause would wait."""
+    import copy
     import os
+    import threading
     import time
+    import weakref
 
     from mlx_vlm import server as _server
     from mlx_vlm.server import generation
@@ -413,14 +508,43 @@ def install(generator_cls):
             self.__dict__[own] = value
         setattr(generator_cls, name, property(get, set_))
 
-    said = []
+    said, said_structured = [], []
+    make = generator_cls.__dict__.get('_make_logits_processors')
+    if make is not None and not getattr(make, 'quanteeze', False):
+
+        def _make_logits_processors(self, args, input_ids=None):
+            held = vars(args).get(STRUCTURED) if args is not None else None
+            if held is None:
+                return make(self, args, input_ids)
+            mine = copy.copy(args)
+            vars(mine).pop(STRUCTURED, None)
+            mine.logits_processors = held
+            return Structured(make(self, mine, input_ids) or [])
+        _make_logits_processors.quanteeze = True
+        generator_cls._make_logits_processors = _make_logits_processors
+
+    lock, keys = threading.Lock(), iter(range(1 << 62))
+
+    def done(key):
+        with lock:
+            _COMING['flying'].discard(key)
 
     def before(request):
-        now = time.monotonic()
-        if _COMING['last'] is not None and now - _COMING['last'] <= GATHER_MS / 1000:
-            _COMING['burst'] = now
-        _COMING['last'] = now
+        with lock:
+            key = next(keys)
+            if _COMING['flying']:
+                _COMING['burst'] = time.monotonic()
+            _COMING['flying'].add(key)
+        request.mtp_flying = key
+        weakref.finalize(request, done, key)
         args = request.args
+        if ACTIVE[0] is not None and args is not None and getattr(args, 'logits_processors', None) is not None:
+            vars(args)[STRUCTURED] = args.logits_processors
+            args.logits_processors = None
+            if not said_structured:
+                said_structured.append(True)
+                print('quanteeze: MTP drafting: a request with structured output (response_format) is served '
+                      'undrafted (mlx-vlm refuses it with a drafter)', file=sys.stderr, flush=True)
         if ACTIVE[0] is not None and args is not None and getattr(args, 'thinking_budget', None) is not None:
             args.thinking_budget = None
             if not said:
@@ -428,32 +552,141 @@ def install(generator_cls):
                 print('quanteeze: MTP drafting: a request\'s thinking budget is taken off (mlx-vlm refuses it '
                       'with a drafter)', file=sys.stderr, flush=True)
 
-    stream.add(generator_cls, 'mtp', before=before)
+    def wrap(request, tokens):
+        return _Flying(tokens, lambda: done(request.mtp_flying))
+
+    stream.add(generator_cls, 'mtp', wrap=wrap, before=before)
+
+
+class _Flying:
+    """Wrap a request's token iterator so `_COMING['flying']` stays populated only while generating."""
+
+    def __init__(self, tokens, done):
+        self._tokens, self._done = tokens, done
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._tokens)
+        except BaseException:
+            self._done()
+            raise
+
+    def close(self):
+        self._done()
+        return self._tokens.close()
+
+    def __getattr__(self, attr):
+        return getattr(self._tokens, attr)
 
 
 def install_batches(batch_cls):
     """`mlx-vlm`'s `BatchGenerator` drafts only for a batch that starts with one request; when
-    multiple requests are batched together, they decode without the drafter."""
+    multiple requests are batched together, they decode without the drafter.
+
+    A row carrying structured output (`Structured` / `response_format`) is never drafted: a batch it
+    starts runs undrafted, and while a drafting batch is active, structured rows wait for it to end."""
     step = batch_cls._next
 
     def _next(self, **kwargs):
         own = self.__dict__.setdefault('_quanteeze_drafter', (self.draft_model, self.draft_kind))
+        held = []
         if own[0] is not None and self._prompt_batch is None and self._unprocessed_sequences \
                 and not len(self._generation_batch):
-            alone = min(self.prefill_batch_size, len(self._unprocessed_sequences)) == 1
+            first = self._unprocessed_sequences[:max(1, self.prefill_batch_size)]
+            alone = len(first) == 1 and not structured(first[0])
             self.draft_model, self.draft_kind = own if alone else (None, None)
-        return step(self, **kwargs)
+        elif self.draft_model is not None and self._unprocessed_sequences:
+            held = [s for s in self._unprocessed_sequences if structured(s)]
+            if held:
+                self._unprocessed_sequences = [s for s in self._unprocessed_sequences if not structured(s)]
+        try:
+            return step(self, **kwargs)
+        finally:
+            if held:
+                self._unprocessed_sequences = sorted(self._unprocessed_sequences + held, key=lambda s: len(s[1]))
     batch_cls._next = _next
 
 
 def enable(drafter, kind='mtp'):
-    """Draft with `drafter` from the next request on."""
+    """Draft with `drafter` from the next request on, resetting cross-thread round counters."""
     ACTIVE[0] = (drafter, kind)
+    count_rounds()
+    ext = _drafts()
+    if ext is not None:
+        ext.reset()
 
 
+@per_load.on_let_go
 def disable():
     ACTIVE[0] = None
     OVERRIDE_BLOCK[0] = None
+
+
+_DRAFTS = {}
+COUNTS_ITSELF = '_quanteeze_counts_itself'
+
+
+def _drafts():
+    """Return `native_ext`'s `_drafts` module unless `QUANTEEZE_NATIVE` is off or build fails."""
+    from . import native_ext
+    key = native_ext.mode()
+    if key not in _DRAFTS:
+        _DRAFTS[key] = (
+            native_ext.extension('drafts', with_mlx=False, with_stm=False, quiet=(key == 'auto'))
+            if native_ext.allowed(True)
+            else None
+        )
+    return _DRAFTS[key]
+
+
+def count_round(draft_model, accepted, draft_count):
+    """Record one speculative round in C++ (`vendor/drafts/drafts.cpp`) across threads and copies."""
+    del draft_model
+    ext = _drafts()
+    if ext is not None:
+        ext.add(1, int(draft_count), float(accepted))
+
+
+def _counted(record):
+    def recorded(draft_model, accepted, draft_count):
+        out = record(draft_model, accepted, draft_count)
+        if not getattr(type(draft_model), COUNTS_ITSELF, False):
+            count_round(draft_model, accepted, draft_count)
+        return out
+    recorded.quanteeze_counted = True
+    return recorded
+
+
+def count_rounds():
+    """Wrap `mlx_vlm.speculative.{mtp,dflash,eagle3}._record_speculative_round` once so rounds on
+    per-request shallow drafter copies accumulate in C++ (`_drafts`). Drafters marked `COUNTS_ITSELF`
+    (such as DSpark, whose gate adjusts `draft_count`) record directly via `count_round`."""
+    import importlib
+    for mod_name in ('mtp', 'dflash', 'eagle3'):
+        try:
+            module = importlib.import_module(f'mlx_vlm.speculative.{mod_name}')
+        except ImportError:
+            continue
+        record = getattr(module, '_record_speculative_round', None)
+        if record is not None and not getattr(record, 'quanteeze_counted', False):
+            module._record_speculative_round = _counted(record)
+
+
+def counted(drafter):
+    """`(rounds, drafted, accepted)` since `enable()`: C++ cross-thread totals when `_drafts` is active,
+    else `mlx-vlm`'s attributes on `drafter`."""
+    ext = _drafts()
+    if ext is not None:
+        rounds, drafted, accepted = ext.read()
+        return int(rounds), int(drafted), float(accepted)
+    return (
+        int(getattr(drafter, 'speculative_total_rounds', 0)),
+        int(getattr(drafter, 'speculative_total_drafted', 0)),
+        float(getattr(drafter, 'speculative_total_accepted', 0.0)),
+    )
 
 
 def label_of(drafter):
@@ -470,10 +703,8 @@ def label_of(drafter):
 
 
 def summary(drafter):
-    """Rounds, tokens drafted and accepted, and the acceptance rate, as mlx-vlm counts them."""
-    rounds = int(getattr(drafter, 'speculative_total_rounds', 0))
-    drafted = int(getattr(drafter, 'speculative_total_drafted', 0))
-    accepted = float(getattr(drafter, 'speculative_total_accepted', 0.0))
+    """Rounds, tokens drafted and accepted, and the acceptance rate (`counted`)."""
+    rounds, drafted, accepted = counted(drafter)
     return dict(label=label_of(drafter), rounds=rounds, drafted=drafted, accepted=int(round(accepted)),
                 acceptance=round(accepted / drafted, 4) if drafted else None,
                 tokens_a_round=round(1 + accepted / rounds, 3) if rounds else None)
@@ -578,9 +809,9 @@ def time_rounds(drafter, mode):
 
 
 def times(drafter):
-    """TIMES as ms a round (the rounds mlx-vlm counted since the start), and the round's rest:
+    """TIMES as ms a round (`counted(drafter)[0]`), and the round's rest:
     inside less its timed stages."""
-    rounds = int(getattr(drafter, 'speculative_total_rounds', 0))
+    rounds = counted(drafter)[0]
     if not rounds or not TIMES:
         return {}
     ms = {k: round(v[1] * 1e3 / rounds, 2) for k, v in TIMES.items()}

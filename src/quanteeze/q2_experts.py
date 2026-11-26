@@ -18,6 +18,8 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from . import per_load
+
 PROJECTIONS = {'gate_proj': 'ffn_gate_exps', 'up_proj': 'ffn_up_exps', 'down_proj': 'ffn_down_exps'}
 NAMES = ('weight', 'scales', 'biases')
 _SAFETENSORS = {'U8': np.uint8, 'U32': np.uint32, 'BF16': np.uint16, 'F16': np.float16, 'F32': np.float32,
@@ -586,6 +588,7 @@ def reading():
     return any(held.reading() for held in list(_HELD.values()))
 
 
+@per_load.on_let_go
 def let_go(path=None):
     """Let go of the host's copy of checkpoint `path`'s experts (all of them for None)."""
     target = path.path if _is_source(path) else path
@@ -649,7 +652,7 @@ def on_network(path, mounts='/proc/mounts'):
 def read_threads(path=None, mounts='/proc/mounts'):
     """Reader thread count from `QUANTEEZE_READ_THREADS` (`auto`: 16 on network FS, else 4)."""
     from . import variables
-    raw = (variables.get('QUANTEEZE_READ_THREADS') or 'auto').strip().lower()
+    raw = (variables.get('QUANTEEZE_READ_THREADS', variables.at_load()) or 'auto').strip().lower()
     if raw == 'auto':
         return NETWORK_READ_THREADS if (path and on_network(path, mounts)) else LOCAL_READ_THREADS
     return max(1, int(raw))

@@ -326,10 +326,11 @@ def note_others(info=None, held=None):
 
 def working_set_share():
     """QUANTEEZE_WORKING_SET_SHARE as a share, None for auto (recommended_budget)."""
-    text = (variables.get('QUANTEEZE_WORKING_SET_SHARE') or 'auto').strip().lower()
+    snap = variables.at_start()
+    text = (variables.get('QUANTEEZE_WORKING_SET_SHARE', snap) or 'auto').strip().lower()
     if text == 'auto':
         return None
-    share = variables.number('QUANTEEZE_WORKING_SET_SHARE')
+    share = variables.number('QUANTEEZE_WORKING_SET_SHARE', snap)
     if not 0 < share <= 1:
         raise ValueError(f'QUANTEEZE_WORKING_SET_SHARE is a share of the memory, over 0 and at most 1: {share:g}')
     return share
@@ -522,7 +523,8 @@ class Keeper:
     def from_env(cls, **kwargs):
         """A keeper set by QUANTEEZE_KEEP_GB, QUANTEEZE_KEEP_FREE_GB, QUANTEEZE_KEEP_SWAP_GB,
         QUANTEEZE_KEEP_DISK_GB, QUANTEEZE_KEEP_PRESSURE, QUANTEEZE_KEEP_STRAIN, and QUANTEEZE_KEEP_CUT_GB."""
-        value = (variables.get('QUANTEEZE_KEEP_GB') or 'auto').strip().lower()
+        snap = variables.at_start()
+        value = (variables.get('QUANTEEZE_KEEP_GB', snap) or 'auto').strip().lower()
         if value == 'off':
             return None
         readings = kwargs.get('readings') or Readings()
@@ -535,13 +537,13 @@ class Keeper:
             limit = float(value) * 1e9
         if not limit:
             return None
-        free = variables.number('QUANTEEZE_KEEP_FREE_GB') * 1e9
-        kwargs.setdefault('system', not variables.off('QUANTEEZE_KEEP_PRESSURE'))
-        if 'strain' not in kwargs and sys.platform.startswith('linux') and not variables.off('QUANTEEZE_KEEP_STRAIN'):
-            kwargs['strain'] = Strain(floor_gb=variables.number('QUANTEEZE_KEEP_CUT_GB'))
+        free = variables.number('QUANTEEZE_KEEP_FREE_GB', snap) * 1e9
+        kwargs.setdefault('system', not variables.off('QUANTEEZE_KEEP_PRESSURE', snap))
+        if 'strain' not in kwargs and sys.platform.startswith('linux') and not variables.off('QUANTEEZE_KEEP_STRAIN', snap):
+            kwargs['strain'] = Strain(floor_gb=variables.number('QUANTEEZE_KEEP_CUT_GB', snap))
         return cls(limit, stop_at=total - free if total else None,
-                   swap_growth=variables.number('QUANTEEZE_KEEP_SWAP_GB') * 1e9,
-                   disk_floor=variables.number('QUANTEEZE_KEEP_DISK_GB') * 1e9, **kwargs)
+                   swap_growth=variables.number('QUANTEEZE_KEEP_SWAP_GB', snap) * 1e9,
+                   disk_floor=variables.number('QUANTEEZE_KEEP_DISK_GB', snap) * 1e9, **kwargs)
 
     def _holds(self, held):
         mlx = self.readings.mlx_held()
@@ -726,13 +728,22 @@ class Throttle:
         """A throttle set by `<prefix>AT` (thermal level; 2; `'off'` for no throttle),
         `<prefix>DUTY` (the GPU's share of the time while hot: one share, or `'<level>:<share>,...'`;
         `DUTIES` by default) and `<prefix>MAX_REST` (seconds; 2)."""
-        at = os.environ.get(prefix + 'AT', '2')
-        if at.lower() == 'off':
-            return None
-        text = os.environ.get(prefix + 'DUTY')
+        snap = variables.at_start()
+        if prefix == 'QUANTEEZE_THROTTLE_':
+            at = variables.get('QUANTEEZE_THROTTLE_AT', snap) or '2'
+            if at.lower() == 'off':
+                return None
+            text = variables.get('QUANTEEZE_THROTTLE_DUTY', snap)
+            max_rest = variables.number('QUANTEEZE_THROTTLE_MAX_REST', snap)
+        else:
+            at = os.environ.get(prefix + 'AT', '2')
+            if at.lower() == 'off':
+                return None
+            text = os.environ.get(prefix + 'DUTY')
+            max_rest = float(os.environ.get(prefix + 'MAX_REST', '2'))
         duty = None if not text else {int(float(k)): float(v) for k, v in (p.split(':') for p in text.split(','))} \
             if ':' in text else float(text)
-        return cls(at=float(at), duty=duty, max_rest=float(os.environ.get(prefix + 'MAX_REST', '2')), **kwargs)
+        return cls(at=float(at), duty=duty, max_rest=max_rest, **kwargs)
 
     def share(self, level):
         """The GPU's share of the time at a thermal level at or above `at`."""

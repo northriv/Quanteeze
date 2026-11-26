@@ -40,12 +40,13 @@ import mlx.core as mx
 from mlx_vlm.models.glm5_next.language import _expert_select
 from mlx_vlm.models.linear import tiled_linear
 
+from . import kernel_checks
+
 CHECKS = 3
 ROWS = 32                       # route()'s rows at most: a decode step of a batch, or a draft's
 ON = [True]                     # QUANTEEZE_SIGMOID_ROUTER_KERNELS
 STATS = dict(logits=0, route=0, checked=0, mismatched=0)
-CHOICE = {}                     # (part, shape): whether it matched mlx-vlm's
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('sigmoid_router')  # (part, shape): whether it matched mlx-vlm's
 SAID = []
 
 _LOGITS = r"""
@@ -229,28 +230,8 @@ def gate_route(gate, logits):
 def _served(part, key, mine, theirs):
     """mine() where this part's shape matched theirs() bit for bit the first CHECKS times it was
     met, else theirs()."""
-    key = (part,) + key
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
-    if choice is not None and seen >= CHECKS:
-        if choice:
-            STATS[part] += 1
-            return mine()
-        return theirs()
-    want = theirs()
-    STATS['checked'] += 1
-    try:
-        got = mine()
-        pairs = zip(got, want) if isinstance(want, tuple) else [(got, want)]
-        same = all(a.dtype == b.dtype and mx.array_equal(a, b).item() for a, b in pairs)
-    except Exception as error:                              # a kernel that does not build: the original
-        if not SAID:
-            SAID.append(True)
-            print(f'quanteeze: the routing kernels unavailable ({type(error).__name__}: {error})',
-                  file=sys.stderr, flush=True)
-        same = False
-    STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
-    return want
+    return kernel_checks.served(sys.modules[__name__], (part,) + key, mine, theirs,
+                                'the routing kernels', stat=part)
 
 
 def summary():

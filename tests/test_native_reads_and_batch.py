@@ -313,7 +313,7 @@ def test_demand_native_reads_verification_fallback(tmp_path, monkeypatch):
 def test_macos_mount_network_fs_detection(monkeypatch):
     mount_out = (
         '/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n'
-        '//user@nas.local/models on /Volumes/Models (smbfs, nodev, nosuid, mounted by northriv)\n'
+        '//user@nas.local/models on /Volumes/Models (smbfs, nodev, nosuid, mounted by user)\n'
         'nas.local:/exports/lab on /Volumes/Lab Share (nfs, nodev, nosuid)\n'
     )
     monkeypatch.setattr(sys, 'platform', 'darwin')

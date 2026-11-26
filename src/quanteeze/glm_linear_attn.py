@@ -34,21 +34,12 @@ from functools import lru_cache
 import mlx.core as mx
 from mlx_vlm.models.linear import linear
 
-from . import linear_attn
+from . import kernel_checks, linear_attn, metal_kernels, per_thread
 
 CHECKS = 3
 STATS = dict(served=0, checked=0, mismatched=0)
-CHOICE = {}                     # shape: whether it matched mlx-vlm's
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('glm_linear_attn')  # shape: whether it matched mlx-vlm's
 SAID = []
-
-_SIGMOID = """
-template <typename X>
-inline X mlx_sigmoid(X x) {
-  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
-  return (x < 0) ? y : 1 - y;
-}
-"""
 
 _CONV = r"""
     uint head = threadgroup_position_in_grid.x;
@@ -154,7 +145,7 @@ _GATED_NORM = r"""
 
 
 def _header(**values):
-    return _SIGMOID + ''.join(f'constant constexpr float {k} = {float(v)!r}f;\n' for k, v in values.items())
+    return metal_kernels.SIGMOID + ''.join(f'constant constexpr float {k} = {float(v)!r}f;\n' for k, v in values.items())
 
 
 def _name(base, *values):
@@ -236,7 +227,7 @@ def step(layer, x, cache, stock):
     bit the first CHECKS times it was met, else stock()."""
     key = (tuple(layer.qkv_proj.weight.shape), layer.num_heads, layer.conv_kernel, float(layer.scale),
            float(layer.lower_bound), float(layer.o_norm.eps))
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS['served'] += 1
@@ -249,8 +240,7 @@ def step(layer, x, cache, stock):
     try:
         cache[0], cache[1] = before
         got = decode(layer, x, cache)
-        same = all(a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(a, b).item()
-                   for a, b in [(got, want), (cache[0], after[0]), (cache[1], after[1])])
+        same = kernel_checks.same_bits((got, cache[0], cache[1]), (want, after[0], after[1]))
     except Exception as error:                              # a kernel that does not build: mlx-vlm's
         if not SAID:
             SAID.append(True)
@@ -259,7 +249,7 @@ def step(layer, x, cache, stock):
         same = False
     cache[0], cache[1] = after
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 

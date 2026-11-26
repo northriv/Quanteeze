@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 
-from . import cuda_kernels, cuda_ple_layer
+from . import cuda_kernels, cuda_ple_layer, kernel_checks
 from .arch import qwen4_exp
 from .arch.qwen4_exp import _BatchInvariantForward
 
@@ -29,8 +29,7 @@ ON = [True]                     # QUANTEEZE_HC_KERNELS
 STATS = dict(norm=0, mix=0, project=0, fused=0, rows=0, batch=0, checked=0, mismatched=0)
 ROWS_MOST = 8                   # max tokens/requests in verify-rows or batch kernels (2 to 8)
 ROWS_COMPILE_AFTER = 2          # verify passes served outside a graph before compiling on Metal
-CHOICE = {}                     # (part, shape, dtype): whether it matched the original
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('hyper')  # (part, shape, dtype): whether it matched the original
 SAID = []
 
 _NORM = r"""
@@ -790,28 +789,8 @@ def mix(projected, normed, hc, d):
 def _served(part, key, mine, theirs):
     """mine() where this part's shape matched theirs() bit for bit the first CHECKS times it was
     met, else theirs()."""
-    key = (part,) + key
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
-    if choice is not None and seen >= CHECKS:
-        if choice:
-            STATS[part] += 1
-            return mine()
-        return theirs()
-    want = theirs()
-    STATS['checked'] += 1
-    try:
-        got = mine()
-        pairs = zip(got, want) if isinstance(want, tuple) else [(got, want)]
-        same = all(mx.array_equal(a, b).item() for a, b in pairs)
-    except Exception as error:
-        if not SAID:
-            SAID.append(True)
-            print(f'quanteeze: hyper-connection kernels unavailable ({type(error).__name__}: {error})',
-                  file=sys.stderr, flush=True)
-        same = False
-    STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
-    return want
+    return kernel_checks.served(sys.modules[__name__], (part,) + key, mine, theirs,
+                                'hyper-connection kernels', stat=part)
 
 
 class HyperForward(_BatchInvariantForward):
@@ -873,7 +852,7 @@ class HyperForward(_BatchInvariantForward):
         def mine():
             return kernels(module, hidden_states, branch, weights)
 
-        if qwen4_exp.COMPILE[0] and CHOICE.get(('rows',) + key) and CHECKED.get(('rows',) + key, 0) >= CHECKS:
+        if qwen4_exp.COMPILE[0] and kernel_checks.settled(CHOICE, CHECKED, ('rows',) + key, CHECKS):
             out = self._compiled_rows(module, key, kernels, hidden_states, branch, weights, after=0)
             if out is not None:
                 STATS['rows'] += 1
@@ -902,7 +881,7 @@ class HyperForward(_BatchInvariantForward):
         def mine():
             return kernels(module, hidden_states, branch, weights)
 
-        if qwen4_exp.COMPILE[0] and CHOICE.get(('rows',) + key) and CHECKED.get(('rows',) + key, 0) >= CHECKS:
+        if qwen4_exp.COMPILE[0] and kernel_checks.settled(CHOICE, CHECKED, ('rows',) + key, CHECKS):
             out = self._compiled_rows(module, key, kernels, hidden_states, branch, weights)
             if out is not None:
                 STATS['rows'] += 1
@@ -1056,8 +1035,11 @@ def _parts(module, hidden_states, branch):
 
 def _settled(key, parts):
     """Whether every part's checks for this shape are made: a compiled graph may then serve it."""
-    return all(CHECKED.get((part[0],) + key + part[1:], 0 if part[0] != 'project' else CHECKS) >= CHECKS
-               for part in parts)
+    for part in parts:
+        seen = kernel_checks.read(CHOICE, CHECKED, (part[0],) + key + part[1:])[1]
+        if seen < CHECKS and not (part[0] == 'project' and seen == 0):
+            return False
+    return True
 
 
 def summary():

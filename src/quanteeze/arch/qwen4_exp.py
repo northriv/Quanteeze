@@ -10,7 +10,6 @@ Hooks the batch-invariant decode/verify forward so one-token decode and speculat
   `quanteeze.cuda_router`, `quanteeze.cuda_moe`).
 """
 import sys
-import threading
 import weakref
 
 import mlx.core as mx
@@ -25,25 +24,7 @@ EVAL_LAYERS = [12]                      # quanteeze.serve: QUANTEEZE_EVAL_LAYERS
 COMPILE_STATS = {'compiled': 0, 'hyper': 0, 'refused': 0}
 VERIFY_ROWS_MOST = 8
 VERIFYING = per_thread.Field('verify')
-
-
-class _LocalFlag(threading.local):
-    def __init__(self):
-        self.on = False
-
-
-_CAPTURE_STATE = _LocalFlag()
-
-
-class _Capturing:
-    def __getitem__(self, _i):
-        return _CAPTURE_STATE.on
-
-    def __setitem__(self, _i, val):
-        _CAPTURE_STATE.on = bool(val)
-
-
-CAPTURING = _Capturing()
+CAPTURE = per_thread.Field('capture')
 
 
 def _hc_mean(hidden, hc_count, hidden_size):
@@ -116,6 +97,8 @@ class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
         return_shared_kv=False,
         skip_logits=False,
     ):
+        if capture_layer_ids is None and CAPTURE[0] is not None:
+            capture_layer_ids = CAPTURE[0]
         if capture_layer_ids is None:
             return super().__call__(
                 language_model,
@@ -135,15 +118,16 @@ class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
         )
-        logits_hidden = self._hyper_connection(language_model.model.hyper_connection_mixer, hidden)
         if return_hidden and capture_layer_ids != []:
-            hidden_sink.append(logits_hidden)
+            hidden_sink.append(hidden)
         if skip_logits:
             logits = None
-        elif language_model.args.tie_word_embeddings:
-            logits = self._embedding_as_linear(language_model.model.embed_tokens, logits_hidden)
         else:
-            logits = self._linear(language_model.lm_head, logits_hidden)
+            logits_hidden = self._hyper_connection(language_model.model.hyper_connection_mixer, hidden)
+            if language_model.args.tie_word_embeddings:
+                logits = self._embedding_as_linear(language_model.model.embed_tokens, logits_hidden)
+            else:
+                logits = self._linear(language_model.lm_head, logits_hidden)
         return _language.LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,
@@ -366,10 +350,16 @@ def _install_dflash():
     lm_cls = _language.LanguageModel
     if not getattr(lm_cls, '_quanteeze_dflash', False):
         orig_lm_call = lm_cls.__call__
-        orig_supports = lm_cls._supports_batch_invariant_decode
+
+        def _eval_cache_states(cache):
+            if cache is None:
+                return
+            states = [entry.state for entry in cache if entry is not None and hasattr(entry, 'state')]
+            if states:
+                mx.async_eval(states)
 
         def speculative_verify_dflash_hidden(self, inputs, cache, target_layer_ids):
-            mx.async_eval([entry.state for entry in cache])
+            _eval_cache_states(cache)
             position_ids = _verify_position_ids(self, inputs, cache)
             out = _language._QWEN4_BATCH_INVARIANT_FORWARD.verify(
                 self,
@@ -386,6 +376,7 @@ def _install_dflash():
             if kwargs.get('speculative_verify'):
                 kwargs.pop('speculative_verify', None)
                 position_ids = kwargs.pop('position_ids', None)
+                _eval_cache_states(cache)
                 if position_ids is None and cache is not None:
                     position_ids = _verify_position_ids(self, inputs, cache)
                 return _language._QWEN4_BATCH_INVARIANT_FORWARD.verify(
@@ -399,28 +390,141 @@ def _install_dflash():
                     return_shared_kv=bool(kwargs.get('return_shared_kv', False)),
                     skip_logits=bool(kwargs.get('skip_logits', False)),
                 )
-            if kwargs.get('capture_layer_ids') is not None:
-                was, CAPTURING[0] = CAPTURING[0], True
+            capture_ids = kwargs.get('capture_layer_ids')
+            if capture_ids is not None:
+                was, CAPTURE[0] = CAPTURE[0], list(capture_ids)
                 try:
                     return orig_lm_call(self, inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs)
                 finally:
-                    CAPTURING[0] = was
+                    CAPTURE[0] = was
             return orig_lm_call(self, inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs)
-
-        def supports_batch_invariant_decode(self):
-            if CAPTURING[0]:
-                return False
-            return orig_supports(self)
 
         lm_cls.speculative_verify_dflash_hidden = speculative_verify_dflash_hidden
         lm_cls.__call__ = lm_call
-        lm_cls._supports_batch_invariant_decode = supports_batch_invariant_decode
         lm_cls._quanteeze_dflash = True
 
 
+def _trim_index_blocks(cache, new_len):
+    """Preserve already-summarized QSA blocks strictly before `new_len` across speculative rollback."""
+    blocks = getattr(cache, 'index_block_keys', None)
+    if blocks is None:
+        return
+    ratio = getattr(cache, 'index_block_ratio', None)
+    if not ratio or ratio <= 0:
+        cache.clear_index_blocks()
+        return
+    keep = int(new_len) // int(ratio)
+    if keep <= 0:
+        cache.clear_index_blocks()
+    elif blocks.shape[2] > keep:
+        cache.index_block_keys = blocks[:, :, :keep]
+
+
+def _install_qsa_cache():
+    """Patch QSA KV caches to preallocate indexer storage and retain valid block summaries on trim."""
+    qsa_cls = _language.QSAKVCache
+    if not getattr(qsa_cls, '_quanteeze_qsa_cache', False):
+        def qsa_trim(self, n):
+            n = min(self.offset, n)
+            super(_language.QSAKVCache, self).trim(n)
+            if self.index_keys is not None:
+                self.index_keys = self.index_keys[:, : self.offset]
+                self.index_position_ids = self.index_position_ids[..., : self.offset]
+            _trim_index_blocks(self, self.offset)
+            return n
+
+        qsa_cls.trim = qsa_trim
+        qsa_cls._quanteeze_qsa_cache = True
+
+    qsa_quant_cls = _language.QSAQuantizedKVCache
+    if not getattr(qsa_quant_cls, '_quanteeze_qsa_cache', False):
+        def qsa_quant_trim(self, n):
+            n = min(self.offset, n)
+            super(_language.QSAQuantizedKVCache, self).trim(n)
+            if self.index_keys is not None:
+                self.index_keys = self.index_keys[:, : self.offset]
+                self.index_position_ids = self.index_position_ids[..., : self.offset]
+            _trim_index_blocks(self, self.offset)
+            return n
+
+        qsa_quant_cls.trim = qsa_quant_trim
+        qsa_quant_cls._quanteeze_qsa_cache = True
+
+    batch_cls = _language.BatchQSAKVCache
+    if not getattr(batch_cls, '_quanteeze_qsa_cache', False):
+        def batch_trim(self, n):
+            trimmed = self.kv_cache.trim(n)
+            self.index_offset = max(0, self.index_offset - trimmed)
+            _trim_index_blocks(self, self.index_offset)
+            return trimmed
+
+        def batch_update_indexer(self, keys, position_ids):
+            prev = self.index_offset
+            incoming = keys.shape[1]
+            step = getattr(self, 'step', 256) or 256
+            add = ((incoming + step - 1) // step) * step if incoming > 0 else step
+            if self.index_keys is None:
+                self.index_keys = mx.zeros((keys.shape[0], add, keys.shape[2]), dtype=keys.dtype)
+                self.index_position_ids = mx.zeros((*position_ids.shape[:-1], add), dtype=position_ids.dtype)
+                if incoming:
+                    self.index_keys[:, :incoming] = keys
+                    self.index_position_ids[..., :incoming] = position_ids
+                self.index_offset = incoming
+                return self.index_keys[:, :incoming], self.index_position_ids[..., :incoming]
+
+            if self.index_position_ids.ndim == 3 and position_ids.ndim == 2:
+                position_ids = mx.broadcast_to(position_ids[None], (self.index_position_ids.shape[0], *position_ids.shape))
+            elif self.index_position_ids.ndim == 2 and position_ids.ndim == 3:
+                self.index_position_ids = mx.contiguous(
+                    mx.broadcast_to(self.index_position_ids[None], (position_ids.shape[0], *self.index_position_ids.shape))
+                )
+            elif self.index_position_ids.ndim != position_ids.ndim:
+                raise ValueError(
+                    'QSA position IDs must be 2-D text positions or 3-D MRoPE positions, '
+                    f'got cached={self.index_position_ids.shape} and current={position_ids.shape}.'
+                )
+
+            key_dtype = mx.result_type(self.index_keys, keys)
+            if key_dtype != self.index_keys.dtype:
+                self.index_keys = self.index_keys.astype(key_dtype)
+            if key_dtype != keys.dtype:
+                keys = keys.astype(key_dtype)
+
+            pos_dtype = mx.result_type(self.index_position_ids, position_ids)
+            if pos_dtype != self.index_position_ids.dtype:
+                self.index_position_ids = self.index_position_ids.astype(pos_dtype)
+            if pos_dtype != position_ids.dtype:
+                position_ids = position_ids.astype(pos_dtype)
+
+            end = prev + incoming
+            if end > self.index_keys.shape[1]:
+                cur = self.index_keys if prev == self.index_keys.shape[1] else self.index_keys[:, :prev]
+                self.index_keys = mx.concatenate([cur, mx.zeros((keys.shape[0], add, keys.shape[2]), dtype=key_dtype)], axis=1)
+            if end > self.index_position_ids.shape[-1]:
+                cur = (
+                    self.index_position_ids
+                    if prev == self.index_position_ids.shape[-1]
+                    else self.index_position_ids[..., :prev]
+                )
+                self.index_position_ids = mx.concatenate(
+                    [cur, mx.zeros((*position_ids.shape[:-1], add), dtype=pos_dtype)], axis=-1
+                )
+
+            if incoming:
+                self.index_keys[:, prev:end] = keys
+                self.index_position_ids[..., prev:end] = position_ids
+            self.index_offset = end
+            return self.index_keys[:, :end], self.index_position_ids[..., :end]
+
+        batch_cls.trim = batch_trim
+        batch_cls.update_indexer = batch_update_indexer
+        batch_cls._quanteeze_qsa_cache = True
+
+
 def install(model):
-    """Install `_BatchInvariantForward`, DFlash2 capture/verify, and `expert_qmv` switch hooks on `model`."""
+    """Install `_BatchInvariantForward`, DFlash2 capture/verify, QSA indexer cache hooks, and `expert_qmv` switches."""
     _install_dflash()
+    _install_qsa_cache()
     lm = getattr(_language, 'LanguageModel', None)
     if lm is not None and hasattr(lm, '_speculative_verify') and not getattr(
             lm._speculative_verify, '_quanteeze_verifying', False):

@@ -358,7 +358,7 @@ def test_parallel_crossing_guards_and_tables_room_split(monkeypatch, tmp_path):
     saved_cut = parallel._CUT[0]
     saved_hosts = parallel._HOSTS[0]
     saved_on_host = parallel._ON_HOST[0]
-    saved_crossed = dict(parallel._CROSSED)
+    saved_crossed = list(parallel._CROSSED)
     try:
         parallel.GROUP[0] = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
         parallel._OWNED[0] = range(2, 4)
@@ -400,5 +400,47 @@ def test_parallel_crossing_guards_and_tables_room_split(monkeypatch, tmp_path):
         parallel._HOSTS[0] = saved_hosts
         parallel._ON_HOST[0] = saved_on_host
         parallel._CROSSED.clear()
-        parallel._CROSSED.update(saved_crossed)
+        parallel._CROSSED.extend(saved_crossed)
         _restore_env(saved_env)
+
+
+def test_parallel_no_delay_and_per_thread_collective_and_crossed():
+    """`parallel.no_delay` sets `TCP_NODELAY` on both socket ends, `_LAST` isolates per thread, and
+    `refuse`/`crossings` sum thread-local dicts cleanly."""
+    import socket
+    import threading
+    from multiprocessing.connection import Client, Listener
+    from quanteeze import parallel
+
+    with Listener(('127.0.0.1', 0), authkey=b'k') as listener:
+        got = {}
+        taker = threading.Thread(target=lambda: got.update(conn=parallel.no_delay(listener.accept())))
+        taker.start()
+        out = parallel.no_delay(Client(listener.address, authkey=b'k'))
+        taker.join()
+    for conn in (out, got['conn']):
+        sock = socket.socket(fileno=os.dup(conn.fileno()))
+        try:
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+        finally:
+            sock.close()
+    out.send_bytes(b'x' * 65536)
+    assert got['conn'].recv_bytes() == b'x' * 65536
+    out.close()
+    got['conn'].close()
+
+    # Thread isolation of _LAST
+    seen = {}
+    parallel._LAST[0] = 'main'
+
+    def worker(tag):
+        parallel._LAST[0] = tag
+        seen[tag] = parallel._LAST[0]
+
+    threads = [threading.Thread(target=worker, args=(f't{i}',)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert parallel._LAST[0] == 'main'
+    assert seen == {'t0': 't0', 't1': 't1', 't2': 't2', 't3': 't3'}

@@ -163,3 +163,55 @@ def test_mtp_pays_in_memory_and_settings(monkeypatch):
     for name in ('QUANTEEZE_CUDA_ATTN_ROWS', 'QUANTEEZE_CUDA_QMV_ROWS'):
         assert name in variables.SETTINGS
         assert control.CHOICES[name] == ('on', 'off')
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason='Metal backend required')
+@pytest.mark.parametrize('shape', [(1, 2, 256), (1, 3, 256), (1, 4, 256), (2, 1, 256)])
+def test_expert_qmv_verify_fused_matches_stock_and_toggle(shape, monkeypatch):
+    """Multi-token verify (`1, T, D`) and batched decode (`B, 1, D`) run via `fused()` when `VERIFY=True`
+    and match stock `SwitchGLU` bit-for-bit; `VERIFY=False` falls back to `own()` (`served`)."""
+    from mlx_lm.models.switch_layers import SwitchGLU
+    from quanteeze import expert_qmv
+
+    mx.random.seed(19)
+    sw = SwitchGLU(input_dims=256, hidden_dims=128, num_experts=8, bias=False)
+    sw.set_dtype(mx.bfloat16)
+    for proj_name in ('gate_proj', 'up_proj', 'down_proj'):
+        q = getattr(sw, proj_name).to_quantized(group_size=64, bits=4, mode='affine')
+        setattr(sw, proj_name, q)
+    mx.eval(sw.parameters())
+
+    def stock(x_in, idx_in):
+        return sw(x_in, idx_in)
+
+    monkeypatch.setattr(expert_qmv, 'CHOICE', {})
+    monkeypatch.setattr(expert_qmv, 'CHECKED', {})
+    monkeypatch.setattr(expert_qmv, 'STATS', dict(served=0, fused=0, checked=0, mismatched=0))
+    monkeypatch.setattr(expert_qmv, 'ON', [True])
+    monkeypatch.setattr(expert_qmv, 'FUSED', [True])
+    monkeypatch.setattr(expert_qmv, 'VERIFY', [True])
+
+    b0, t0, d = shape
+    for step in range(expert_qmv.CHECKS + 2):
+        mx.random.seed(100 + step)
+        x = (mx.random.normal((b0, t0, d)) * 0.25).astype(mx.bfloat16)
+        idx = mx.random.randint(0, 8, (b0, t0, 3), dtype=mx.uint32)
+        mx.eval(x, idx)
+        want = stock(x, idx)
+        got = expert_qmv.decode(sw, x, idx)
+        mx.eval(want, got)
+        assert mx.array_equal(got, want).item()
+    assert expert_qmv.STATS['mismatched'] == 0
+    assert expert_qmv.STATS['fused'] == 2
+
+    if t0 > 1:
+        monkeypatch.setattr(expert_qmv, 'VERIFY', [False])
+        assert not expert_qmv.fusable(sw, x)
+        served_before = expert_qmv.STATS['served']
+        for _ in range(expert_qmv.CHECKS + 1):
+            got = expert_qmv.decode(sw, x, idx)
+            mx.eval(got)
+        assert expert_qmv.STATS['served'] == served_before + 1
+
+    assert 'QUANTEEZE_EXPERT_QMV_VERIFY_FUSED' in variables.SETTINGS
+    assert control.CHOICES['QUANTEEZE_EXPERT_QMV_VERIFY_FUSED'] == ('on', 'off')

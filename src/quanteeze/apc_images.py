@@ -39,6 +39,7 @@ _PLANS = OrderedDict()          # the request's salt -> (salt without images, im
 _PLANS_LOCK = threading.Lock()
 _LOCAL = threading.local()      # .images: this request's image hashes; .relax: a lookup that may end before an image
 PRECISION = [None]              # what the served weights compute a prompt with, as text (use_precision)
+INSTALLED = [False]             # True once install() has wrapped APCManager for image-salted prefixes
 
 
 def use_model(model):
@@ -198,3 +199,4 @@ def install(generator_cls, batch_cls, manager_cls):
     batch_cls._apc_pick_for = _apc_pick_for
     batch_cls._apc_safe_prefix_lookup_min = _apc_safe_prefix_lookup_min
     batch_cls._apc_suffix_is_text_only = _apc_suffix_is_text_only
+    INSTALLED[0] = True

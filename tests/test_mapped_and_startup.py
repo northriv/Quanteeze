@@ -171,3 +171,102 @@ def test_control_switch_model_undo_and_choices(tmp_path, monkeypatch):
     while control._SWITCH['busy'] and time.time() < deadline:
         time.sleep(0.01)
     assert os.environ.get('QUANTEEZE_BITS') == '2'
+
+
+def test_control_unload_model_route_and_warm_batch_and_gb_up(tmp_path, monkeypatch):
+    """`control.unload_model` waits for inflight requests, refuses generation (503 `unloaded`) until reloaded
+    from the Home page, `serve._gb_up` rounds up to 0.1 GB, and `serve._warm_batch` runs batch shapes."""
+    import asyncio
+    import mlx.core as mx
+    from quanteeze import serve
+
+    assert serve._gb_up(32_000_153_600) == '32.1'
+
+    ckpt = tmp_path / 'ckpt'
+    ckpt.mkdir()
+    (ckpt / 'config.json').write_text('{"model_type": "qwen4_exp"}')
+    there = str(ckpt.resolve())
+
+    monkeypatch.setattr(control, '_SWITCH', {
+        'busy': False, 'inflight': 1, 'served': there, 'target': None,
+        'state': 'idle', 'error': None, 'loader': None, 'check': None,
+        'unloader': None, 'held': None,
+    })
+    let_go, loaded = [], []
+    control._SWITCH.update(unloader=lambda: let_go.append(True), loader=lambda p: loaded.append(p))
+
+    out = control.unload_model(wait=0.01)
+    assert out['state'] == 'unloading' and out['held'] == there
+
+    seen = []
+
+    class DummyApp:
+        async def __call__(self, scope, receive, send):
+            seen.append(scope['path'])
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'ok', 'more_body': False})
+
+    async def post_json(path, body, token=None):
+        raw = json.dumps(body).encode()
+        sent = []
+        headers = [(b'x-quanteeze-token', token.encode())] if token else []
+        sent_req = [False]
+
+        async def receive():
+            if not sent_req[0]:
+                sent_req[0] = True
+                return {'type': 'http.request', 'body': raw, 'more_body': False}
+            return {'type': 'http.disconnect'}
+
+        async def send(msg):
+            sent.append(msg)
+
+        await control.Middleware(DummyApp(), 'tok')(
+            {'type': 'http', 'method': 'POST', 'path': path, 'headers': headers}, receive, send,
+        )
+        return sent[0]['status'], b''.join(m.get('body', b'') for m in sent[1:])
+
+    st, body = asyncio.run(post_json('/v1/chat/completions', {'model': there, 'messages': []}))
+    assert st == 503 and json.loads(body)['error']['type'] == 'unloaded' and not seen
+    assert let_go == []
+
+    control._SWITCH['inflight'] = 0
+    deadline = time.time() + 2.0
+    while control._SWITCH['busy'] and time.time() < deadline:
+        time.sleep(0.01)
+    s = control.model_state()
+    assert let_go == [True] and s['state'] == 'unloaded' and s['held'] == there and s['served'] is None
+
+    st2, body2 = asyncio.run(post_json('/v1/chat/completions', {'model': there, 'messages': []}))
+    assert st2 == 503 and 'let go from the page' in json.loads(body2)['error']['message']
+
+    control.switch_model(there, wait=0.01)
+    deadline = time.time() + 2.0
+    while control._SWITCH['busy'] and time.time() < deadline:
+        time.sleep(0.01)
+    assert control.model_state()['held'] is None and control.model_state()['state'] == 'idle'
+    assert loaded == [there]
+
+    st3, _ = asyncio.run(post_json('/v1/chat/completions', {'model': there, 'messages': []}))
+    assert st3 == 200 and seen == ['/v1/chat/completions']
+
+    # POST /v1/quanteeze/model {"unload": true} triggers unload_model
+    monkeypatch.setattr(control, 'unload_model', lambda: {'state': 'unloading'})
+    st4, _ = asyncio.run(post_json(control.MODEL_PATH, {'unload': True}, token='tok'))
+    assert st4 == 200
+
+    # _warm_batch runs 2 and 3 rows when QUANTEEZE_WARM_UP_BATCH=3, skips on 'off', and control.check validates
+    monkeypatch.setenv('QUANTEEZE_WARM_UP_BATCH', '3')
+    from mlx_vlm.generate import ar as _ar
+    monkeypatch.setattr(_ar, '_make_cache', lambda lm, lens: [len(lens)])
+    calls = []
+    fake_lm = lambda x, cache=None: calls.append(tuple(x.shape)) or mx.ones((*x.shape, 4), mx.float32)
+    note = serve._warm_batch(fake_lm, [1, 2, 3], lambda out: mx.argmax(out[:, -1], axis=-1))
+    assert note == ', batches of 2 to 3 requests'
+    assert calls == [(2, 3), (2, 1), (2, 1), (3, 3), (3, 1), (3, 1)]
+    monkeypatch.setenv('QUANTEEZE_WARM_UP_BATCH', 'off')
+    assert serve._warm_batch(fake_lm, [1, 2, 3], lambda out: out) == ''
+    for ok_val in ('0', '4', 'off'):
+        assert control.check('QUANTEEZE_WARM_UP_BATCH', ok_val) is None
+    for bad_val in ('auto', '2.5'):
+        assert control.check('QUANTEEZE_WARM_UP_BATCH', bad_val) is not None

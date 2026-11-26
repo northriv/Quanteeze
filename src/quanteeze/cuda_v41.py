@@ -12,7 +12,7 @@ import sys
 import mlx.core as mx
 import numpy as np
 
-from . import cuda_kernels
+from . import cuda_kernels, kernel_checks
 
 ON = [True]                     # QUANTEEZE_HC_KERNELS
 CHECK_ROWS = 256
@@ -66,9 +66,14 @@ SOURCE = r"""
 _KERNEL = []
 
 
+def _gpu():
+    """Whether this rank computes on a CUDA GPU (not a CPU rank in a ring on a CUDA host)."""
+    return cuda_kernels.available() and mx.default_device() == mx.gpu
+
+
 def available():
-    """Whether V4.1 CUDA hyper-connection kernels are enabled and running on MLX CUDA."""
-    return ON[0] and cuda_kernels.available()
+    """Whether V4.1 CUDA hyper-connection kernels are enabled and running on a CUDA GPU."""
+    return ON[0] and _gpu()
 
 
 def split(mixes, scale, base, hc_mult, sinkhorn_iters, eps):
@@ -109,7 +114,7 @@ def matches(blocks, hc_mult, sinkhorn_iters, eps, rows=CHECK_ROWS, seed=0):
             base = getattr(block, f'hc_{part}_base').astype(mx.float32)
             mixes = mx.array(rng.normal(0, 3, (1, rows, width)).astype(np.float32))
             want, got = ops(mixes, scale, base), split(mixes, scale, base, hc_mult, sinkhorn_iters, eps)
-            same = all(mx.array_equal(g, w).item() for g, w in zip(got, want))
+            same = kernel_checks.same_bits(got, want)
             STATS['checked'] += 1
             if not same:
                 STATS['mismatched'] += 1
@@ -176,7 +181,7 @@ def _fp8_ops(x):
 
 def fp8_matches(x):
     got, want = fp8_roundtrip(x), _fp8_ops(x)
-    return mx.array_equal(got, want).item()
+    return kernel_checks.same_bits(got, want)
 
 
 class _AsMlxVlmKernel:
@@ -308,8 +313,8 @@ def prepost_matches(seed=0, shapes=PREPOST_CHECK):
             post = mx.array(rng.uniform(0, 2 * spread, lead + (4,)).astype(np.float32))
             comb = mx.array(rng.dirichlet(np.ones(4), lead + (4,)).astype(np.float32) * spread)
             if not (
-                mx.array_equal(hc_pre(x4, pre), ops_pre(x4, pre)).item()
-                and mx.array_equal(hc_expand(x, x4, post, comb), ops_expand(x, x4, post, comb)).item()
+                kernel_checks.same_bits(hc_pre(x4, pre), ops_pre(x4, pre))
+                and kernel_checks.same_bits(hc_expand(x, x4, post, comb), ops_expand(x, x4, post, comb))
             ):
                 return False
     return True
@@ -414,7 +419,7 @@ def route(logits, bias, scale, k):
 
 def install_route(gates, rows=(1, 7, 33), seed=0):
     ROUTE[0] = False
-    if not (ROUTE_ON[0] and cuda_kernels.available()) or not gates:
+    if not (ROUTE_ON[0] and _gpu()) or not gates:
         return False
     rng = np.random.default_rng(seed)
     ok = True
@@ -426,7 +431,7 @@ def install_route(gates, rows=(1, 7, 33), seed=0):
                 return False
             want = gate.by_ops(logits)
             got = route(logits, gate.bias, gate.routed_scaling_factor, gate.top_k)
-            ok = ok and all(mx.array_equal(g, w).item() for g, w in zip(got, want))
+            ok = ok and kernel_checks.same_bits(got, want)
         if not ok:
             break
     ROUTE[0] = ok
@@ -440,9 +445,189 @@ def install_route(gates, rows=(1, 7, 33), seed=0):
     return ok
 
 
+ATTN_ON = [True]                # QUANTEEZE_CUDA_ATTN
+ATTN = {}
+GLUE_SOURCE = r"""
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<32>(block);
+  const int row = blockIdx.x, t = threadIdx.x, lane = warp.thread_rank(), w = warp.meta_group_rank();
+  constexpr float NEG_INF = -cuda::std::numeric_limits<float>::infinity();
+  constexpr float LOWEST = cuda::std::numeric_limits<float>::lowest();
+  cg::greater<float> max_op;
+  cg::plus<float> plus_op;
+  __shared__ float local_max[32];
+  __shared__ float local_norm[32];
+  const int W = window_shape[window_ndim - 1], P = pooled_shape[pooled_ndim - 1];
+  auto cover = [](int n) { int need = (n + 3) / 4, b = 32; while (b < need && b < 1024) b *= 2; return b; };
+  const int TW = cover(W), TP = cover(P);
+  auto lse = [&](const float* in, const bool* mask, int n, int threads) -> float {
+    const int nw = threads / 32;
+    float vals[4];
+    for (int i = 0; i < 4; i++) {
+      const int c = t * 4 + i;
+      vals[i] = (t < threads && c < n) ? (mask[c] ? in[c] : LOWEST) : NEG_INF;
+    }
+    float maxval = LOWEST, normalizer = 0.0f, prevmax = maxval;
+    for (int i = 0; i < 4; i++) maxval = max_op(maxval, vals[i]);
+    normalizer = normalizer * __expf(prevmax - maxval);
+    for (int i = 0; i < 4; i++) normalizer = normalizer + __expf(vals[i] - maxval);
+    prevmax = maxval;
+    maxval = cg::reduce(warp, maxval, max_op);
+    normalizer = normalizer * __expf(prevmax - maxval);
+    normalizer = cg::reduce(warp, normalizer, plus_op);
+    prevmax = maxval;
+    block.sync();
+    if (lane == 0) local_max[w] = maxval;
+    block.sync();
+    maxval = lane < nw ? local_max[lane] : NEG_INF;
+    maxval = cg::reduce(warp, maxval, max_op);
+    normalizer = normalizer * __expf(prevmax - maxval);
+    block.sync();
+    if (lane == 0) local_norm[w] = (w < nw) ? normalizer : 0.0f;
+    block.sync();
+    normalizer = lane < nw ? local_norm[lane] : 0.0f;
+    normalizer = cg::reduce(warp, normalizer, plus_op);
+    return Add{}(logf(normalizer), maxval);
+  };
+  const float n1 = lse(window + row * W, wmask, W, TW);
+  const float n2 = lse(pooled + row * P, pmask, P, TP);
+  const float norm = LogAddExp{}(LogAddExp{}(n1, n2), sinks[row]);
+  for (int j = t; j < W; j += blockDim.x)
+    wout[row * W + j] = Exp{}(Subtract{}(wmask[j] ? window[row * W + j] : LOWEST, norm));
+  for (int j = t; j < P; j += blockDim.x)
+    pout[row * P + j] = Exp{}(Subtract{}(pmask[j] ? pooled[row * P + j] : LOWEST, norm));
+"""
+_GLUE = []
+
+
+def _lse_threads(n):
+    need, block = -(-n // 4), 32
+    while block < need and block < 1024:
+        block *= 2
+    return block
+
+
+def attention_glue(window, wmask, pooled, pmask, sinks):
+    """Fused mask + logsumexp + logaddexp + split-softmax weights for decode sparse pooled attention."""
+    if not _GLUE:
+        _GLUE.append(
+            cuda_kernels.kernel(
+                'quanteeze_v41_attention_glue',
+                ['window', 'wmask', 'pooled', 'pmask', 'sinks'],
+                ['wout', 'pout'],
+                GLUE_SOURCE,
+            )
+        )
+    H, W, P = window.shape[1], window.shape[-1], pooled.shape[-1]
+    block = max(_lse_threads(W), _lse_threads(P))
+    return _GLUE[0](
+        inputs=[window, wmask, pooled, pmask, sinks],
+        grid=(H * block, 1, 1),
+        threadgroup=(block, 1, 1),
+        output_shapes=[window.shape, pooled.shape],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+
+
+def _takes_attention(q, local_kv, pooled, topk, local_mask, pooled_mask, sinks):
+    del pooled
+    return (
+        q.ndim == 4 and q.shape[0] == 1 and q.shape[2] == 1 and q.dtype == mx.float32 and sinks is not None
+        and topk.ndim == 3 and topk.shape[:2] == (1, 1) and 0 < topk.shape[-1] <= 4096
+        and 0 < local_kv.shape[-2] <= 4096
+        and local_mask is not None and local_mask.dtype == mx.bool_ and local_mask.size == local_kv.shape[-2]
+        and pooled_mask is not None and pooled_mask.dtype == mx.bool_ and pooled_mask.size == topk.shape[-1]
+    )
+
+
+def sparse_pooled_attention(q, local_kv, pooled, topk, local_mask, pooled_mask, scale, sinks):
+    from mlx_vlm.models.deepseek_v4 import language as v4
+    if not _takes_attention(q, local_kv, pooled, topk, local_mask, pooled_mask, sinks):
+        return ATTN['original'](q, local_kv, pooled, topk, local_mask, pooled_mask, scale, sinks)
+    pooled_sq = v4._gather_pooled(pooled, topk)
+    q_scaled = q * scale
+    local_scores = q_scaled @ local_kv.swapaxes(-1, -2)
+    q_bl = q_scaled.transpose(0, 2, 1, 3)
+    pooled_scores = (q_bl @ pooled_sq.swapaxes(-1, -2)).transpose(0, 2, 1, 3)
+    local_weights, pooled_weights = attention_glue(
+        local_scores, local_mask.reshape(-1), pooled_scores, pooled_mask.reshape(-1), sinks.astype(mx.float32)
+    )
+    out = local_weights @ local_kv
+    pw_bl = pooled_weights.transpose(0, 2, 1, 3)
+    out = out + (pw_bl @ pooled_sq).transpose(0, 2, 1, 3)
+    return out.astype(q.dtype)
+
+
+ATTN_CHECK = [(128, 512, 1000), (128, 37, 60), (40, 512, 700), (7, 300, 300), (128, 1, 4)]
+
+
+def attention_matches(original, seed=0, cases=ATTN_CHECK, heads=8, dim=512):
+    rng = np.random.default_rng(seed)
+    for W, P, N in cases:
+        q = mx.array(rng.normal(0, 1, (1, heads, 1, dim)).astype(np.float32))
+        local_kv = mx.array(rng.normal(0, 1, (1, 1, W, dim)).astype(np.float32)).astype(mx.bfloat16)
+        pooled = mx.array(rng.normal(0, 1, (1, N, dim)).astype(np.float32)).astype(mx.bfloat16)
+        topk = rng.integers(0, N, (1, 1, P)).astype(np.int32)
+        topk[..., -1:] = -1 if P > 1 else topk[..., -1:]
+        topk = mx.array(topk)
+        local_mask = mx.array(rng.random(W) < 0.9).reshape(1, 1, 1, W)
+        pooled_mask = (topk != -1)[:, None]
+        sinks = mx.array(rng.normal(0, 1, heads).astype(np.float32))
+        args = (q, local_kv, pooled, topk, local_mask, pooled_mask, dim ** -0.5, sinks)
+        if not kernel_checks.same_bits(sparse_pooled_attention(*args), original(*args)):
+            return False
+    return True
+
+
+def install_attention():
+    from mlx_vlm.models.deepseek_v41 import language
+    mine = language._sparse_pooled_attention is sparse_pooled_attention
+    if not (ATTN_ON[0] and _gpu()):
+        if mine:
+            language._sparse_pooled_attention = ATTN['original']
+        ATTN['installed'] = False
+        return False
+    if mine:
+        ATTN['installed'] = True
+        return True
+    ATTN['original'] = language._sparse_pooled_attention
+    ok = attention_matches(ATTN['original'])
+    ATTN['installed'] = ok
+    if ok:
+        language._sparse_pooled_attention = sparse_pooled_attention
+    print(
+        'quanteeze: DeepSeek V4.1 decode sparse-attention glue CUDA kernel: '
+        + ('bit-exact match' if ok else 'mismatch; keeping MLX ops')
+        + ' (QUANTEEZE_CUDA_ATTN)',
+        file=sys.stderr,
+        flush=True,
+    )
+    return ok
+
+
+def cpp_kernels(ext):
+    """Return `(fp8, glue)` CUDA kernel specs for `v41_attention`'s C++ extension matching what Python
+    runs on CUDA (`fp8` when `install_fp8` succeeded, else `None`; `glue` when `install_attention` succeeded)."""
+    from mlx_vlm.models.deepseek_v41 import fakequant, language
+    fp8 = glue = None
+    if isinstance(fakequant._fp8_roundtrip_kernel, _AsMlxVlmKernel):
+        fp8 = ext.cuda_kernel_spec('quanteeze_v41_fp8_roundtrip', ['x'], ['out'], cuda_kernels.HEADER, FP8_SOURCE, 0)
+    if language._sparse_pooled_attention is sparse_pooled_attention:
+        glue = ext.cuda_kernel_spec(
+            'quanteeze_v41_attention_glue',
+            ['window', 'wmask', 'pooled', 'pmask', 'sinks'],
+            ['wout', 'pout'],
+            cuda_kernels.HEADER,
+            GLUE_SOURCE,
+            0,
+        )
+    return fp8, glue
+
+
 def summary():
     return dict(
         hc=dict(STATS),
         route=bool(ROUTE[0]),
         fp8_checked=len(FP8_CHOICE),
+        attn=bool(ATTN.get('installed', False)),
     )

@@ -111,3 +111,55 @@ def test_cuda_experts_2bit_and_4bit_match_stock_bit_for_bit(bits, gs, batch, mon
         assert mx.array_equal(got, want).item()
     assert cuda_experts.STATS['mismatched'] == 0
     assert cuda_experts.STATS['served'] == 2
+
+
+def test_cuda_head_ple_8bit_sm120_and_v41_gpu_guard(monkeypatch):
+    """`cuda_head` & `cuda_ple_layer` accept 4- and 8-bit affine projections, `cuda_v41._gpu()` rejects CPU-rank
+    execution, and `cuda_qmv.qmv_fp8()` delegates cleanly by `cuda_ple.compute_major()`."""
+    from types import SimpleNamespace
+    from quanteeze import cuda_head, cuda_ple, cuda_ple_layer, cuda_qmv, cuda_v41
+
+    monkeypatch.setattr(cuda_kernels, 'available', lambda: True)
+
+    class Projection:
+        def __init__(self, shape, sshape, bits=8, gs=64):
+            self.mode = 'affine'
+            self.bits = bits
+            self.group_size = gs
+            self.weight = mx.zeros(shape, mx.uint32)
+            self.scales = mx.zeros(sshape, mx.bfloat16)
+            self.biases = mx.zeros(sshape, mx.bfloat16)
+
+        def get(self, name, default=None):
+            return getattr(self, name, default)
+
+        def __contains__(self, name):
+            return hasattr(self, name)
+
+    # rename type name to QuantizedLinear for cuda_head.takes check
+    QuantizedLinear = type('QuantizedLinear', (Projection,), {})
+    x = mx.zeros((1, 1, 512), mx.bfloat16)
+    head8 = QuantizedLinear((128, 128), (128, 8), bits=8, gs=64)
+    head2 = QuantizedLinear((128, 32), (128, 8), bits=2, gs=64)
+    assert cuda_head.takes(head8, x)
+    assert not cuda_head.takes(head2, x)
+
+    assert 'qz_qmv8_row<' in cuda_head.ROWS_SOURCE
+    assert 'qz_qmv8_row<' in cuda_ple_layer._PROJECT
+    assert cuda_ple_layer._quantized(head8, 128, 512)
+    assert not cuda_ple_layer._quantized(head2, 128, 512)
+
+    assert isinstance(cuda_ple.compute_major(), int)
+    assert cuda_v41._gpu() is (mx.default_device() == mx.gpu)
+    monkeypatch.setattr(mx, 'default_device', lambda: mx.cpu)
+    assert not cuda_v41._gpu()
+    assert not cuda_v41.available()
+
+    # qmv_fp8 predicate & dispatch path
+    w = mx.zeros((64, 512 // 4), mx.uint32)
+    s = mx.zeros((64, 512 // 32), mx.uint8)
+    assert cuda_qmv.takes_fp8(x.reshape(1, -1), w, s, None, True, 32, 8, 'mxfp8')
+    monkeypatch.setattr(cuda_ple, 'compute_major', lambda: 8)
+    sentinel = mx.ones((1, 64), mx.bfloat16)
+    monkeypatch.setattr(cuda_qmv, '_ORIGINAL', [lambda *a, **k: sentinel])
+    assert cuda_qmv.qmv_fp8(x.reshape(1, -1), w, s) is sentinel

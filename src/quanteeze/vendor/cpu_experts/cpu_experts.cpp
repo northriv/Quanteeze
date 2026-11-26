@@ -356,6 +356,7 @@ API int qz_mxfp4(const uint32_t* w, const uint8_t* sc, int cols, const float* x,
 #include <thread>
 #include <vector>
 #include "atomic_smart_ptr.h"
+#include "lanes.h"
 #include "xwaitcell.h"
 #if defined(__linux__)
 #include <pthread.h>
@@ -964,6 +965,8 @@ struct Server {
     int32_t* ans = nullptr;
     std::unique_ptr<ServeLayer[]> layers;
     int n_layers = 0;
+    int n_rows = 0;
+    std::shared_ptr<Lanes> lanes;
     std::vector<int64_t> done;
     std::vector<int> cpus;
     // Non-blocking active count, shutdown flag, and scalar telemetry for the pinned-mailbox polling loop
@@ -975,7 +978,7 @@ struct Server {
     std::thread thread;
 
     void answer(int i) {
-        ServeLayer& L = layers[i];
+        ServeLayer& L = layers[i % n_layers];
         volatile int32_t* b = box + int64_t(i) * box_words;
         volatile int32_t* a = ans + int64_t(i) * ans_words;
         const int32_t stamp = b[0];
@@ -1033,8 +1036,8 @@ struct Server {
         int64_t last = now_ns();
         while (!stop.load(std::memory_order_acquire)) {
             bool any = false;
-            for (int i = 0; i < n_layers; ++i) {
-                if (!layers[i].on.load(std::memory_order_acquire)) continue;
+            for (int i = 0; i < n_rows; ++i) {
+                if (!layers[i % n_layers].on.load(std::memory_order_acquire)) continue;
                 const int32_t s = reinterpret_cast<volatile int32_t*>(box)[int64_t(i) * box_words];
                 if (s > done[i]) {
                     serving.store(1, std::memory_order_release);
@@ -1055,7 +1058,8 @@ struct Server {
 };
 
 API void* qz_server_new(void* pool, int isa, int D, int n_layers, int32_t* box, int64_t box_words, int32_t* ans,
-                        int64_t ans_words, int spin_us) {
+                        int64_t ans_words, int spin_us, int lanes) {
+    lanes = lanes < 1 ? 1 : lanes;
     auto owned = std::make_unique<Server>();
     Server* s = owned.get();
     s->pool = static_cast<Pool*>(pool);
@@ -1068,9 +1072,15 @@ API void* qz_server_new(void* pool, int isa, int D, int n_layers, int32_t* box, 
     s->spin_us = spin_us;
     s->layers = std::make_unique<ServeLayer[]>(n_layers);
     s->n_layers = n_layers;
-    s->done.assign(n_layers, 0);
-    for (int i = 0; i < n_layers; ++i) s->done[i] = box[int64_t(i) * box_words];
+    s->n_rows = lanes * n_layers;
+    s->lanes = std::make_shared<Lanes>(lanes);
+    s->done.assign(s->n_rows, 0);
+    for (int i = 0; i < s->n_rows; ++i) s->done[i] = box[int64_t(i) * box_words];
     return owned.release();
+}
+
+API int qz_server_lane(void* handle) {
+    return lane_of(static_cast<Server*>(handle)->lanes);
 }
 
 API void qz_server_layer(void* handle, int i, const Proj* like, const void* const* bases, const int64_t* rowb,
@@ -1121,4 +1131,5 @@ API void qz_server_free(void* handle) {
     std::unique_ptr<Server> s(static_cast<Server*>(handle));
     s->stop.store(1, std::memory_order_release);
     if (s->thread.joinable()) s->thread.join();
+    if (s->lanes) s->lanes->gone = 1;
 }

@@ -13,13 +13,16 @@ your choice of either:
      LICENSE-POLYFORM-SHIELD.
 
 Third-party files under src/quanteeze/vendor/deepseek_v4/,
-src/quanteeze/vendor/deepseek_v41/, and src/quanteeze/iq_grids.py retain their
-original MIT License.
+src/quanteeze/vendor/deepseek_v41/, src/quanteeze/iq_grids.py, and
+bench/llamacpp/ retain their original MIT License.
 
-Bundled kamepoolalloc files under src/quanteeze/vendor/kamepoolalloc/
-(https://github.com/northriv/kamepoolalloc, Copyright (C) 2002-2026 Kentaro
-Kitagawa) are dual-licensed under Apache-2.0 OR GPL-2.0-or-later — see
-src/quanteeze/vendor/kamepoolalloc/LICENSE.
+Bundled kamestm (https://github.com/northriv/KAME/tree/master/kamestm) and
+kamepoolalloc (https://github.com/northriv/kamepoolalloc) files under
+src/quanteeze/vendor/kamepoolalloc/ (Copyright (C) 2002-2026 Kentaro Kitagawa)
+are dual-licensed under Apache-2.0 OR GPL-2.0-or-later — see
+src/quanteeze/vendor/kamepoolalloc/LICENSE,
+src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0, and
+src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0.
 
 Portions of the Metal and CUDA kernel ports in src/quanteeze/verify_qmv.py,
 src/quanteeze/expert_qmv.py, src/quanteeze/linear_attn.py, and

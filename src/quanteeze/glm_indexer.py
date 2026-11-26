@@ -34,12 +34,13 @@ from functools import lru_cache
 import mlx.core as mx
 from mlx_vlm.models.glm5_next.language import _score_index_keys
 
+from . import kernel_checks, per_thread
+
 CHECKS = 4
 ON = [True]                     # QUANTEEZE_INDEXER_KERNEL
 WORDS = 4096                    # the bitmap's words: pools up to 131072, a context of 524288 tokens
 STATS = dict(served=0, checked=0, mismatched=0)
-CHOICE = {}                     # (path, top k, pool): whether it matched mlx-vlm's
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('glm_indexer')  # (path, top k, pool): whether it matched mlx-vlm's
 SAID = []
 
 _SELECT = r"""
@@ -221,7 +222,7 @@ def step(indexer, x, q_resid, cache, pool_cache, offset, stock):
     the first CHECKS times it was met, else stock()."""
     pools = pool_cache.offset + (1 if pool_cache.remainder == pool_cache.ratio - 1 else 0)   # after this token
     key = ('scored' if _path(indexer, pools)[1] else 'every', indexer.index_topk, indexer.index_kpool)
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS['served'] += 1
@@ -233,7 +234,7 @@ def step(indexer, x, q_resid, cache, pool_cache, offset, stock):
         pooled = pool_cache.pooled
         pool_keys = pooled if pooled is not None else mx.zeros((1, 0, indexer.head_dim), x.dtype)
         got = select(indexer, x, q_resid, cache.keys[..., :cache.offset, :], pool_keys)
-        same = got.dtype == want.dtype and got.shape == want.shape and mx.array_equal(got, want).item()
+        same = kernel_checks.same_bits(got, want)
     except Exception as error:                              # a kernel that does not build: mlx-vlm's
         if not SAID:
             SAID.append(True)
@@ -241,7 +242,7 @@ def step(indexer, x, q_resid, cache, pool_cache, offset, stock):
                   file=sys.stderr, flush=True)
         same = False
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 

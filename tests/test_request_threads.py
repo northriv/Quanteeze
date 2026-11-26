@@ -379,3 +379,44 @@ def test_mlx_buffers_wired_presets_and_prompt_turns(monkeypatch):
         assert prefill._windows(parts, dummy_layer) == [[(0, 512)], [(512, 1024)], [(1024, 1536)]]
     finally:
         prefill.TURNS = saved_turns
+
+
+def test_whole_model_together_ok_and_wired_while_generating(monkeypatch):
+    """`WHOLE=True` enables `together_ok()` without a Demand driver; `_wired_while_generating()` wires Metal once
+    when the first request enters and restores the prior limit only when the last request exits."""
+    import weakref
+    from quanteeze import demand, parallel, serve
+
+    monkeypatch.setattr(demand, '_LIVE', weakref.WeakSet())
+    monkeypatch.setattr(parallel, 'size', lambda: 1)
+    monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS_ANY', 'off')
+
+    monkeypatch.setattr(request_threads, 'WHOLE', [True])
+    assert request_threads.together_ok()
+    monkeypatch.setattr(request_threads, 'WHOLE', [False])
+    assert not request_threads.together_ok()
+    monkeypatch.setattr(request_threads, 'WHOLE', [True])
+    not_started = SimpleNamespace(_stm=None)
+    monkeypatch.setattr(demand, '_LIVE', [not_started])
+    assert not request_threads.together_ok()
+
+    # Ref-counted Metal wired limit
+    wired_calls = []
+    monkeypatch.setattr(mx.metal, 'is_available', lambda: True)
+    monkeypatch.setattr(mx, 'device_info', lambda: {'max_recommended_working_set_size': 123456})
+    monkeypatch.setattr(mx, 'set_wired_limit', lambda v: wired_calls.append(v) or 999)
+    monkeypatch.setattr(request_threads, '_WIRING', dict(generating=0, before=None))
+    monkeypatch.setattr(request_threads, 'STATS', dict(request_threads.STATS, wired=0))
+    monkeypatch.setattr(serve, '_WIRED', [0])
+
+    with request_threads._wired_while_generating():
+        assert request_threads._WIRING['generating'] == 1
+        assert wired_calls == [123456]
+        with request_threads._wired_while_generating():
+            assert request_threads._WIRING['generating'] == 2
+            assert wired_calls == [123456]
+        assert request_threads._WIRING['generating'] == 1
+        assert wired_calls == [123456]
+    assert request_threads._WIRING['generating'] == 0
+    assert wired_calls == [123456, 999]
+    assert request_threads.STATS['wired'] == 1

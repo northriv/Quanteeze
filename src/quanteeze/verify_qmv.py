@@ -64,21 +64,19 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import kernel_checks, per_thread
+
 CHECKS = 2                         # passes a shape is checked against MLX's one-token decode
 MAX_TOKENS = 8                     # a verify pass's tokens at most (models.linear.DECODE_BLOCK_SIZE)
 PER = 4                            # tokens a threadgroup at most, the pass's split evenly: on the Mac
                                    # 8 at once ran 4-7x slower than 4 at large outputs (the
                                    # per-token arrays out of registers), and 2 by 2 a pass of 3 computed
                                    # a fourth; QUANTEEZE_VERIFY_QMV sets it
-CHOICE = {}                        # shape: the port serving it, or False for none
-CHECKED = {}                       # shape: the passes it was checked on
+CHOICE, CHECKED = kernel_checks.tables('verify_qmv')  # shape: the port serving it, or False for none
 STATS = dict(served=0, declined=0, checked=0, mismatched=0)
-HC_CHOICE = {}                     # (tokens, hc, width, dtype): 'block', 'kernel' or 'tokens'
-HC_CHECKED = {}
+HC_CHOICE, HC_CHECKED = kernel_checks.tables('verify_qmv.hc', reference='tokens')  # (tokens, hc, width, dtype): 'block', 'kernel' or 'tokens'
 HC_WAYS = ('block', 'kernel')
-ATTEND_CHOICE = {}                 # (tokens, heads, width, dtype): which STAGES at once, or False (the loop); not by
-                                   # the top-k, which grows a token a step while the context is short
-ATTEND_CHECKED = {}
+ATTEND_CHOICE, ATTEND_CHECKED = kernel_checks.tables('verify_qmv.attend')  # (tokens, heads, width, dtype): STAGES or False
 _SAID = set()
 
 
@@ -697,14 +695,13 @@ def verify_multi(multi, x):
     groups, t, k = x.shape[1], x.shape[2], x.shape[3]
     one = _Group(multi, 0)
     key = (int(one.bits), int(one.group_size), int(k), int(one.weight.shape[0]), str(x.dtype), multi.mode, 'multi')
-    choice = CHOICE.get(key)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is False:
         STATS['declined'] += 1
         return None
 
     def ours(port):
         return run_multi(port, multi, x)
-    seen = CHECKED.get(key, 0)
     if choice is not None and seen >= CHECKS:
         STATS['served'] += 1
         return ours(choice)
@@ -713,14 +710,14 @@ def verify_multi(multi, x):
     STATS['checked'] += 1
     for port in [choice] if choice is not None else [p for p in FP_PORTS if _applies(p, k, key[3], key[0], key[1])]:
         try:
-            same = mx.array_equal(ours(port), want).item()
+            same = kernel_checks.same_bits(ours(port), want)
         except Exception:                                 # noqa: BLE001 -- a kernel that does not build
             same = False
         if same:
-            CHOICE[key], CHECKED[key] = port, seen + 1
+            per_thread.checked(CHOICE, CHECKED, key, port, CHECKS)
             return want
     STATS['mismatched'] += 1
-    CHOICE[key] = False
+    per_thread.checked(CHOICE, CHECKED, key, False, CHECKS)
     return want
 
 
@@ -730,11 +727,10 @@ def verify_linear(linear, x):
     if not eligible(linear, x):
         return None
     key = _shape(linear, x)
-    choice = CHOICE.get(key)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is False:
         STATS['declined'] += 1
         return None
-    seen = CHECKED.get(key, 0)
     if choice is not None and seen >= CHECKS:
         STATS['served'] += 1
         return run(choice, linear, x)
@@ -746,7 +742,7 @@ def verify_linear(linear, x):
     for port in order:
         try:
             got = run(port, linear, x)
-            same = mx.array_equal(got, want).item()
+            same = kernel_checks.same_bits(got, want)
         except Exception as error:                          # a kernel that does not build: none for it
             if port not in _SAID:
                 _SAID.add(port)
@@ -754,10 +750,10 @@ def verify_linear(linear, x):
                       file=sys.stderr, flush=True)
             same = False
         if same:
-            CHOICE[key], CHECKED[key] = port, seen + 1
+            per_thread.checked(CHOICE, CHECKED, key, port, CHECKS)
             return want
     STATS['mismatched'] += 1
-    CHOICE[key] = False
+    per_thread.checked(CHOICE, CHECKED, key, False, CHECKS)
     return want
 
 
@@ -784,8 +780,7 @@ def verify_hc_expand(x, residual, post, comb, original):
     ways = {'block': lambda: op(x, residual, post, comb),
             'kernel': lambda: hc.exact_hc_expand(x, residual, post, comb),
             'tokens': lambda: _hc_tokens(op, x, residual, post, comb)}
-    choice = HC_CHOICE.get(key)
-    seen = HC_CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(HC_CHOICE, HC_CHECKED, key)
     if choice is not None and seen >= CHECKS:
         STATS['hc_' + choice] = STATS.get('hc_' + choice, 0) + 1
         return ways[choice]()
@@ -793,13 +788,13 @@ def verify_hc_expand(x, residual, post, comb, original):
     for way in ([choice] if choice is not None and choice != 'tokens' else HC_WAYS):
         try:
             got = ways[way]()
-            same = got is not None and mx.array_equal(got, want).item()
+            same = got is not None and kernel_checks.same_bits(got, want)
         except Exception:
             same = False
         if same:
-            HC_CHOICE[key], HC_CHECKED[key] = way, seen + 1
+            per_thread.checked(HC_CHOICE, HC_CHECKED, key, way, CHECKS, reference='tokens')
             return want
-    HC_CHOICE[key], HC_CHECKED[key] = 'tokens', CHECKS
+    per_thread.checked(HC_CHOICE, HC_CHECKED, key, False, CHECKS, reference='tokens')
     return want
 
 
@@ -857,7 +852,7 @@ def _stages(attention, q, latent, topk, kv_cache):
                glm.scaled_dot_product_attention(queries, selected, selected, cache=kv_cache, scale=attention.scale,
                                                 mask=valid[:, None]),
                attention.unembed_out(outs))
-    return tuple(bool(mx.array_equal(a, b).item()) for a, b in zip(at_once, (queries, outs, unembedded)))
+    return tuple(bool(kernel_checks.same_bits(a, b)) for a, b in zip(at_once, (queries, outs, unembedded)))
 
 
 def verify_attend(attention, original, q, latent, new_latent, topk, kv_cache, projected_cache, last_only=False):
@@ -872,7 +867,7 @@ def verify_attend(attention, original, q, latent, new_latent, topk, kv_cache, pr
             or hasattr(kv_cache, 'bits') or 'TurboQuant' in type(kv_cache).__name__):
         return original(q, latent, new_latent, topk, kv_cache, projected_cache, last_only)
     key = (int(t), int(q.shape[1]), int(q.shape[-1]), str(q.dtype))
-    choice, seen = ATTEND_CHOICE.get(key), ATTEND_CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(ATTEND_CHOICE, ATTEND_CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if not choice:
             return original(q, latent, new_latent, topk, kv_cache, projected_cache, last_only)
@@ -884,7 +879,7 @@ def verify_attend(attention, original, q, latent, new_latent, topk, kv_cache, pr
 
     def matches(at_once):
         got = _attend_at_once(attention, q, latent, topk, kv_cache, at_once).transpose(0, 2, 1, 3).reshape(1, t, -1)
-        return mx.array_equal(got, want[0]).item()
+        return kernel_checks.same_bits(got, want[0])
     try:
         tried = choice or (True, True, True)
         same = matches(tried)
@@ -901,8 +896,7 @@ def verify_attend(attention, original, q, latent, new_latent, topk, kv_cache, pr
             print(f'quanteeze: verify attention at once unavailable ({type(error).__name__}: {error})',
                   file=sys.stderr, flush=True)
         same = False
-    ATTEND_CHOICE[key] = tuple(tried) if same else False
-    ATTEND_CHECKED[key] = seen + 1 if same else CHECKS
+    per_thread.checked(ATTEND_CHOICE, ATTEND_CHECKED, key, tuple(tried) if same else False, CHECKS)
     return want
 
 

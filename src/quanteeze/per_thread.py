@@ -24,6 +24,8 @@ class _Pass(threading.local):
         self.verify = False
         self.exact = False
         self.batch = False
+        self.collective = None
+        self.capture = None
         self.caps = None
         self.round = None
         self.drafted = None
@@ -182,7 +184,7 @@ class Counts:
         self._local.read = None
         mine = own.get(key)
         if mine is None:
-            mine = _zero_like(self._template[key]) if key in self._template else type(value)(0)
+            mine = _zero_like(self._template[key]) if key in self._template else type(_plain(value))(0)
             if not self._owns or own is self._owns[0]:
                 mine = copy.deepcopy(self._template.get(key, mine))
         own[key] = _plain(mine + (value - base))
@@ -319,6 +321,38 @@ def _zero_like(v):
     if isinstance(v, list) and all(map(_number, v)):
         return [type(x)(0) for x in v]
     return copy.deepcopy(v)
+
+
+_NO_TABLE = object()
+
+
+def checked(choice, seen, key, found, checks, reference=False):
+    """Count one of the first `checks` checks of kernel shape `key` against its reference.
+
+    `found` is truthy on match (or the kernel choice value) and falsy on mismatch, which sticks
+    with `reference` and `seen = checks`. Uses the atomic C++ `kernel_checks` cell when backed by
+    `kernel_checks.tables()`, or `counted()` on plain dicts for single-threaded fallback.
+    """
+    count_fn = getattr(choice, 'count', None)
+    if count_fn is not None and getattr(seen, 'table', None) is getattr(choice, 'table', _NO_TABLE):
+        return count_fn(key, found, checks, reference)
+    return counted(choice, seen, key, found, checks, reference)
+
+
+def counted(choice, seen, key, found, checks, reference=False):
+    """Single-threaded dict implementation of `checked()`."""
+    was = choice.get(key, _NO_TABLE)
+    if (
+        was is not _NO_TABLE
+        and (was is reference or (reference is not False and was == reference))
+        and seen.get(key, 0) >= checks
+    ):
+        return reference
+    if found:
+        choice[key], seen[key] = found, seen.get(key, 0) + 1
+    else:
+        choice[key], seen[key] = reference, checks
+    return choice[key]
 
 
 KIND_PROMPT = 0

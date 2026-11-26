@@ -33,10 +33,8 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from . import cuda_kernels
+from . import cuda_kernels, cuda_ple, kernel_checks, per_thread
 
-CHECKS = 3
-ON = [True]                     # QUANTEEZE_CUDA_QMV
 CHECKS = 3
 ON = [True]                     # QUANTEEZE_CUDA_QMV
 ROWS_ON = [True]                # QUANTEEZE_CUDA_QMV_ROWS: a call of 2 to ROWS_MOST rows through qmv_rows()
@@ -46,8 +44,7 @@ BITS = (4, 8)                   # bits computes() takes (qz_qmv4_row(s), qz_qmv8
 ROWS_LEAST = {4: 1 << 21, 8: 1 << 22}   # minimum weights * (rows - 1) for qmv_rows()
 ONE_LEAST = [1 << 24]           # minimum weights for one-row 8-bit qmv() (None: leave to MLX)
 STATS = dict(served=0, rows=0, checked=0, mismatched=0)
-CHOICE = {}                     # (K, N, group size[, bits, rows]): whether it matched MLX's
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('cuda_qmv')  # (K, N, group size[, bits, rows]): whether it matched MLX's
 SAID = []
 _ORIGINAL = []                  # mx.quantized_matmul as MLX gave it
 
@@ -468,6 +465,81 @@ def qmv_rows(x, w, scales, biases, group_size, bits):
     )[0]
 
 
+FP8_HEADER = '#include <cooperative_groups/reduce.h>\n'
+
+FP8_SM120_SOURCE = r"""
+  namespace cg = cooperative_groups;
+  auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+  const int n = w_shape[0], k = x_shape[x_ndim - 1];
+  const int row = blockIdx.x * RPB + threadIdx.y;
+  if (row >= n) return;
+  const int lane = warp.thread_rank();
+  const int packed = k / 4;
+  const uint32_t* mat = reinterpret_cast<const uint32_t*>(w) + static_cast<long long>(row) * packed;
+  const uint8_t* sp = reinterpret_cast<const uint8_t*>(scales) + static_cast<long long>(row) * (k / 32) + (lane * 16) / 32;
+  const uint16_t* xs = reinterpret_cast<const uint16_t*>(x);
+  auto e4m3 = [](uint32_t b) -> float {
+    const float v = __fmaf_ieee_rn(__uint_as_float(((b & 0x80u) << 24) | ((b & 0x7fu) << 20)), 0x1p120f, -0.0f);
+    return (b & 0x7fu) == 0x7fu ? __uint_as_float(0x7fc00000u) : v;
+  };
+  auto xf = [&](int i) -> float { return __uint_as_float(static_cast<uint32_t>(xs[i]) << 16); };
+  float sum = 0.0f;
+  for (int col = 4 * lane; col < packed; col += 32 * 4) {
+    float sx = 0.0f, sy = 0.0f;
+    const uint4 words = *reinterpret_cast<const uint4*>(mat + col);
+    const uint32_t ws[4] = {words.x, words.y, words.z, words.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int at = 4 * (col + j);
+      sx = __fmaf_ieee_rn(e4m3(ws[j] & 0xffu), xf(at), sx);
+      sx = __fmaf_ieee_rn(e4m3((ws[j] >> 8) & 0xffu), xf(at + 1), sx);
+      sy = __fmaf_ieee_rn(e4m3((ws[j] >> 16) & 0xffu), xf(at + 2), sy);
+      sy = __fmaf_ieee_rn(e4m3(ws[j] >> 24), xf(at + 3), sy);
+    }
+    const uint32_t sb = *sp;
+    const float scale = sb == 0 ? __uint_as_float(0x00400000u) : sb == 255 ? __uint_as_float(0x7fc00000u)
+                                                                : __uint_as_float(sb << 23);
+    sum = __fmaf_ieee_rn(__fmaf_ieee_rn(sx, 1.0f, sy), scale, sum);
+    sp += 16;
+  }
+  sum = cg::reduce(warp, sum, cg::plus<float>{});
+  if (lane == 0) reinterpret_cast<__nv_bfloat16*>(y)[row] = __float2bfloat16_rn(sum);
+"""
+
+
+@lru_cache(maxsize=None)
+def _fp8_sm120_kernel():
+    return cuda_kernels.kernel(
+        'quanteeze_qmv_mxfp8_sm120', ['x', 'w', 'scales'], ['y'], FP8_SM120_SOURCE, header=FP8_HEADER
+    )
+
+
+def takes_fp8(x, w, scales, biases, transpose, group_size, bits, mode):
+    """Whether `qmv_fp8()` computes this one-row affine MXFP8 call."""
+    return (transpose is True and mode == 'mxfp8' and bits == 8 and group_size == 32
+            and biases is None and x.dtype == mx.bfloat16 and w.ndim == 2 and w.dtype == mx.uint32
+            and scales.dtype == mx.uint8 and x.ndim >= 1 and x.size == x.shape[-1]
+            and x.shape[-1] % 512 == 0 and x.shape[-1] == scales.shape[-1] * 32 == w.shape[-1] * 4
+            and scales.shape[0] == w.shape[0])
+
+
+def qmv_fp8(x, w, scales):
+    """`mx.quantized_matmul(x, w, scales, transpose=True, group_size=32, bits=8, mode='mxfp8')` of one row:
+    matches MLX's `fp_qmv` on compute capability >= 10, delegates to MLX below."""
+    if cuda_ple.compute_major() >= 10:
+        n = w.shape[0]
+        return _fp8_sm120_kernel()(
+            inputs=[x, w, scales],
+            template=[('RPB', 8)],
+            grid=(32 * -(-n // 8), 8, 1),
+            threadgroup=(32, 8, 1),
+            output_shapes=[(*x.shape[:-1], n)],
+            output_dtypes=[x.dtype],
+        )[0]
+    fn = _ORIGINAL[0] if _ORIGINAL else mx.quantized_matmul
+    return fn(x, w, scales, None, True, 32, 8, 'mxfp8')
+
+
 def computes(x, w, scales, biases, transpose, group_size, bits, mode):
     """Whether qz_qmv4_row (4 bits) or qz_qmv8_row (8 bits) computes each row of this call."""
     return (transpose is True and mode == 'affine' and bits in BITS and biases is not None
@@ -524,7 +596,7 @@ def _served(key, mine, theirs, counted='served'):
     """mine() where this shape matched theirs() bit for bit the first CHECKS times it was met, else
     theirs(); a call being traced into a compiled graph (whose values cannot be read) theirs() until
     the checks are made outside one."""
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS[counted] += 1
@@ -533,7 +605,7 @@ def _served(key, mine, theirs, counted='served'):
     want = theirs()
     try:
         got = mine()
-        same = mx.array_equal(got, want).item()
+        same = kernel_checks.same_bits(got, want)
     except Exception as error:
         if 'transformations' in str(error):                 # traced (mx.compile): nothing to compare yet
             return want
@@ -544,7 +616,7 @@ def _served(key, mine, theirs, counted='served'):
         same = False
     STATS['checked'] += 1
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 

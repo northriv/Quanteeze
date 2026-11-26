@@ -23,11 +23,14 @@ or an argument whose prompt axis cannot be told, goes through whole, as the mode
 enabled() is asked each call: true while the model is served on demand from the SSD.
 """
 from contextlib import contextmanager, nullcontext
+import sys
 import threading
 import time
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from . import kernel_checks
 
 _STATE = threading.local()
 TURNS = None
@@ -206,7 +209,7 @@ def _join(values, lengths):
 
 def _same(a, b):
     if isinstance(a, mx.array) and isinstance(b, mx.array):
-        return a.shape == b.shape and a.dtype == b.dtype and bool(mx.array_equal(a, b).item())
+        return kernel_checks.same_bits(a, b)
     if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)) and len(a) == len(b):
         return all(_same(x, y) for x, y in zip(a, b))
     return a == b
@@ -355,7 +358,14 @@ def _chunked(cls):
             sw = arch.switch_of(self)
             dem = getattr(sw, 'demand', None) if sw is not None else None
             if dem is not None:
-                dem.end_layer_prefill(sw, ok=ok)
+                try:
+                    dem.end_layer_prefill(sw, ok=ok)
+                except Exception as err:
+                    if not ok:
+                        print(f'quanteeze: prefill layer cleanup failed: {type(err).__name__}: {err}',
+                              file=sys.stderr, flush=True)
+                    else:
+                        raise
         return whole
 
     return type(f'Chunked{cls.__name__}', (cls,), {'__call__': __call__, '_quanteeze_chunked': True})

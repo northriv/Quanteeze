@@ -12,7 +12,7 @@ import threading
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import variables
+from . import per_load, variables
 
 CHUNK = 1024
 SLACK_TOKENS = 256
@@ -27,26 +27,37 @@ STATS = dict(
 _SIZES = dict(working=0, prompt=0, prompt_tokens=0, kv_token=0.0, kv_fixed=0)
 _LOCK = threading.Lock()
 _ROOM = [None]
+_SEEDED = [None]
 _HELD = {}
 _AUTO = [None]
 
 
 def enabled():
     """Whether GPU memory request leases are enabled (`QUANTEEZE_REQUEST_LEASES`, default `on`)."""
-    return not variables.off('QUANTEEZE_REQUEST_LEASES')
+    return not variables.off('QUANTEEZE_REQUEST_LEASES', variables.at_load())
 
 
 def seeded():
     return _ROOM[0] is not None
 
 
+def seeded_room():
+    """Return seeded work-room size in bytes, or None before seeding."""
+    return _SEEDED[0]
+
+
+@per_load.on_let_go
 def reset():
-    """Reset work-room lease state when unloading or switching models."""
+    """Reset work-room lease state when unloading or switching models and restore cache limit."""
     with _LOCK:
-        _ROOM[0] = None
+        was = _ROOM[0]
+        _ROOM[0] = _SEEDED[0] = _AUTO[0] = None
         _HELD.clear()
-        _AUTO[0] = None
         _SIZES.update(working=0, prompt=0, prompt_tokens=0, kv_token=0.0, kv_fixed=0)
+        STATS.update({k: type(v)() for k, v in STATS.items()})
+    if was is not None:
+        from . import serve
+        mx.set_cache_limit(serve._cache_limit())
 
 
 def _driver():
@@ -55,7 +66,7 @@ def _driver():
         stm = getattr(d, '_stm', None)
         if stm is not None and stm.started:
             return stm
-    if variables.get('QUANTEEZE_REQUEST_THREADS_ANY').lower() == 'on':
+    if (variables.get('QUANTEEZE_REQUEST_THREADS_ANY', variables.at_load()) or 'off').lower() == 'on':
         return stm_core.room_driver()
     return None
 
@@ -85,6 +96,7 @@ def seed():
         room = min(room, found[0] + found[1] + mx.get_cache_memory())
     room = max(0, int(room))
     driver.room_put(room)
+    _SEEDED[0] = room
     _ROOM[0] = driver
     STATS['seeded_gb'] = round(room / 1e9, 2)
     extra = '' if found is None else f', driver free {found[0] / 1e9:.2f} GB, pool unused {found[1] / 1e9:.2f} GB'

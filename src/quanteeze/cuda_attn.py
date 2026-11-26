@@ -23,7 +23,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from . import cuda_kernels, cuda_qmv
+from . import cuda_kernels, cuda_qmv, kernel_checks, per_load, per_thread
 
 CHECKS = 3
 ON = [True]                     # QUANTEEZE_CUDA_ATTN
@@ -31,10 +31,16 @@ ROWS_ON = [True]                # QUANTEEZE_CUDA_ATTN_ROWS: a verify pass's toke
 ROWS_MOST = 7                   # max verify pass tokens handled cleanly before MLX switches to qmm
 STATS = dict(served=0, checked=0, mismatched=0, rows=0)
 DECLINED = {}                   # why a step was left to mlx-vlm: its count
-CHOICE = {}                     # (shape, softmax block): whether it matched mlx-vlm's
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('cuda_attn')  # (shape, softmax block): whether it matched mlx-vlm's
 SAID = []
 MAX_KEYS = 2056                 # a dense prefix's keys at most (the budget's 2048 and a block's tail), shared memory
+
+
+@per_load.on_let_go
+def _let_go():
+    """Clear per-thread attention provenance cache on model unload while keeping kernel checks."""
+    _MADE.clear()
+    _PROVEN[0] = (None, False)
 
 # A warp a row, 8 rows a block: q's rows, then k's, then v's; each of T tokens in turn.
 _QKV = r"""
@@ -635,7 +641,7 @@ def attend(forward, attention, x, cache, position_ids):
               else tuple(softmax_block(length + i + 1) for i in range(rows)))
     key = (tuple(x.shape), attention.num_attention_heads, attention.num_key_value_heads, attention.head_dim,
            blocks, int(attention.q_proj.bits), int(attention.o_proj.bits))
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if not choice:
             return theirs(cache)
@@ -657,7 +663,7 @@ def attend(forward, attention, x, cache, position_ids):
     try:
         got = _finish(attention, qs, *recorded.fetched, q)
         parts = dict(key=(kr, recorded.given[0]), value=(v, recorded.given[1]), output=(got, want))
-        differ = [name for name, (a, b) in parts.items() if not mx.array_equal(a, b).item()]
+        differ = [name for name, (a, b) in parts.items() if not kernel_checks.same_bits(a, b)]
     except Exception as error:
         return _refuse(key, error, lambda: want)
     if differ and not SAID:
@@ -665,7 +671,7 @@ def attend(forward, attention, x, cache, position_ids):
         print(f'quanteeze: the full attention\'s kernels differ from mlx-vlm\'s in {", ".join(differ)} '
               f'({key}); mlx-vlm\'s serves it', file=sys.stderr, flush=True)
     STATS['mismatched'] += bool(differ)
-    CHOICE[key], CHECKED[key] = not differ, (seen + 1 if not differ else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, not differ, CHECKS)
     return want
 
 
@@ -675,7 +681,7 @@ def _refuse(key, error, theirs):
         print(f'quanteeze: the full attention\'s kernels unavailable ({type(error).__name__}: {error})',
               file=sys.stderr, flush=True)
     STATS['mismatched'] += 1
-    CHOICE[key], CHECKED[key] = False, CHECKS
+    per_thread.checked(CHOICE, CHECKED, key, False, CHECKS)
     return theirs()
 
 

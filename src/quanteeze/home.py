@@ -12,9 +12,10 @@ monitor live server status, and download models from Hugging Face once the user 
   `8` for uniform least-squares quantization) and `QUANTEEZE_FROM_SSD_GB`, prepares or selects the
   PLE SSD view as `QUANTEEZE_NGRAM_SSD` asks, and switches the served model through
   `quanteeze.control.switch_model`.
-- The presets (`PRESETS`): memory (`QUANTEEZE_MEMORY_RESERVE`), n-gram PLE table
-  (`QUANTEEZE_NGRAM_SSD`), MTP speculative decoding (`QUANTEEZE_MTP`, `QUANTEEZE_MTP_EXACT`), and
-  thermal throttling (`QUANTEEZE_THROTTLE_AT`, `QUANTEEZE_THROTTLE_DUTY`).
+- The presets (`PRESETS`): memory (`QUANTEEZE_MEMORY_RESERVE`), wired memory (`QUANTEEZE_WIRED_GB`),
+  n-gram PLE table (`QUANTEEZE_NGRAM_SSD`), Flash-Next KV cache precision (`QUANTEEZE_KV_BITS`),
+  MTP speculative decoding (`QUANTEEZE_MTP`, `QUANTEEZE_MTP_EXACT`), external drafter
+  (`QUANTEEZE_DRAFTER`), and thermal throttling (`QUANTEEZE_THROTTLE_AT`, `QUANTEEZE_THROTTLE_DUTY`).
 - A download (`download()`): fetches a Hugging Face repository into the local cache on a background
   thread after `info()` reports its file count and size.
 """
@@ -38,6 +39,7 @@ UNIFORM_BITS = (1, 2, 3, 4, 8)
 UNIFORM_GGML = ('q3_k', 'q2_k', 'iq2_xs')
 UNIFORM_MODES = ('mxfp4', *UNIFORM_GGML)
 UNIFORM_CHOICES = (*UNIFORM_BITS, *UNIFORM_MODES)
+KV_PLAIN = ('qwen3_5', 'qwen3_5_text')
 ITEMSIZE = {
     'BOOL': 1, 'U8': 1, 'I8': 1, 'U16': 2, 'I16': 2,
     'F16': 2, 'BF16': 2, 'U32': 4, 'I32': 4, 'F32': 4,
@@ -94,18 +96,33 @@ PRESETS = {
             'values': {'QUANTEEZE_NGRAM_SSD': 'off'},
         },
     },
+    'kv': {
+        'off': {
+            'label': 'bfloat16',
+            'about': "the default: the full attention layers' keys and values kept as the model computes them, "
+                     '24.6 kB a token (1.7 GB at 70k tokens, 6.4 GB at 262k)',
+            'plain': "the default: the full attention layers' keys and values kept as the model computes them "
+                     '(Qwen3.8-27B: 65.5 kB a token, 8.6 GB at 128k tokens)',
+            'values': {'QUANTEEZE_KV_BITS': ''},
+        },
+        '8': {
+            'label': '8 bits',
+            'about': "the full attention layers' keys and values at 8 bits, 0.53 of the memory (0.9 GB at 70k "
+                     'tokens, 3.4 GB at 262k): more room for long conversations and the experts. Not the same bits '
+                     '-- a key off by ~0.7% -- though the served KL showed no difference on a CUDA GPU or a Mac, '
+                     'nor did long-prompt prefill or decode speed',
+            'plain': "the full attention layers' keys and values at 8 bits in mlx-vlm's own cache, the last of them "
+                     'left at bfloat16: 0.56 of the memory (Qwen3.8-27B: 36.7 kB a token, 4.8 GB at 128k tokens). '
+                     'Not the same bits; on a Mac decode is 1-3% slower',
+            'values': {'QUANTEEZE_KV_BITS': '8'},
+        },
+    },
     'mtp': {
         'auto': {
             'label': 'Auto',
             'about': 'drafts tokens ahead with the model\'s own MTP / DSpark head where that pays here, verified '
                      'bit for bit against single-token decode',
             'values': {'QUANTEEZE_MTP': '', 'QUANTEEZE_MTP_EXACT': ''},
-        },
-        'dflash2': {
-            'label': 'DFlash2',
-            'about': 'block-diffusion drafter (DFlash2) predicting a token block in parallel and tracing the '
-                     'coherent path via CandidateSelector',
-            'values': {'QUANTEEZE_MTP': 'dflash2', 'QUANTEEZE_MTP_EXACT': 'bits'},
         },
         'exact': {
             'label': 'On (exact)',
@@ -121,6 +138,19 @@ PRESETS = {
             'label': 'Off',
             'about': 'one token a pass; the drafter head\'s 1-2 GB stay free',
             'values': {'QUANTEEZE_MTP': 'off', 'QUANTEEZE_MTP_EXACT': ''},
+        },
+    },
+    'drafter': {
+        'head': {
+            'label': 'MTP head',
+            'about': 'the default: the model\'s own bundled MTP / DSpark head drafts as MTP says',
+            'values': {'QUANTEEZE_DRAFTER': ''},
+        },
+        'dflash2': {
+            'label': 'DFlash2',
+            'about': 'standalone block-diffusion drafter (DFlash2, ~0.3 GB in memory) when present on this machine '
+                     'for this model type; falls back to the bundled MTP head otherwise',
+            'values': {'QUANTEEZE_DRAFTER': 'dflash2'},
         },
     },
     'heat': {
@@ -143,7 +173,7 @@ PRESETS = {
 }
 
 _MODELS = {}
-_DOWNLOAD = {'repo': None, 'state': 'idle', 'error': None, 'bytes': 0, 'total': None, 'path': None}
+_DOWNLOAD = {'repo': None, 'state': 'idle', 'error': None, 'bytes': 0, 'total': None, 'path': None, 'kind': 'model'}
 
 
 def _decoder_layers(path):
@@ -219,20 +249,8 @@ def checkpoints():
 
 
 def _drafter(path):
-    """Whether a checkpoint is a speculative drafter (`..._mtp`, `dflash`, `dflash2`, `dspark`, `eagle3`) rather
-    than a standalone model."""
-    try:
-        cfg = json.loads((Path(path) / 'config.json').read_text())
-    except (OSError, ValueError):
-        return False
-    mtype = str(cfg.get('model_type', '')).lower()
-    archs = [str(a) for a in (cfg.get('architectures') or ())]
-    return (
-        mtype.endswith('_mtp')
-        or mtype in ('dflash', 'dflash2', 'dspark', 'eagle3')
-        or 'dflash_config' in cfg
-        or any('DraftModel' in a or 'DSparkModel' in a for a in archs)
-    )
+    """Whether a checkpoint is a drafter that serves beside a model rather than a target model."""
+    return mtp.drafter_checkpoint(path)
 
 
 # ---------------------------------------------------------------- the catalog
@@ -258,6 +276,13 @@ def _gb(path):
     return sum(os.path.getsize(p) for p in path.glob('*.safetensors') if p.exists()) / 1e9
 
 
+def _fresh(info):
+    """Return catalog info with fresh local drafter discovery for its model type."""
+    mtp_info = dict(info['mtp'])
+    mtp_info['drafters'] = mtp.drafters_for(mtp_info.get('kind'))
+    return dict(info, mtp=mtp_info)
+
+
 def model_info(path):
     """What the catalog says of a checkpoint: its name, repository, model type, GB, whether it has
     routed experts, its original expert GB and uniform least-squares GB at 1-8 bits, and the GB of
@@ -265,7 +290,7 @@ def model_info(path):
     path = Path(path)
     key = (str(path), (path / 'config.json').stat().st_mtime)
     if key in _MODELS:
-        return dict(_MODELS[key])
+        return _fresh(_MODELS[key])
     text, whole = _config(path)
     n_experts = next((int(text.get(k) or whole.get(k)) for k in EXPERTS if text.get(k) or whole.get(k)), 0)
     moe = n_experts > 0
@@ -281,7 +306,9 @@ def model_info(path):
         'experts_per_tok': int(text.get('num_experts_per_tok') or 0) or None,
     }
     drafts, why = mtp.auto(path, whole.get('model_type'))
-    info['mtp'] = {'head': mtp.head(path) > 0, 'auto': drafts, 'why': why}
+    info['mtp'] = {'head': mtp.head(path) > 0, 'auto': drafts, 'why': why, 'kind': whole.get('model_type')}
+    kind_kv = whole.get('model_type') or text.get('model_type')
+    info['kv_bits'] = 'flash' if kind_kv == 'qwen4_exp' else 'plain' if kind_kv in KV_PLAIN else False
     try:
         info['ple'] = ple_info(path)
     except (ValueError, OSError, KeyError) as e:
@@ -302,7 +329,7 @@ def model_info(path):
         except (ValueError, OSError, KeyError):
             info['uniform_gb'], info['stock_bits'] = None, None
     _MODELS[key] = info
-    return dict(info)
+    return _fresh(info)
 
 
 def _sizes(path, named):
@@ -618,10 +645,20 @@ def presets():
         for key, p in choices.items():
             if all(variables.get(n) == (v or variables.get(n, {})) for n, v in p['values'].items()):
                 now = key
+        if (group == 'drafter'
+                and not (variables.get('QUANTEEZE_DRAFTER') or '').strip()
+                and (variables.get('QUANTEEZE_MTP') or '').strip().lower() == 'dflash2'):
+            now = 'dflash2'
         out[group] = {
-            'choices': [{'key': k, 'label': p['label'], 'about': p['about']} for k, p in choices.items()],
+            'choices': [
+                {'key': k, 'label': p['label'], 'about': p['about'],
+                 **({'plain': p['plain']} if 'plain' in p else {})}
+                for k, p in choices.items()
+            ],
             'now': now or 'custom',
         }
+    if out['kv']['now'] == 'custom' and variables.off('QUANTEEZE_KV_BITS'):
+        out['kv']['now'] = 'off'
     if sys.platform != 'darwin':
         out['heat']['note'] = 'Only macOS tells quanteeze how hot it runs: here none of these slows it down.'
     import mlx.core as mx
@@ -641,7 +678,11 @@ def choose_preset(group, key):
         values = PRESETS[group][key]['values']
     except KeyError:
         raise ValueError(f'no preset {group}/{key}') from None
-    out = control.change(dict(values))
+    vals = dict(values)
+    if (group == 'drafter' and key == 'head'
+            and (variables.get('QUANTEEZE_MTP') or '').strip().lower() == 'dflash2'):
+        vals['QUANTEEZE_MTP'] = ''
+    out = control.change(vals)
     if out['rejected']:
         raise ValueError('; '.join(f'{n}: {why}' for n, why in out['rejected'].items()))
     return presets()
@@ -675,12 +716,12 @@ def info(repo):
         'gb': round(sum(sizes) / 1e9, 2),
         'gated': bool(getattr(m, 'gated', False)),
         'where': str(hub() / f'models--{repo.replace("/", "--")}'),
-        'local': local(repo),
+        'local': local(repo) or mtp._local(repo),
     }
 
 
 def local(repo):
-    """The checkpoint of `repo` here (its catalog path), or None."""
+    """The checkpoint of `repo` here (its catalog path), or None.  Drafters use `mtp._local()`."""
     for d in checkpoints():
         if repo_of(d) == repo:
             return str(d)
@@ -699,14 +740,16 @@ def download_state():
     return out
 
 
-def download(repo, total=None, fetch=None):
+def download(repo, total=None, fetch=None, kind='model'):
     """Fetch `repo` into Hugging Face's cache on a thread of its own; one at a time."""
     repo = _repo(repo)
+    if kind not in ('model', 'drafter'):
+        raise ValueError(f'kind: model or drafter, not {kind!r}')
     if _DOWNLOAD['state'] == 'downloading':
         raise ValueError(f'downloading {_DOWNLOAD["repo"]} already')
     if fetch is None:
         from huggingface_hub import snapshot_download as fetch
-    _DOWNLOAD.update(repo=repo, state='downloading', error=None, bytes=0, total=total, path=None)
+    _DOWNLOAD.update(repo=repo, state='downloading', error=None, bytes=0, total=total, path=None, kind=kind)
 
     def run():
         try:
@@ -761,7 +804,8 @@ def live():
         out['demand'] = demand_inst.summary()
     out['serving'] = dict(serve._SERVING.get('info') or {})
     if mtp.ACTIVE[0] is not None:
-        out['mtp'] = mtp.summary(mtp.ACTIVE[0][0])
+        drafter, kind = mtp.ACTIVE[0]
+        out['mtp'] = dict(mtp.summary(drafter), drafter=mtp.name(drafter), kind=kind, bits=mtp.bits_of(drafter))
     out['model'] = control.chosen() or control.current()
     out['requests'] = phases.state(control._SWITCH['inflight'])
     return out
@@ -831,5 +875,6 @@ def handle(method, route, body):
         return download(
             body.get('repo'),
             float(body['gb']) * 1e9 if isinstance(body.get('gb'), (int, float)) else None,
+            kind=body.get('kind') or 'model',
         )
     return download_state()

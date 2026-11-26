@@ -39,6 +39,111 @@ if sys.platform != 'darwin' and _gpu_model():
     except Exception:
         pass
 
+
+NVRTC_PCH = [None]              # vendor/nvrtc_pch/nvrtc_pch.cpp CDLL handle when loaded, else None
+NVRTC_PCH_DIR = [None]          # per-process directory where NVRTC writes PCH files, or None
+_PCH_PREFIX = 'quanteeze-nvrtc-pch-'
+_PCH_ALIVE = '.alive'           # flock'd while this process lives
+_PCH_HELD = []                  # open fd(s) holding the flock
+
+
+def _pch_dir(lib):
+    """Create a per-process PCH directory under $TMPDIR (or /tmp) and bind it via `qz_nvrtc_pch_dir`.
+
+    Sweeps stale same-host, same-uid PCH directories whose `.alive` flock can be acquired (i.e. dead
+    processes), holds an exclusive flock on `.alive` while alive, and removes the directory via a
+    PID-guarded `atexit` callback.
+    """
+    import atexit
+    import fcntl
+    import shutil
+    import socket
+    import tempfile
+    import time
+
+    root = tempfile.gettempdir()
+    prefix = f'{_PCH_PREFIX}{socket.gethostname().split(".")[0]}-'
+    uid = os.getuid()
+    for name in os.listdir(root):
+        if not name.startswith(prefix):
+            continue
+        old = os.path.join(root, name)
+        try:
+            if os.stat(old).st_uid != uid:
+                continue
+            fd = os.open(os.path.join(old, _PCH_ALIVE), os.O_RDONLY)
+        except FileNotFoundError:
+            try:
+                if time.time() - os.stat(old).st_mtime > 600:
+                    shutil.rmtree(old, ignore_errors=True)
+            except OSError:
+                pass
+            continue
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            continue
+        else:
+            shutil.rmtree(old, ignore_errors=True)
+        finally:
+            os.close(fd)
+
+    path = tempfile.mkdtemp(prefix=f'{prefix}{os.getpid()}-', dir=root)
+    fd = None
+    try:
+        fd = os.open(os.path.join(path, _PCH_ALIVE), os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not lib.qz_nvrtc_pch_dir(path.encode()):
+            raise OSError('nvrtc_pch library rejected PCH directory')
+        _PCH_HELD.append(fd)
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+    pid = os.getpid()
+    atexit.register(lambda: os.getpid() == pid and shutil.rmtree(path, ignore_errors=True))
+    return path
+
+
+def _nvrtc_pch():
+    """Load libnvrtc_pch with RTLD_GLOBAL before MLX imports so custom kernels add --pch."""
+    if 'mlx.core' in sys.modules:
+        return
+    from . import native_ext, variables
+    if variables.off('QUANTEEZE_NVRTC_PCH') or not native_ext.available():
+        return
+    try:
+        import ctypes
+        lib_path = native_ext.library('nvrtc_pch', quiet=True)
+        if lib_path is None:
+            return
+        lib = ctypes.CDLL(str(lib_path), mode=ctypes.RTLD_GLOBAL)
+        NVRTC_PCH[0] = lib
+        NVRTC_PCH_DIR[0] = _pch_dir(lib)
+    except Exception as e:                                                # noqa: BLE001 -- NVRTC as MLX calls it
+        print(f'quanteeze: NVRTC precompiled headers (QUANTEEZE_NVRTC_PCH) not used: {type(e).__name__}: {e}',
+              file=sys.stderr, flush=True)
+
+
+def nvrtc_pch_counts():
+    """Return `(compiles, pch_added, pch_made)` recorded by `nvrtc_pch`, or None when not loaded."""
+    if NVRTC_PCH[0] is None:
+        return None
+    import ctypes
+    out = (ctypes.c_uint64 * 3)()
+    NVRTC_PCH[0].qz_nvrtc_pch_counts(out)
+    return int(out[0]), int(out[1]), int(out[2])
+
+
+if sys.platform != 'darwin' and _gpu_model():
+    _nvrtc_pch()
+
 # mlx-vlm's modules quanteeze patches as they are imported, before any model is built or loaded.
 PATCHES = {
     'mlx_vlm.utils': lambda m: importlib.import_module('quanteeze.checkpoints').install(m),

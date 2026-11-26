@@ -1,0 +1,42 @@
+cff-version: 1.2.0
+message: "If you use Quanteeze in academic or research work, please cite both Quanteeze and the underlying kamestm / kamepoolalloc papers as applicable."
+type: software
+title: "Quanteeze: Fast Uniform Quantization and On-Demand MoE Serving on Apple Silicon and CUDA"
+version: 0.1.10
+authors:
+  - family-names: Kitagawa
+    given-names: Kentaro
+    affiliation: "Institute for Solid State Physics, The University of Tokyo"
+repository-code: "https://github.com/northriv/Quanteeze"
+url: "https://github.com/northriv/Quanteeze"
+license: "GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0"
+keywords:
+  - mixture-of-experts
+  - quantization
+  - llm-inference
+  - mlx
+  - apple-silicon
+  - cuda
+  - software-transactional-memory
+references:
+  - type: article
+    title: "Formally Verified Lock-Free Software Transactional Memory for Scientific Measurement"
+    authors:
+      - family-names: Kitagawa
+        given-names: Kentaro
+    year: 2026
+    doi: "10.48550/arXiv.2608.12024"
+    url: "https://arxiv.org/abs/2608.12024"
+  - type: software
+    title: "kamepoolalloc: A Lock-Free, Per-Thread, Four-Tier Pool Allocator"
+    authors:
+      - family-names: Kitagawa
+        given-names: Kentaro
+    year: 2026
+    repository-code: "https://github.com/northriv/kamepoolalloc"
+  - type: software
+    title: "KAME: AI-Assisted Automation Program for Physical Property Measurements"
+    authors:
+      - family-names: Kitagawa
+        given-names: Kentaro
+    repository-code: "https://github.com/northriv/KAME"

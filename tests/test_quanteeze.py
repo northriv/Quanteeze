@@ -829,6 +829,7 @@ def test_apc_disk_convergent_encryption_exact_and_hybrid(tmp_path, monkeypatch):
     monkeypatch.setattr(apc_disk, 'PRECISION', [None])
     monkeypatch.setenv('QUANTEEZE_BITS', '4')
     monkeypatch.setenv('APC_DISK_MIN_FREE_RAM_GB', '0')
+    monkeypatch.setenv('APC_MEMORY_RESERVE_GB', '0')
 
     # 1. Hybrid checkpoint (KVCache + ArraysCache) -- non-trimmable (`exact_v1`)
     hybrid_dir = tmp_path / 'hybrid'
@@ -969,6 +970,7 @@ def test_apc_disk_block_shards_and_legacy_purge(tmp_path, monkeypatch):
     monkeypatch.setattr(apc_disk, 'PRECISION', [None])
     monkeypatch.setenv('QUANTEEZE_BITS', '3')
     monkeypatch.setenv('APC_DISK_MIN_FREE_RAM_GB', '0')
+    monkeypatch.setenv('APC_MEMORY_RESERVE_GB', '0')
 
     shard_root = tmp_path / 'shards'
     ns_dir = shard_root / _apc._safe_namespace('ns_blocks')

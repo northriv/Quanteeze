@@ -23,13 +23,12 @@ from functools import lru_cache
 import mlx.core as mx
 import numpy as np
 
-from . import cuda_kernels, cuda_ple
+from . import cuda_kernels, cuda_ple, kernel_checks, per_thread
 
 CHECKS = 3
 MAX_ROWS = 256
 STATS = dict(engram=0, embedding=0, checked=0, mismatched=0)
-CHOICE = {}                     # (kind, row width, rows): whether it matched the host's
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('cuda_engram')  # (kind, row width): whether it matched the host's
 SAID = []
 MXFP8 = dict(group_size=32, bits=8, mode='mxfp8')
 
@@ -150,8 +149,8 @@ def lookup(embedding, ids, own):
     table = _table(embedding)
     if table is None:
         return None
-    key = (table[0], table[1], ids.size)
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    key = (table[0], table[1])
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS[table[0]] += 1
@@ -160,7 +159,7 @@ def lookup(embedding, ids, own):
     want = own(embedding, ids)
     try:
         got = rows(table, ids)
-        same = got.shape == want.shape and mx.array_equal(got.view(mx.uint16), want.view(mx.uint16)).item()
+        same = kernel_checks.same_bits(got, want)
     except Exception as error:
         if not SAID:
             SAID.append(True)
@@ -169,7 +168,7 @@ def lookup(embedding, ids, own):
         same = False
     STATS['checked'] += 1
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 

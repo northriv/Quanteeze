@@ -396,6 +396,9 @@ def test_demand_auto_yields_to_gpu_staging_when_load_zero(tmp_path, monkeypatch)
         y = m_dem.layers[0].mlp.switch_mlp(x, inds)
         mx.eval(y)
         assert dem.cpu_served == 0
+        assert dem.cpu_yielded >= 1
+        assert dem.summary()['cpu_yielded'] >= 1
+        assert dem._cpu is None
         assert dem.host_served == 3
     finally:
         if dem is not None:

@@ -7,6 +7,33 @@ license = "GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0"
 license-files = ["LICENSE", "LICENSE-GPL-2.0", "LICENSE-POLYFORM-SHIELD"]
 authors = [{ name = "Kentaro Kitagawa" }]
 requires-python = ">=3.12"
+keywords = [
+    "llm",
+    "vlm",
+    "moe",
+    "mlx",
+    "quantization",
+    "inference",
+    "apple-silicon",
+    "metal",
+    "cuda",
+    "speculative-decoding",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "cryptography>=42",
     "mlx==0.32.4",
@@ -22,6 +49,12 @@ cuda12 = ["mlx[cuda12]==0.32.4"]
 cuda13 = ["mlx[cuda13]==0.32.4"]
 cpu = ["mlx[cpu]==0.32.4"]
 
+[project.urls]
+Homepage = "https://github.com/northriv/Quanteeze"
+Repository = "https://github.com/northriv/Quanteeze"
+Documentation = "https://github.com/northriv/Quanteeze#readme"
+Issues = "https://github.com/northriv/Quanteeze/issues"
+
 [project.scripts]
 quanteeze = "quanteeze.serve:main"
 
@@ -31,6 +64,27 @@ dev = ["pytest>=8"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.uv.build-backend]
+source-include = [
+    "README.ja.md",
+    "CITATION.cff",
+    "tests/**",
+    "bench/**",
+    "scripts/**",
+]
+source-exclude = [
+    "/tests/test_local_*.py",
+    "/CLAUDE.md",
+    "**/__pycache__",
+    "**/*.py[cod]",
+]
+wheel-exclude = [
+    "**/__pycache__",
+    "**/*.py[cod]",
+    "quanteeze/vendor/deepseek_v4/tests/**",
+    "quanteeze/vendor/deepseek_v41/tests/**",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

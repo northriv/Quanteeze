@@ -30,8 +30,12 @@ _INTERNAL = ('tail', 'read_at', 'first_at', 'last_at')
 
 
 def _opens_thinking(generator, request):
-    """Whether the request's prompt ends inside a <think> the template opened (its last tokens);
-    where they cannot be read, whether its arguments leave thinking on."""
+    """Whether the request's prompt ends inside a <think> the template opened (its last tokens),
+    or continues an unclosed thinking block (`reask`); where they cannot be read, whether its
+    arguments leave thinking on."""
+    args = getattr(request, 'args', None)
+    if getattr(args, '_quanteeze_in_thinking', False):
+        return True
     try:
         import numpy as np
         ids = np.array(request.raw_inputs['input_ids']).reshape(-1)[-4:]
@@ -39,7 +43,6 @@ def _opens_thinking(generator, request):
         tail = tokenizer.decode([int(i) for i in ids])
         return THINK in tail and THINK_END not in tail.rsplit(THINK, 1)[-1]
     except Exception:                                  # noqa: BLE001 -- a guess is enough for the page
-        args = getattr(request, 'args', None)
         return getattr(args, 'enable_thinking', None) is not False and getattr(args, 'reasoning_effort', None) != 'none'
 
 
@@ -77,7 +80,7 @@ def wrote(entry, text, tokens, finish_reason):
     tail = entry['tail'] + (text or '')
     if entry['phase'] == 'thinking' and THINK_END in tail:
         entry['phase'], tail = 'answering', tail.split(THINK_END, 1)[1]
-    if entry['phase'] == 'answering' and CALL in tail:
+    if entry['phase'] in ('thinking', 'answering') and CALL in tail:
         entry['phase'] = 'tool'
     entry['tail'] = tail[-len(CALL) - len(THINK_END):]
     if finish_reason is not None:

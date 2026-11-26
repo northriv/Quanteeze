@@ -203,3 +203,22 @@ def test_dspark_native_markov_and_gate_match_python(monkeypatch):
     assert mx.array_equal(got_s, ref_s).item()
     assert mx.array_equal(got_sq, ref_sq).item()
     assert mx.array_equal(got_semb, ref_semb).item()
+
+
+def test_nvrtc_pch_library_builds_and_exports_counts(monkeypatch):
+    """`native_ext.library('nvrtc_pch')` compiles without importing MLX and exports `qz_nvrtc_pch_counts`."""
+    import ctypes
+    import quanteeze
+
+    monkeypatch.setenv('QUANTEEZE_NATIVE', 'on')
+    monkeypatch.setenv('QUANTEEZE_NVRTC_PCH', 'on')
+    expected = native_ext.library_path('nvrtc_pch')
+    lib_path = native_ext.library('nvrtc_pch', force=True, quiet=False)
+    if lib_path is None:
+        pytest.skip('no C++20 compiler available')
+    assert lib_path == expected and lib_path.is_file()
+    handle = ctypes.CDLL(str(lib_path))
+    counts = (ctypes.c_uint64 * 3)(99, 99, 99)
+    handle.qz_nvrtc_pch_counts(counts)
+    assert (counts[0], counts[1], counts[2]) == (0, 0, 0)
+    assert 'QUANTEEZE_NVRTC_PCH' in quanteeze.control.CHOICES

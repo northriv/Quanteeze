@@ -12,13 +12,13 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from . import cuda_kernels, cuda_qmv
+from . import cuda_kernels, cuda_qmv, kernel_checks, per_thread
 
 CHECKS = 3
 ON = [True]                     # QUANTEEZE_CUDA_HEAD
+BITS = (4, 8)                   # bits head() accepts (qz_qmv4_row, qz_qmv8_row)
 STATS = dict(served=0, checked=0, mismatched=0)
-CHOICE = {}                     # (K, N, group size): whether it matched the original
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('cuda_head')  # (K, N, group size[, 8 bits]): whether it matched the original
 SAID = []
 
 HEADER = cuda_qmv.HEADER + r"""
@@ -47,7 +47,12 @@ ROWS_SOURCE = r"""
     __shared__ unsigned long long keys[8];
     unsigned long long key = 0ull;
     if (row < ROW0 + N_OUT) {
-      const float sum = qz_qmv4_row<K_IN, GS>(x, w, scales, biases, row);
+      float sum;
+      if constexpr (BITS == 8) {
+        sum = qz_qmv8_row<K_IN, GS, true>(x, w, scales, biases, row);
+      } else {
+        sum = qz_qmv4_row<K_IN, GS>(x, w, scales, biases, row);
+      }
       key = qz_argmax_key(__float2bfloat16_rn(sum), static_cast<unsigned>(row));
     }
     if (warp.thread_rank() == 0) {
@@ -128,7 +133,8 @@ def head(linear, x):
     first, count = share(n)
     blocks = max(1, -(-count // 8))
     keys = _rows_kernel()(inputs=[mx.contiguous(x.reshape(-1)), linear.weight, linear.scales, linear.biases],
-                          template=[('GS', int(linear.group_size)), ('ROW0', first), ('N_OUT', count), ('K_IN', k)],
+                          template=[('GS', int(linear.group_size)), ('ROW0', first), ('N_OUT', count),
+                                    ('K_IN', k), ('BITS', int(linear.bits))],
                           grid=(32 * blocks, 8, 1), threadgroup=(32, 8, 1), output_shapes=[(blocks,)],
                           output_dtypes=[mx.uint64])[0]
     return _best(keys)
@@ -136,20 +142,21 @@ def head(linear, x):
 
 def takes(linear, x, token_mask=None):
     """Whether head() computes this step's token as the original does: on CUDA, one token of bfloat16
-    and no mask, an affine 4-bit head with biases (no bias added) that cuda_qmv's rows take."""
+    and no mask, an affine 4- or 8-bit head with biases (no bias added) that cuda_qmv's rows take."""
     return (token_mask is None and cuda_kernels.available() and isinstance(x, mx.array) and x.ndim == 3
             and x.shape[:2] == (1, 1) and type(linear).__name__ == 'QuantizedLinear' and 'bias' not in linear
-            and isinstance(linear.get('scales'), mx.array)
-            and cuda_qmv.takes(x, linear.weight, linear.scales, linear.get('biases'), True, linear.group_size,
-                               linear.bits, getattr(linear, 'mode', 'affine')))
+            and isinstance(linear.get('scales'), mx.array) and getattr(linear, 'bits', None) in BITS
+            and cuda_qmv.one_row(x, linear.weight, linear.scales, linear.get('biases'), True, linear.group_size,
+                                 linear.bits, getattr(linear, 'mode', 'affine')))
 
 
 def argmax(linear, x, token_mask, own):
     """own() (the original quantized_argmax) through head() where this shape matched it."""
     if not ON[0] or not takes(linear, x, token_mask):
         return own()
-    key = (x.shape[-1], linear.weight.shape[0], int(linear.group_size))
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    bits = int(linear.bits)
+    key = (x.shape[-1], linear.weight.shape[0], int(linear.group_size)) + ((bits,) if bits != 4 else ())
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS['served'] += 1
@@ -159,10 +166,10 @@ def argmax(linear, x, token_mask, own):
     try:
         from mlx_vlm.models.quantized_verifier import singleton_quantized_linear
         got = head(linear, x)
-        rows = cuda_qmv.qmv(x.reshape(1, -1), linear.weight, linear.scales, linear.biases, linear.group_size)
+        rows = cuda_qmv.qmv(x.reshape(1, -1), linear.weight, linear.scales, linear.biases, linear.group_size, bits)
         theirs = singleton_quantized_linear(linear, x)
-        same = (want is not None and got.shape == want.shape and mx.array_equal(got, want).item()
-                and mx.array_equal(rows.reshape(theirs.shape), theirs).item())
+        same = (want is not None and kernel_checks.same_bits(got, want)
+                and kernel_checks.same_bits(rows.reshape(theirs.shape), theirs))
     except Exception as error:
         if not SAID:
             SAID.append(True)
@@ -171,7 +178,7 @@ def argmax(linear, x, token_mask, own):
         same = False
     STATS['checked'] += 1
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 

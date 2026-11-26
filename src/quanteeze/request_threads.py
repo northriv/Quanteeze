@@ -15,10 +15,11 @@ import itertools
 import secrets
 import sys
 import threading
+import traceback
 
 import mlx.core as mx
 
-from . import leases, per_thread, variables
+from . import leases, per_load, per_thread, variables
 
 _PROMPT = threading.Lock()
 _BUILD = threading.Lock()
@@ -33,6 +34,9 @@ _WORKER = threading.local()
 _SERVING = set()
 _SERVING_LOCK = threading.RLock()
 _SAID_ALONE = [False]
+WHOLE = [False]
+_WIRING = dict(generating=0, before=None)
+_WIRING_LOCK = threading.Lock()
 
 STATS = dict(
     first_here=0,
@@ -46,11 +50,15 @@ STATS = dict(
     cpu_blocks=0,
     prompt_turn_waits=0,
     turn_timeouts=0,
+    wired=0,
 )
 
 PER_REQUEST = ('_rope_deltas', '_position_ids')
 SKIP_EVALUATING = ('engram', 'vision')
 EVALUATE_AT_MOST = 8e9
+
+
+_LOADED = dict(threads=None, any=False)
 
 
 def _count(key, n=1):
@@ -64,9 +72,42 @@ def running():
         return len(_RUNNING)
 
 
+def _load_settings():
+    """Snapshot QUANTEEZE_REQUEST_THREADS and _ANY from the load snapshot into `_LOADED`."""
+    snap = variables.at_load()
+    _LOADED.update(
+        threads=max(1, variables.integer('QUANTEEZE_REQUEST_THREADS', snap)),
+        any=(variables.get('QUANTEEZE_REQUEST_THREADS_ANY', snap) or 'off').strip().lower() == 'on',
+    )
+    return _LOADED['threads']
+
+
 def threads():
     """Return QUANTEEZE_REQUEST_THREADS clamped to at least 1."""
-    return max(1, variables.integer('QUANTEEZE_REQUEST_THREADS'))
+    n = _LOADED['threads']
+    return max(1, variables.integer('QUANTEEZE_REQUEST_THREADS', variables.at_load())) if n is None else n
+
+
+def _any():
+    if _LOADED['threads'] is not None:
+        return _LOADED['any']
+    return (variables.get('QUANTEEZE_REQUEST_THREADS_ANY', variables.at_load()) or 'off').strip().lower() == 'on'
+
+
+def request_lanes():
+    """Number of host mailbox lanes needed for concurrent CPU expert serving."""
+    n = threads()
+    return 1 if n <= 1 else n + 1
+
+
+@per_load.on_let_go
+def reset():
+    """Reset per-load request-thread counters and loaded settings snapshot when unloading."""
+    with _RUNNING_LOCK:
+        for k in STATS:
+            STATS[k] = 0
+    _SAID_ALONE[0] = False
+    _LOADED.update(threads=None, any=False)
 
 
 def _turns():
@@ -136,13 +177,13 @@ def _decode_turn(prompting):
 
 def together_ok():
     """Return True if concurrent request execution is currently safe to overlap."""
-    from . import demand, parallel
-    if parallel.size() > 1:
+    from . import demand, kernel_checks, parallel
+    if parallel.size() > 1 or not kernel_checks.shared():
         return False
     live = list(demand._LIVE)
-    if variables.get('QUANTEEZE_REQUEST_THREADS_ANY').lower() == 'on':
-        return not live
-    return bool(live) and all(d._stm is not None and d._stm.started for d in live)
+    if not live:
+        return bool(WHOLE[0] or _any())
+    return all(d._stm is not None and d._stm.started for d in live)
 
 
 def drafts_alone(generator):
@@ -219,15 +260,22 @@ def _drafter(generator):
     return mine
 
 
-def _room_for(request):
+def _room_for(request, workers=()):
     from . import serve
     adm = serve._ADMISSION[0]
     with _RUNNING_LOCK:
         active = list(_RUNNING.values())
+    if len(active) < sum(1 for w in workers if w.is_alive()):
+        return False
     if not active or adm is None:
         return True
     remaining = [max(0, m - n) for m, n in active] + [int(getattr(request.args, 'max_tokens', 0) or 0)]
-    return adm.reserved(remaining) <= adm.limit - mx.get_active_memory()
+    if adm.kv_token:
+        needed = adm.reserved(remaining)
+    else:
+        per = leases.sizes()['kv_token']
+        needed = per * sum(min(r, adm.ahead) for r in remaining) if per and adm.ahead else 0.0
+    return needed <= adm.limit - mx.get_active_memory()
 
 
 def _batch_generator(generator, args, drafter):
@@ -352,15 +400,30 @@ def _passes_done():
     from . import demand
     try:
         mx.synchronize()
-        for d in list(demand._LIVE):
-            d.thread_done()
     except Exception as e:
-        print(f'quanteeze: request threads: releasing thread passes failed: {type(e).__name__}: {e}',
+        print(f'quanteeze: request threads: synchronizing stream at request end failed: {type(e).__name__}: {e}',
               file=sys.stderr, flush=True)
+    for d in list(demand._LIVE):
+        try:
+            d.thread_done()
+        except Exception as e:
+            print(f'quanteeze: request threads: releasing thread passes failed: {type(e).__name__}: {e}',
+                  file=sys.stderr, flush=True)
+
+
+def passes_failed():
+    """Undo any per-thread marks and holds left behind by a pass that raised."""
+    from . import demand
+    for d in list(demand._LIVE):
+        try:
+            d.pass_failed()
+        except Exception as e:
+            print(f'quanteeze: request threads: resetting failed pass state failed: {type(e).__name__}: {e}',
+                  file=sys.stderr, flush=True)
 
 
 def _draft_together():
-    return variables.get('QUANTEEZE_REQUEST_THREADS_DRAFT_TOGETHER').lower() == 'on'
+    return (variables.get('QUANTEEZE_REQUEST_THREADS_DRAFT_TOGETHER', variables.at_load()) or 'off').lower() == 'on'
 
 
 def _prompt_done(counted):
@@ -626,9 +689,63 @@ def _oldest(uid):
         return bool(_RUNNING) and uid == min(_RUNNING)
 
 
+@contextlib.contextmanager
+def _wired_while_generating():
+    """Keep Metal wired up to working set (or QUANTEEZE_WIRED_GB if higher) across concurrent request threads."""
+    if not mx.metal.is_available():
+        yield
+        return
+    with _WIRING_LOCK:
+        if _WIRING['generating'] == 0:
+            most = int(mx.device_info().get('max_recommended_working_set_size', 0))
+            serve = sys.modules.get(__package__ + '.serve')
+            limit = max(most, int(getattr(serve, '_WIRED', [0])[0] or 0))
+            _WIRING['before'] = mx.set_wired_limit(limit) if limit > 0 else None
+            STATS['wired'] += 1
+        _WIRING['generating'] += 1
+    try:
+        yield
+    finally:
+        with _WIRING_LOCK:
+            _WIRING['generating'] -= 1
+            if _WIRING['generating'] == 0 and _WIRING['before'] is not None:
+                mx.set_wired_limit(_WIRING['before'])
+                _WIRING['before'] = None
+
+
 def _serve(generator, request, uid, slots, own=True, lease=None):
-    with lease if lease is not None else contextlib.nullcontext():
+    with lease if lease is not None else contextlib.nullcontext(), _wired_while_generating():
         _served(generator, request, uid, slots, own, lease)
+
+
+def _served_ends(uid, batch_gen, active, prompting, counted):
+    """Per-step cleanup for `_served`, isolating failures so every subsequent resource still releases."""
+    from . import cuda_ple
+
+    def removed():
+        with _RUNNING_LOCK:
+            for k in [k for k in _RUNNING if k == uid or k in active]:
+                _RUNNING.pop(k, None)
+
+    def unmarked():
+        with _SERVING_LOCK:
+            _SERVING.discard(threading.get_ident())
+
+    steps = (
+        ('prompt turn', (lambda: _prompt_done(counted)) if prompting else None),
+        ('batch close', batch_gen.close if batch_gen is not None and callable(getattr(batch_gen, 'close', None)) else None),
+        ('running marks', removed),
+        ('passes', _passes_done),
+        ('serving mark', unmarked),
+        ('deferred frees', cuda_ple.free_later),
+    )
+    for what, step in steps:
+        if step is None:
+            continue
+        try:
+            step()
+        except Exception as e:
+            print(f'quanteeze: request {uid}: {what}: {type(e).__name__}: {e}', file=sys.stderr, flush=True)
 
 
 def _served(generator, request, uid, slots, own=True, lease=None):
@@ -636,6 +753,7 @@ def _served(generator, request, uid, slots, own=True, lease=None):
     from mlx_vlm.server import generation as G
 
     rqueue, active, batch_gen, prompting, counted = request.rqueue, {}, None, False, False
+    per_thread.PASS.__init__()
     per_thread.PASS.request_uid = uid
     _WORKER.on = True
     with _SERVING_LOCK:
@@ -717,33 +835,28 @@ def _served(generator, request, uid, slots, own=True, lease=None):
                     lease.prompt_done()
                     lease.held(_caches_bytes(batch_gen))
     except Exception as e:
-        import traceback
         print(f'quanteeze: a request thread failed: {type(e).__name__}: {e}', file=sys.stderr, flush=True)
         for info in list(active.values()):
             _phase_ended(info)
         traceback.print_exc(file=sys.stderr)
+        passes_failed()
+        if e.__traceback__ is not None:
+            traceback.clear_frames(e.__traceback__)
         try:
             rqueue.put(e)
         except Exception:
             pass
     finally:
-        if prompting:
-            _prompt_done(counted)
-        if batch_gen is not None and callable(getattr(batch_gen, 'close', None)):
-            batch_gen.close()
-        with _RUNNING_LOCK:
-            for k in [k for k in _RUNNING if k == uid or k in active]:
-                _RUNNING.pop(k, None)
-        _passes_done()
-        with _SERVING_LOCK:
-            _SERVING.discard(threading.get_ident())
-        from . import cuda_ple
-        cuda_ple.free_later()
-        per_thread.PASS.request_uid = None
-        _WORKER.on = False
-        slots.release()
-        if own:
-            clear_mlx_streams()
+        try:
+            _served_ends(uid, batch_gen, active, prompting, counted)
+        finally:
+            with _SERVING_LOCK:
+                _SERVING.discard(threading.get_ident())
+            per_thread.PASS.request_uid = None
+            _WORKER.on = False
+            slots.release()
+            if own:
+                clear_mlx_streams()
 
 
 def _dispatch(generator, n):
@@ -777,62 +890,76 @@ def _dispatch(generator, n):
             continue
         if request is None:
             continue
-        while workers and (not together_ok() or drafts_alone(generator)):
-            workers = [w for w in workers if w.is_alive()]
-            if workers:
-                workers[0].join(0.05)
-        held, lease = False, None
-        if n > 1 and not workers and not leases.seeded() and leases.enabled() and together_ok():
-            leases.seed()
-        uid = next(_UIDS)
-        if leases.seeded():
-            lease = leases.Lease(
-                uid, _prompt_count(request), getattr(request.args, 'max_tokens', 0),
-                generator._effective_prefill_step_size(),
-            )
-            while not lease.take(alone=not workers):
-                held = True
-                workers = [w for w in workers if w.is_alive()]
-                if workers:
-                    workers[0].join(0.05)
-        else:
-            while workers and not _room_for(request):
-                held = True
-                workers = [w for w in workers if w.is_alive()]
-                if workers:
-                    workers[0].join(0.05)
-        if held:
-            _count('held_for_room')
-        handed = False
+        lease = None
         try:
-            while not slots.acquire(timeout=0.1):
+            while workers and (not together_ok() or drafts_alone(generator)):
                 workers = [w for w in workers if w.is_alive()]
-            workers = [w for w in workers if w.is_alive()]
-            if not STATS['threads_started'] and not STATS['first_here']:
-                STATS['first_here'] = 1
-                handed = True
-                _serve(generator, request, uid, slots, own=False, **({} if lease is None else dict(lease=lease)))
-                continue
-            STATS['threads_started'] += 1
-            STATS['together' if workers else 'alone'] += 1
-            try:
-                w = threading.Thread(
-                    target=_serve,
-                    args=(generator, request, uid, slots),
-                    kwargs=dict(own=True, **({} if lease is None else dict(lease=lease))),
-                    daemon=True,
-                    name=f'quanteeze-request-{uid}',
+                if workers:
+                    workers[0].join(0.05)
+            held = False
+            if n > 1 and not workers and not leases.seeded() and leases.enabled() and together_ok():
+                leases.seed()
+            uid = next(_UIDS)
+            if leases.seeded():
+                lease = leases.Lease(
+                    uid, _prompt_count(request), getattr(request.args, 'max_tokens', 0),
+                    generator._effective_prefill_step_size(),
                 )
-                w.start()
-            except BaseException:
-                slots.release()
-                raise
-            handed = True
-        finally:
-            if lease is not None and not handed:
-                lease.give()
-        workers.append(w)
-        STATS['most_at_once'] = max(STATS['most_at_once'], len(workers))
+                while not lease.take(alone=not workers):
+                    held = True
+                    workers = [w for w in workers if w.is_alive()]
+                    if workers:
+                        workers[0].join(0.05)
+            else:
+                while workers and not _room_for(request, workers):
+                    held = True
+                    workers = [w for w in workers if w.is_alive()]
+                    if workers:
+                        workers[0].join(0.05)
+            if held:
+                _count('held_for_room')
+            handed = False
+            try:
+                while not slots.acquire(timeout=0.1):
+                    workers = [w for w in workers if w.is_alive()]
+                workers = [w for w in workers if w.is_alive()]
+                if not STATS['threads_started'] and not STATS['first_here']:
+                    STATS['first_here'] = 1
+                    handed = True
+                    _serve(generator, request, uid, slots, own=False, **({} if lease is None else dict(lease=lease)))
+                    continue
+                STATS['threads_started'] += 1
+                STATS['together' if workers else 'alone'] += 1
+                try:
+                    w = threading.Thread(
+                        target=_serve,
+                        args=(generator, request, uid, slots),
+                        kwargs=dict(own=True, **({} if lease is None else dict(lease=lease))),
+                        daemon=True,
+                        name=f'quanteeze-request-{uid}',
+                    )
+                    w.start()
+                except BaseException:
+                    slots.release()
+                    raise
+                handed = True
+            finally:
+                if lease is not None and not handed:
+                    lease.give()
+            workers.append(w)
+            STATS['most_at_once'] = max(STATS['most_at_once'], len(workers))
+        except Exception as e:
+            print(f'quanteeze: request threads: a request could not be dispatched: {type(e).__name__}: {e}',
+                  file=sys.stderr, flush=True)
+            if lease is not None:
+                try:
+                    lease.give()
+                except Exception:
+                    pass
+            try:
+                request.rqueue.put(e)
+            except Exception:
+                pass
     for w in workers:
         w.join()
 
@@ -847,7 +974,7 @@ def install(generator_cls):
     original = generator_cls._run_impl
 
     def _run_impl(self):
-        n = threads()
+        n = _load_settings()
         if n <= 1:
             return original(self)
         return _dispatch(self, n)

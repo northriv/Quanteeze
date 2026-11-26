@@ -11,7 +11,7 @@ import sys
 
 import numpy as np
 
-from . import native_ext, variables
+from . import native_ext, per_load, variables
 
 CHECKS = 3
 DEAD = -1
@@ -144,3 +144,16 @@ def pass_hashes(ngram, row, input_ids, before, gpu, image_token_id=None):
     STATE['passes'] += 1
     STATE['tokens'] += int(ids.shape[1])
     return got
+
+
+@per_load.on_let_go
+def _let_go_native():
+    """Drop cached `_engram` extension handle on unload so QUANTEEZE_NATIVE applies on the next load."""
+    _EXT.clear()
+
+
+@per_load.on_let_go
+def _let_go():
+    """Release cached NgramHashState tables and reset check count on unload (`STATE['off']` sticks)."""
+    _TABLES.clear()
+    STATE['checked'] = 0

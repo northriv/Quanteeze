@@ -65,6 +65,12 @@ _TABLE = [
      'maximum GB the server writes to the prompt cache\'s disk tier while running: past this cap it writes '
      'no more and serves from what is already stored without evicting to rewrite (unset: uncapped writes, '
      'retention bounded only by APC_DISK_MAX_GB)'),
+    ('QUANTEEZE_APC_DISK_SECRET', '~/.quanteeze/apc-secret', 'memory', 'start',
+     'the file of this machine\'s secret mixed into the prompt cache\'s disk tier (its sealed checkpoints\' names '
+     'and keys, HMAC-SHA-256; quanteeze.apc_disk): 32 random bytes made at first use, readable by the user alone '
+     '(0600), and on macOS excluded from Time Machine -- so one with the disk or its backups but not the secret '
+     'cannot confirm a guessed prompt from them.  Removed or found readable by others, a new one is generated and '
+     'old cache files age out.  off: no secret, names and keys derived from the prompt alone'),
     ('QUANTEEZE_CONTEXT_COMPRESS', 'off', 'memory', 'start',
      'compression of full-attention QSA KV caches kept for later turns in APC (quanteeze.context_compress): '
      'off (keep whole cache), recent (keep sink and recent tail), similar (drop repeated neighboring blocks), '
@@ -83,6 +89,22 @@ _TABLE = [
      'initial attention-sink tokens at the start of a cached prefix that are never dropped'),
     ('QUANTEEZE_CONTEXT_MIN_TOKENS', '4096', 'memory', 'start',
      'minimum cached token length before context compression triggers (shorter caches remain intact)'),
+    ('QUANTEEZE_KV_BITS', '', 'memory', 'load',
+     'bit width of full-attention cached keys and values (quanteeze.kv_bits): unset or off keeps bfloat16; 8 uses MLX '
+     'affine quantization with group size 64 on Qwen3.8 Flash-Next (1,088 vs 2,048 bytes per layer and token, 0.53x, '
+     'leaving indexer keys and linear states unchanged) and on plain KVCache models such as Qwen3.8-27B '
+     '(quanteeze.kv_bits.install_plain: mlx-vlm\'s 8-bit batch cache, 36.7 vs 65.5 kB per token, 0.56x), verified '
+     'against dequantized matmul and supporting batching and APC snapshots (QUANTEEZE_CUDA_ATTN declines 8-bit KV '
+     'caches)'),
+    ('QUANTEEZE_KV_BITS_SELECTED', 'on', 'memory', 'load',
+     'with QUANTEEZE_KV_BITS=8, compute 1-to-2-token decode/verify sparse attention past the indexer budget over '
+     'only the indexer-selected blocks and tail keys (gathered, dequantized, and multiplied via MLX matmul, verified '
+     'against masked full-key attention on first calls per shape; off: masked attention over every cached key)'),
+    ('QUANTEEZE_KV_BITS_UNPACKED', 'auto', 'memory', 'load',
+     'with QUANTEEZE_KV_BITS=8, unpack cached 8-bit keys and values to the query dtype per layer on prefill steps '
+     'for MLX\'s fast scaled dot-product attention and mlx-vlm\'s Metal QSA sparse prefill kernel while running '
+     '1-to-2-token decode/verify through mlx-vlm\'s quantized attention in one call (auto: enabled on Metal, off on '
+     'CUDA; on or off overrides)'),
     ('QUANTEEZE_KEEP_GB', 'auto', 'memory', 'start',
      'GB the server\'s footprint keeps to (quanteeze.guards.Keeper): over it MLX\'s freed buffers are given back, '
      'and over it with the swap grown or the swap\'s disk short the server stops (auto: the working set Metal '
@@ -187,6 +209,10 @@ _TABLE = [
     ('QUANTEEZE_WARM_UP', 'on', 'experts', 'load',
      'on CUDA, the model run once before the first request, so that quanteeze\'s own kernels are compiled then, '
      'not while it waits (not where experts are read on demand)'),
+    ('QUANTEEZE_WARM_UP_BATCH', '0', 'experts', 'load',
+     'with QUANTEEZE_WARM_UP on CUDA: the most requests of a batch the warm-up runs besides (2 to this many rows: '
+     'a short prompt of each together, then two decode steps), so batch-shape kernels are compiled before the first '
+     'request arrives (QUANTEEZE_REQUEST_THREADS=1 batch mode).  0 (default): none'),
     ('QUANTEEZE_HOST_EXPERTS_GB', 'auto', 'experts', 'load',
      'GB of the checkpoint\'s routed experts held in the host\'s memory and read from there, not the disk '
      '(auto: on a discrete CUDA GPU with memory of its own, as many as the host\'s memory or the job\'s cgroup '
@@ -236,9 +262,12 @@ _TABLE = [
      'DFlash2 block-diffusion drafter (e.g. incoai/Qwen3.8-Flash-Next-DFlash2); on: wherever a bundled head '
      'loads; off: never'),
     ('QUANTEEZE_DRAFTER', None, 'speed', 'load',
-     'external speculative drafter repo/path or \'dflash2\' (overrides bundled MTP head when set; dense '
-     'standalone drafters quantize to max(4, QUANTEEZE_MTP_BITS) or stay BF16 when QUANTEEZE_MTP_BITS=off)'),
-    ('QUANTEEZE_MTP_BITS', '2', 'speed', 'load', 'the MTP head\'s routed experts\' bits (off: the checkpoint\'s own)'),
+     'external speculative drafter repo/path or \'dflash2\' (overrides bundled MTP head when set; falls back to '
+     'the bundled MTP head per QUANTEEZE_MTP where none is known for the model type, it is not local, or it fails '
+     'to load; dense standalone drafters quantize to max(4, QUANTEEZE_MTP_BITS) or stay BF16 when QUANTEEZE_MTP_BITS=off)'),
+    ('QUANTEEZE_MTP_BITS', 'auto', 'speed', 'load',
+     'the MTP head\'s routed experts\' bits: a number; off, the checkpoint\'s own; auto (the default), by model '
+     'family (quanteeze.mtp.AUTO_BITS: 4 for Qwen3.8 Flash-Next, 2 for the others)'),
     ('QUANTEEZE_MTP_EXACT', 'bits', 'speed', 'load',
      'how exactly an MTP verify pass computes what one-token decodes would (bits: bit for bit; distribution: '
      'MLX\'s multi-token pass)'),
@@ -261,18 +290,22 @@ _TABLE = [
     ('QUANTEEZE_EXPERT_QMV', 'on', 'speed', 'start',
      'routed MoE expert decode and verify steps with each expert read once for the tokens on it, checked bit for '
      'bit against stock SwitchGLU (off: stock)'),
+    ('QUANTEEZE_EXPERT_QMV_VERIFY_FUSED', 'on', 'speed', 'start',
+     'with QUANTEEZE_EXPERT_QMV on: run verify passes of uniform MoE layers through the decode\'s fused two-kernel '
+     'expert path (each verify token\'s slots as decode rows), checked bit for bit on first shapes (off: per-slot '
+     'multi-token path)'),
     ('QUANTEEZE_KQUANT_QMV', 'on', 'speed', 'start',
      'run pre-distributed GGUF expert projections on Metal and CUDA (plus uniform Q2_K/Q3_K/IQ2_XS on Metal) '
      'through fused gather-qmv and tiled gather-mm kernels once verified against unpacking (off: unpack + gather_mm)'),
-    ('QUANTEEZE_V41_HEAD_KERNEL', 'on', 'speed', 'start',
+    ('QUANTEEZE_V41_HEAD_KERNEL', 'on', 'speed', 'load',
      'on MLX\'s CUDA backend, run DeepSeek V4.1\'s BF16 LM head in a single warp-per-row kernel without float32 '
      'intermediate buffers once verified (off: chunked float32 matmul)'),
     ('QUANTEEZE_HOST_NGRAM', 'on', 'speed', 'start',
      'compute 1-token decode PLE n-gram row ids on the host from the already-evaluated token id rather than '
      'syncing from the GPU (off: GPU)'),
-    ('QUANTEEZE_ENGRAM_READ_AHEAD', 'on', 'speed', 'load',
+    ('QUANTEEZE_ENGRAM_READ_AHEAD', 'on', 'speed', 'request',
      'prefetch later DeepSeek V4.1 Engram layers asynchronously while an earlier Engram layer runs (off: disabled)'),
-    ('QUANTEEZE_ENGRAM_IDS_ONCE', 'on', 'speed', 'load',
+    ('QUANTEEZE_ENGRAM_IDS_ONCE', 'on', 'speed', 'request',
      'read DeepSeek V4.1 1-token decode Engram hash ids to the host once per step across all Engram layers '
      '(off: once per Engram layer)'),
     ('QUANTEEZE_HC_KERNELS', 'on', 'speed', 'start',
@@ -328,16 +361,19 @@ _TABLE = [
     ('QUANTEEZE_EVAL_LAYERS', '12', 'speed', 'start',
      'Flash-Next\'s decode token handed to the GPU this many layers at a time, not one by one (mlx-vlm\'s): on '
      'MLX\'s CUDA backend each hand-over ends a CUDA graph, between which the GPU waits (1: mlx-vlm\'s)'),
-    ('QUANTEEZE_NATIVE', 'on', 'speed', 'start',
+    ('QUANTEEZE_NATIVE', 'on', 'speed', 'load',
      'compile and load C++20 nanobind extensions on demand (off: disabled, pure Python fallbacks)'),
+    ('QUANTEEZE_NVRTC_PCH', 'on', 'speed', 'start',
+     'on CUDA, enable NVRTC precompiled headers via libnvrtc_pch loaded before MLX imports, injecting --pch into '
+     'runtime CUDA kernel compilations to reuse MLX headers across kernels (off: default NVRTC compilation)'),
     ('QUANTEEZE_NGRAM_TOUCH_NATIVE', 'on', 'speed', 'start',
      'read memmapped n-gram and Engram row pages in C++ with the GIL released before lookups (off: numpy indexing)'),
-    ('QUANTEEZE_ENGRAM_HASHES_ON_HOST', 'on', 'speed', 'start',
+    ('QUANTEEZE_ENGRAM_HASHES_ON_HOST', 'on', 'speed', 'request',
      'compute DeepSeek V4.1 Engram hash ids on the host in C++20 alongside the GPU reference (checked bit for bit '
      'against GPU on first passes; off: wait on GPU hashes)'),
-    ('QUANTEEZE_V41_ATTENTION_NATIVE', 'auto', 'speed', 'start',
-     'build DeepSeek V4.1 short-pass full attention in C++20 on MLX (auto: Metal; on/compare/off)'),
-    ('QUANTEEZE_DSPARK_NATIVE', 'auto', 'speed', 'start',
+    ('QUANTEEZE_V41_ATTENTION_NATIVE', 'auto', 'speed', 'load',
+     'build DeepSeek V4.1 short-pass full attention in C++20 on MLX (auto: Metal and CUDA; on/compare/off)'),
+    ('QUANTEEZE_DSPARK_NATIVE', 'auto', 'speed', 'load',
      'run DeepSeek V4.1 DSpark Markov proposal loop and confidence gate in C++20 on MLX (auto: Metal; on/off)'),
     ('QUANTEEZE_CACHE_DIR', '~/.cache/quanteeze', 'speed', 'start',
      'directory where compiled C++20 nanobind extensions are cached (quanteeze.native_ext)'),
@@ -358,11 +394,11 @@ _TABLE = [
      'on: DeepSeek V4.1 reads the images its user turns carry, following QUANTEEZE_VISION_SSD (auto holds the '
      '0.97 GB vision tower and aligner when routed experts fit beside them, else streams on demand except on '
      'network file systems); ssd: always stream vision tower weights on demand; off: let go'),
-    ('QUANTEEZE_REQUEST_THREADS', '1', 'requests', 'start',
+    ('QUANTEEZE_REQUEST_THREADS', '1', 'requests', 'load',
      'maximum concurrent request worker threads each running its own MLX stream (1: mlx-vlm single generation loop)'),
-    ('QUANTEEZE_REQUEST_THREADS_ANY', 'off', 'requests', 'start',
+    ('QUANTEEZE_REQUEST_THREADS_ANY', 'off', 'requests', 'load',
      'allow concurrent request threads when all weights reside in memory without on-demand streaming (on or off)'),
-    ('QUANTEEZE_REQUEST_THREADS_DRAFT_TOGETHER', 'off', 'requests', 'start',
+    ('QUANTEEZE_REQUEST_THREADS_DRAFT_TOGETHER', 'off', 'requests', 'load',
      'allow DSpark speculative verify rounds while another request decodes concurrently (on or off)'),
     ('QUANTEEZE_PROMPT_DECODE_TURNS', 'on', 'requests', 'load',
      'when QUANTEEZE_REQUEST_THREADS is above 1 and C++ STM serves on-demand experts, arbitrate GPU turns '
@@ -439,11 +475,38 @@ def compact_keeps(environ=None):
     return kept
 
 
+_AT_LOAD = [None]
+_AT_START = [None]
+
+
+def take_load_snapshot(environ=None):
+    """Snapshot os.environ (or `environ`) when a model loads, for `'load'` settings."""
+    _AT_LOAD[0] = dict(os.environ if environ is None else environ)
+    return _AT_LOAD[0]
+
+
+def at_load():
+    """The snapshot taken at the most recent model load, or None before load."""
+    return _AT_LOAD[0]
+
+
+def take_start_snapshot(environ=None):
+    """Snapshot os.environ (or `environ`) at server startup, for `'start'` settings."""
+    _AT_START[0] = dict(os.environ if environ is None else environ)
+    return _AT_START[0]
+
+
+def at_start():
+    """The snapshot taken at server startup, or None before start."""
+    return _AT_START[0]
+
+
 def get(name, environ=None):
     """The variable's value, or its default (None for none) where it is unset or empty; one of
     COMPACT's as it gives it while QUANTEEZE_COMPACT is on (unless listed in QUANTEEZE_COMPACT_KEEP)."""
     setting = _setting(name)
-    if name in COMPACT and compact(environ) and name not in compact_keeps(environ):
+    compact_env = _AT_LOAD[0] if environ is None else environ
+    if name in COMPACT and compact(compact_env) and name not in compact_keeps(compact_env):
         return COMPACT[name]
     set_to = value(name, environ)
     return set_to if set_to else setting.default
@@ -467,23 +530,34 @@ def renamed(environ=None):
             for old, new in RENAMED.items() if environ.get(old)]
 
 
-def number(name):
-    return float(get(name))
+def number(name, environ=None):
+    return float(get(name, environ))
 
 
-def integer(name):
-    return int(get(name))
+def integer(name, environ=None):
+    return int(get(name, environ))
 
 
-def off(name):
+def integer_or(name, default=None, environ=None):
+    """The setting as an int, or `default` when unset or not a valid integer."""
+    val = get(name, environ)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def off(name, environ=None):
     """Whether the variable says off."""
-    val = get(name)
+    val = get(name, environ)
     return val is not None and val.lower() == 'off'
 
 
-def path(name):
+def path(name, environ=None):
     """The value as a path, ~ expanded, or None."""
-    val = get(name)
+    val = get(name, environ)
     return None if val is None else Path(val).expanduser()
 
 

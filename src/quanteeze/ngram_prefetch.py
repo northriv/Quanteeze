@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 import mlx.core as mx
 import numpy as np
 
-from . import cuda_engram, cuda_ple, native_ext, per_thread, variables
+from . import cuda_engram, cuda_ple, native_ext, per_load, per_thread, variables
 
 _USED = {}
 _HELD = []
@@ -56,6 +56,8 @@ THREADS = 16
 MIN_ROWS = 64
 PART_ROWS = 512          # rows a thread takes at least
 PART_BYTES = 64 << 20    # a read of the host's copy at most
+WHOLE_WITHIN = 50_000_000   # budget shortfall tolerance for holding all tables (min with 1/WHOLE_SHARE)
+WHOLE_SHARE = 200
 ADVISE = [None]          # QUANTEEZE_NGRAM_ADVISE
 _TOUCH = {}
 
@@ -76,7 +78,7 @@ def _touch_ext():
     """Return the compiled `_touch` nanobind extension, or None when disabled/unavailable."""
     if 'ext' not in _TOUCH:
         ext = None
-        if not variables.off('QUANTEEZE_NGRAM_TOUCH_NATIVE'):
+        if not variables.off('QUANTEEZE_NGRAM_TOUCH_NATIVE', variables.at_start()):
             ext = native_ext.extension('touch', with_mlx=False, with_stm=False, quiet=True)
         _TOUCH['ext'] = ext
     return _TOUCH['ext']
@@ -120,7 +122,7 @@ def _touch_native(job, out=None):
 
 def _advising():
     if ADVISE[0] is None:
-        ADVISE[0] = hasattr(mmap, 'MADV_WILLNEED') and not variables.off('QUANTEEZE_NGRAM_ADVISE')
+        ADVISE[0] = hasattr(mmap, 'MADV_WILLNEED') and not variables.off('QUANTEEZE_NGRAM_ADVISE', variables.at_start())
     return ADVISE[0]
 
 
@@ -202,8 +204,7 @@ class Prefetcher:
                 for part in np.array_split(rows, max(1, min(self.threads, rows.size // PART_ROWS)))]
 
 
-_RANDOM = set()
-_RANDOM_HELD = []
+_RANDOM = {}
 
 
 def read_randomly(array):
@@ -215,8 +216,11 @@ def read_randomly(array):
         _advise_random(mm)
     except (AttributeError, OSError, ValueError):
         return
-    _RANDOM.add(id(mm))
-    _RANDOM_HELD.append(mm)
+    key = id(mm)
+    try:
+        _RANDOM[key] = __import__('weakref').ref(mm, lambda _, k=key: _RANDOM.pop(k, None))
+    except TypeError:
+        _RANDOM[key] = mm
 
 
 def _advise_random(mm):
@@ -308,16 +312,23 @@ class HostCopy:
     once read."""
 
     def __init__(self, embeddings, budget, workers, skip=lambda file: False):
-        self.bytes = self.total = self._read = 0
+        self.bytes = self.total = self._read = self.left = self.left_bytes = 0
         self.error = None
         self._entries = []
         self._pool = ThreadPoolExecutor(max(1, workers), thread_name_prefix='ngram-copy')
-        for embedding in embeddings:
+        found = [(embedding, list(_memmaps(embedding))) for embedding in embeddings]
+        wanted = sum(array.nbytes for _, arrays in found for _, _, array in arrays if not skip(array.filename))
+        if budget < wanted <= budget + min(WHOLE_WITHIN, wanted // WHOLE_SHARE):
+            budget = wanted
+        for embedding, arrays in found:
             pinned = cuda_ple.reads(embedding) or cuda_engram.reads(embedding)
             empty = cuda_ple.empty if pinned else np.empty                      # pinned: the GPU reads it there
-            for where, key, array in _memmaps(embedding):
+            for where, key, array in arrays:
                 self.total += array.nbytes
-                if self.bytes + array.nbytes > budget or skip(array.filename):
+                if skip(array.filename):
+                    continue
+                if self.bytes + array.nbytes > budget:
+                    self.left, self.left_bytes = self.left + 1, self.left_bytes + array.nbytes
                     continue
                 copy = empty(array.shape, array.dtype)
                 row = array.nbytes // array.shape[0]
@@ -374,10 +385,13 @@ def unread():
     return sum(held.unread() for held in _HELD)
 
 
+@per_load.on_let_go
 def let_go():
     """Stop reading the host's copy of the tables; what was read stays with the model's tables."""
     while _HELD:
         _HELD.pop().close()
+    _TOUCH.clear()
+    _RANDOM.clear()
 
 
 def close_all():

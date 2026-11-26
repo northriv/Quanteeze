@@ -12,12 +12,11 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from . import cuda_experts, cuda_kernels, cuda_qmv, cuda_router
+from . import cuda_experts, cuda_kernels, cuda_qmv, cuda_router, kernel_checks, per_thread
 
 CHECKS = 3
 STATS = dict(served=0, shared=0, checked=0, mismatched=0)
-CHOICE = {}                     # (slots, experts, hidden, inner, shared inner): whether it matched
-CHECKED = {}
+CHOICE, CHECKED = kernel_checks.tables('cuda_moe')  # (slots, experts, hidden, inner, shared inner): whether it matched
 SAID = []
 
 # Blocks [0, RB) the router's rows, a warp each; [RB, RB + SB) the shared expert's, 4 gate rows in
@@ -317,26 +316,7 @@ def feed_forward(forward, block, x, hyper, weights):
         return moe_out(block, h, idx, scores.reshape(-1), sh, sgate, hyper, weights)
     key = (int(block.top_k), block.gate.weight.shape[0], x.shape[-1], block.switch_mlp.down_proj.weight.shape[-1] * 8,
            block.shared_expert.gate_proj.weight.shape[0])
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
-    if choice is not None and seen >= CHECKS:
-        if choice:
-            STATS['served'] += 1
-            return mine()
-        return theirs()
-    want = theirs()
-    try:
-        got = mine()
-        same = mx.array_equal(got, want).item()
-    except Exception as error:
-        if not SAID:
-            SAID.append(True)
-            print(f'quanteeze: the MoE block\'s kernels unavailable ({type(error).__name__}: {error})',
-                  file=sys.stderr, flush=True)
-        same = False
-    STATS['checked'] += 1
-    STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
-    return want
+    return kernel_checks.served(sys.modules[__name__], key, mine, theirs, "the MoE block's kernels")
 
 
 # A decode's shared expert behind its gate in two kernels, at 8 bits (gated_shared()).
@@ -459,7 +439,7 @@ def gated_shared(forward, block, x):
     se = block.shared_expert
     key = ('shared', x.shape[-1], se.gate_proj.weight.shape[0], int(se.gate_proj.group_size),
            int(se.down_proj.group_size), int(block.shared_expert_gate.group_size))
-    choice, seen = CHOICE.get(key), CHECKED.get(key, 0)
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
             STATS['shared'] = STATS.get('shared', 0) + 1
@@ -467,7 +447,7 @@ def gated_shared(forward, block, x):
         return theirs()
     want = theirs()
     try:
-        same = mx.array_equal(shared(block, x), want).item()
+        same = kernel_checks.same_bits(shared(block, x), want)
     except Exception as error:
         if 'transformations' in str(error):
             return want
@@ -478,7 +458,7 @@ def gated_shared(forward, block, x):
         same = False
     STATS['checked'] += 1
     STATS['mismatched'] += not same
-    CHOICE[key], CHECKED[key] = bool(same), (seen + 1 if same else CHECKS)
+    per_thread.checked(CHOICE, CHECKED, key, bool(same), CHECKS)
     return want
 
 
