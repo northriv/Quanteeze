@@ -94,6 +94,7 @@ Work through the UI from top to bottom (switch between **English / 日本語** i
 
 1. **Model & expert precision**
    Pick a local checkpoint, or enter `org/model-name`, click **Check size**, verify file count and total GB, and click **Download ... GB**.
+   - **Converting unquantized float weights (`f32` / `bf16` / `f16`)**: Unquantized `safetensors` checkpoints are badged **`not quantized`**. When no model is loaded, clicking **Convert to 4 bits…** or **Convert to 8 bits…** lets you inspect the tool (`mlx-lm` or `mlx-vlm`), output directory (beside LM Studio models or in `~/.quanteeze/models`), estimated size, and free space before converting in an isolated process without executing repository custom code.
 2. **Routed expert precision**
    For MoE models, the UI displays expert memory usage and whether each option **fits in memory** or **streams from SSD** across original precision, least-squares (**4 / 3 / 2 / 1 bit**), and **MXFP4 / Q3_K / Q2_K / IQ2_XS**.
    - **Rule of thumb**: pick the highest bit width marked **fits in memory** (if original precision fits, serve it as-is). To run models larger than memory, choose an option marked **streams from SSD**.
@@ -179,6 +180,27 @@ One-liner without editing `config.toml` (also available in **Connect an app** in
 codex -c model_provider="quanteeze" -c model="local" \
   -c 'model_providers.quanteeze={name="Quanteeze",base_url="http://127.0.0.1:8765/v1",wire_api="responses",requires_openai_auth=false,stream_idle_timeout_ms=7200000}'
 ```
+
+- **Optional image-generation MCP tool (`quanteeze.image_mcp`)**: Because Quanteeze's inference server only serves text/VLM generation, `quanteeze.image_mcp` provides a standalone stdio MCP tool `generate_image(prompt, model, width, height, seed, path)` for Codex and other MCP clients. Any discovered checkpoint can be chosen via `model`; the default is the first found model from the top of the table below (commercial-friendly Apache-2.0 models prioritized first):
+
+  | `model` | Model | License | Required local checkpoint | Typical 1024×1024 timing |
+  |---|---|---|---|---|
+  | `z-image-turbo` | Z-Image-Turbo (Tongyi-MAI, 6B) | Apache-2.0 (model card; no `LICENSE` file in repo) | `mlx-community/Z-Image-Turbo-bf16` (20.5 GB) | ~12 s (9 steps) |
+  | `flux2-klein` | FLUX.2-klein-4B (Black Forest Labs) | Apache-2.0 | `black-forest-labs/FLUX.2-klein-4B` float weights (~16 GB; `mlx-community` 4/8-bit copies use `mflux` layout, not `mlx-vlm`) | — (supported when placed) |
+  | `qwen-image` | Qwen-Image-2.1 | Qwen Research License (research/evaluation only) | `mlx-community/Qwen-Image-2.1-MLX-4bit` (10.5 GB) | ~44 s (30 steps) |
+  | `nemotron-image` | Nemotron-Labs-Image-30B-A3B | NVIDIA License (research/evaluation only) | MLX 4/8-bit converted model (e.g. via **Convert to 4 bits…** in Browser UI) + original `Nemotron-Labs-Image-Tokenizer` | ~23 s |
+
+  The first three models use `mlx-vlm`'s image pipelines (`quanteeze.vlm_image`, sizes 256–2048 px in steps of 16), and `nemotron-image` uses `quanteeze.nemotron_image` (512–1536 px in steps of 64). Place checkpoints under a discovered model directory (`~/.lmstudio/models`, `/Volumes/*/lmstudio`, or `~/.quanteeze/models`) and add to `~/.codex/config.toml`:
+
+  ```toml
+  [mcp_servers.images]
+  command = "/path/to/Quanteeze/.venv/bin/python"   # absolute path to this repo's .venv Python
+  args = ["-m", "quanteeze.image_mcp"]               # optionally add "--default", "flux2-klein", etc.
+  tool_timeout_sec = 300
+  ```
+
+  - **Per-model licensing (NVIDIA License / Qwen Research License are non-commercial — research or evaluation only):** `Qwen-Image-2.1` (Qwen Research License) and `Nemotron-Labs-Image-30B-A3B` (NVIDIA License §3.3 — including converted checkpoints, generated PNG outputs, and [`src/quanteeze/vendor/nemotron_image/l24sq.py`](src/quanteeze/vendor/nemotron_image/l24sq.py) / [`LICENSE`](src/quanteeze/vendor/nemotron_image/LICENSE) / [`NOTICE.md`](src/quanteeze/vendor/nemotron_image/NOTICE.md)) are restricted to research or evaluation use only. For commercial products or client work, use `z-image-turbo` or `flux2-klein` (Apache-2.0). The MCP tool surfaces each model's license in its tool description and replies. No weights are distributed in this repository.
+  - Each call checks free memory (model + 6 GB spare), loads the pipeline/model for one image, and releases it afterward. Outputs default to `~/.quanteeze/images/` (capped at 2 GB retained and 2 GB written per process via `--keep-gb` / `--write-gb`).
 
 **Python (OpenAI SDK)**
 
@@ -434,6 +456,7 @@ uv run python -m quanteeze.variables --markdown
 | `QUANTEEZE_EMBED_SSD` | `off` | Stream untied token embeddings row by row via `mmap`. |
 | `QUANTEEZE_APC_ENCRYPT` | `on` | Seal disk prefix-cache (APC) shards and checkpoints with convergent AES-256-GCM (`on` / `off`). |
 | `QUANTEEZE_APC_DISK_SECRET` | `~/.quanteeze/apc-secret` | 32-byte machine secret (`0600`, excluded from Time Machine on macOS) mixed via HMAC-SHA-256 into APC disk names and keys (`off`: prompt-only hashes). |
+| `QUANTEEZE_APC_READ_BACK_PLAIN` | `on` | Convert single-row, unpadded warm APC caches (without KV bits or draft models) back to plain `KVCache` / `ArraysCache` matching fresh requests (`quanteeze.apc_plain`), avoiding per-token batch extraction/copy overhead on Qwen3.5 / Qwen3.8-27B decode (`off`: keep `mlx-vlm` batch caches). |
 | `QUANTEEZE_KV_BITS` | unset | Full-attention cached KV precision on Qwen3.8 Flash-Next (~0.53x memory, 24.6 → 13.1 kB/token) and plain-`KVCache` models such as Qwen3.8-27B (~0.56x memory, 65.5 → 36.7 kB/token via `mlx-vlm`'s 8-bit batch cache; selectable under **KV cache** in the Browser UI; unset / `off`: bfloat16; `8`: 64-element affine 8-bit quantization with batching and APC snapshots). |
 | `QUANTEEZE_KV_BITS_SELECTED` | `on` | With `QUANTEEZE_KV_BITS=8`, compute 1–2-token decode/verify sparse attention past the indexer budget over only the indexer-selected keys (`on` / `off`). |
 | `QUANTEEZE_KV_BITS_UNPACKED` | `auto` | With `QUANTEEZE_KV_BITS=8`, unpack cached 8-bit KV per layer to the query dtype on prefill steps for MLX fast attention and Metal's QSA sparse prefill kernel while running 1–2-token decode/verify in one call through `mlx-vlm`'s quantized attention (`auto`: enabled on Metal, off on CUDA; `on` / `off`). |
@@ -541,7 +564,7 @@ Quanteeze is dual-licensed under your choice of either:
 - **GNU General Public License, version 2 only** (`GPL-2.0-only`) — see [LICENSE-GPL-2.0](LICENSE-GPL-2.0), OR
 - **PolyForm Shield License 1.0.0** (`LicenseRef-PolyForm-Shield-1.0.0`) — see [LICENSE-POLYFORM-SHIELD](LICENSE-POLYFORM-SHIELD).
 
-See [LICENSE](LICENSE) for full details. Third-party components under `src/quanteeze/vendor/deepseek_v4/`, `src/quanteeze/vendor/deepseek_v41/`, `src/quanteeze/iq_grids.py`, and `bench/llamacpp/` retain their original MIT License notices. Bundled [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) and [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) sources under [`src/quanteeze/vendor/kamepoolalloc/`](src/quanteeze/vendor/kamepoolalloc/README.md) (Copyright (C) 2002–2026 Kentaro Kitagawa) are dual-licensed under `Apache-2.0 OR GPL-2.0-or-later` (see [`LICENSE-APACHE-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0) and [`LICENSE-GPL-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0)).
+See [LICENSE](LICENSE) for full details. Third-party components under `src/quanteeze/vendor/deepseek_v4/`, `src/quanteeze/vendor/deepseek_v41/`, `src/quanteeze/iq_grids.py`, and `bench/llamacpp/` retain their original MIT License notices. Bundled [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) and [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) sources under [`src/quanteeze/vendor/kamepoolalloc/`](src/quanteeze/vendor/kamepoolalloc/README.md) (Copyright (C) 2002–2026 Kentaro Kitagawa) are dual-licensed under `Apache-2.0 OR GPL-2.0-or-later` (see [`LICENSE-APACHE-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0) and [`LICENSE-GPL-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0)). Optional third-party decoder files under [`src/quanteeze/vendor/nemotron_image/`](src/quanteeze/vendor/nemotron_image/NOTICE.md) (`l24sq.py`) are governed solely by the NVIDIA License ([`LICENSE`](src/quanteeze/vendor/nemotron_image/LICENSE): **research or evaluation purposes only, non-commercial**) and not by Quanteeze's `GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0` terms; they are never imported by the core inference server unless the optional `Nemotron-Labs-Image` tool is invoked, and must be omitted if redistributing or using Quanteeze under pure `GPL-2.0-only` or for commercial purposes.
 
 Quanteeze distributes no model weights; users are responsible for complying with each model's own license (including any MaaS / service-offering terms when binding beyond `127.0.0.1` via `--host`).
 

@@ -66,6 +66,11 @@ _TABLE = [
      'maximum GB the server writes to the prompt cache\'s disk tier while running: past this cap it writes '
      'no more and serves from what is already stored without evicting to rewrite (unset: uncapped writes, '
      'retention bounded only by APC_DISK_MAX_GB)'),
+    ('QUANTEEZE_APC_READ_BACK_PLAIN', 'on', 'memory', 'start',
+     'serve a single-row unpadded warm prompt read back from the prefix cache (APC) without KV bits or a draft '
+     'model on the model\'s plain caches (KVCache / ArraysCache), matching a fresh request (quanteeze.apc_plain): '
+     'avoids Qwen3.5 / Qwen3.8-27B per-token batch extraction and copying during decode.  off: keep mlx-vlm\'s '
+     'single-row batch caches'),
     ('QUANTEEZE_APC_DISK_SECRET', '~/.quanteeze/apc-secret', 'memory', 'start',
      'the file of this machine\'s secret mixed into the prompt cache\'s disk tier (its sealed checkpoints\' names '
      'and keys, HMAC-SHA-256; quanteeze.apc_disk): 32 random bytes made at first use, readable by the user alone '

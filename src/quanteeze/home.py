@@ -18,6 +18,8 @@ monitor live server status, and download models from Hugging Face once the user 
   (`QUANTEEZE_DRAFTER`), and thermal throttling (`QUANTEEZE_THROTTLE_AT`, `QUANTEEZE_THROTTLE_DUTY`).
 - A download (`download()`): fetches a Hugging Face repository into the local cache on a background
   thread after `info()` reports its file count and size.
+- Float conversion (`convert.py`): marks unquantized float checkpoints (`f32`/`bf16`/`f16`) and converts them
+  to 4- or 8-bit MLX checkpoints in a detached process (`python -I convert.py`) after user confirmation.
 """
 import hashlib
 import json
@@ -30,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import arch, control, fitting, guards, mtp, q2_experts, variables
+from . import arch, control, convert, fitting, guards, mtp, q2_experts, variables
 
 PAGE_PATH, API, ROUTES = control.HOME_PATH, control.HOME_API, control.HOME_ROUTES
 REPO = re.compile(r'^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$')
@@ -196,9 +198,9 @@ VOLUMES = Path('/Volumes')
 
 
 def model_roots():
-    """Directories holding checkpoints as <org>/<name>: LM Studio's, external volumes under
-    `/Volumes/*/lmstudio`, and the two above the model served (or the one the server started with)."""
-    roots = [Path.home() / '.lmstudio' / 'models']
+    """Directories holding checkpoints as <org>/<name>: LM Studio's, the fallback convert folder, external
+    volumes under `/Volumes/*/lmstudio`, and the two above the model served (or the one the server started with)."""
+    roots = [Path.home() / '.lmstudio' / 'models', convert.fallback_root()]
     try:
         roots += sorted(VOLUMES.glob('*/lmstudio'))
     except OSError:
@@ -307,6 +309,14 @@ def model_info(path):
     }
     drafts, why = mtp.auto(path, whole.get('model_type'))
     info['mtp'] = {'head': mtp.head(path) > 0, 'auto': drafts, 'why': why, 'kind': whole.get('model_type')}
+    try:
+        info['unquantized'] = convert.unquantized(path)
+    except (ValueError, OSError, KeyError) as e:
+        info['unquantized'], info['unquantized_error'] = None, f'{type(e).__name__}: {e}'
+    try:
+        info['converted_from'] = json.loads((path / convert.MARKER).read_text()).get('source')
+    except (OSError, ValueError):
+        info['converted_from'] = None
     kind_kv = whole.get('model_type') or text.get('model_type')
     info['kv_bits'] = 'flash' if kind_kv == 'qwen4_exp' else 'plain' if kind_kv in KV_PLAIN else False
     try:
@@ -733,6 +743,15 @@ def _landed(repo):
     return sum(p.stat().st_size for p in blobs.glob('*') if p.is_file()) if blobs.is_dir() else 0
 
 
+def _loaded():
+    """The model the server holds or is loading now, or None (conversion waits for none)."""
+    return (
+        control.current()
+        or control.chosen()
+        or (control._SWITCH.get('target') if control._SWITCH.get('busy') else None)
+    )
+
+
 def download_state():
     out = dict(_DOWNLOAD)
     if out['state'] == 'downloading' and out['repo']:
@@ -871,6 +890,12 @@ def handle(method, route, body):
         return prepare_ple(body.get('path') or '')
     if (method, route) == ('GET', 'ple'):
         return ple_state()
+    if (method, route) in (('POST', 'convert/info'), ('POST', 'convert')):
+        path = str(body.get('path') or '')
+        go = convert.plan if route == 'convert/info' else convert.start
+        return go(path, body.get('bits') or 4, model_roots(), repo_of(path), loaded=_loaded())
+    if (method, route) == ('GET', 'convert'):
+        return convert.state()
     if (method, route) == ('POST', 'download'):
         return download(
             body.get('repo'),

@@ -24,6 +24,22 @@ src/quanteeze/vendor/kamepoolalloc/LICENSE,
 src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0, and
 src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0.
 
+Optional third-party files under src/quanteeze/vendor/nemotron_image/
+(l24sq.py, an MLX port of NVIDIA's Nemotron-Labs-Image-Tokenizer
+modeling_l24sq_vit.py) are governed solely by the NVIDIA License
+(LicenseRef-NvidiaProprietary) in src/quanteeze/vendor/nemotron_image/LICENSE
+(see src/quanteeze/vendor/nemotron_image/NOTICE.md) and NOT by Quanteeze's
+GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0 dual license. Under Section
+3.3 of the NVIDIA License, those files (and any derivative works, model
+checkpoints, or outputs) may be used non-commercially only (for research or
+evaluation purposes). The core Quanteeze inference server never imports
+src/quanteeze/vendor/nemotron_image/; it is lazily loaded only when the
+optional image generation tool (quanteeze.nemotron_image / quanteeze.image_mcp)
+is invoked. Recipients redistributing or using Quanteeze under GPL-2.0-only or
+for commercial purposes must omit src/quanteeze/vendor/nemotron_image/ (and
+not use the optional Nemotron-Labs-Image integration); the rest of Quanteeze
+is unaffected. No model weights are distributed in this repository.
+
 Portions of the Metal and CUDA kernel ports in src/quanteeze/verify_qmv.py,
 src/quanteeze/expert_qmv.py, src/quanteeze/linear_attn.py, and
 src/quanteeze/cuda_qmv.py are adapted from Apple MLX

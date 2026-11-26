@@ -179,6 +179,7 @@ textarea { width: 100%; font: inherit; color: var(--ink); background: var(--page
         <div class="meter"><div id="dl-bar"></div></div>
         <div class="note" id="dl-msg"></div>
       </div>
+      <div id="convert" hidden style="margin-top:12px"></div>
 
       <div id="precision-pane" hidden style="margin-top:16px">
         <h3>Routed expert precision</h3>
@@ -247,7 +248,7 @@ const shortPath = p => p ? p.replace(/\/$/, '').split('/').slice(-2).join('/') :
 
 let TOKEN = null, CATALOG = null, MODEL = null, LIVE = null, PRESETS = null;
 let pickedModel = null, pickedBits = '', wasBusy = false;
-let dlInfo = null, dlTimer = null, pollTimer = null, TRY = null;
+let dlInfo = null, dlTimer = null, pollTimer = null, TRY = null, CONVERTING = false;
 
 function store(t) { try { sessionStorage.setItem('quanteeze-token', t); } catch (e) {} }
 function stored() { try { return sessionStorage.getItem('quanteeze-token'); } catch (e) { return null; } }
@@ -502,6 +503,8 @@ function renderCatalog() {
     btn.append(el('div', {class: 'title'}, parts[parts.length - 1] || m.name));
     const tags = el('div', {class: 'tags'});
     tags.append(el('span', {class: 'tag'}, `${m.gb} GB`));
+    if (m.unquantized) tags.append(el('span', {class: 'tag warn'}, `${m.unquantized.dtype} · not quantized`));
+    if (m.converted_from) tags.append(el('span', {class: 'tag'}, 'converted here'));
     if (m.moe && m.experts) tags.append(el('span', {class: 'tag'}, `${m.layers || '?'}L × ${m.experts}E`));
     if (m.stock_bits) tags.append(el('span', {class: 'tag'}, `${m.stock_bits}-bit stock`));
     if (m.mtp && m.mtp.head) tags.append(el('span', {class: 'tag good'}, 'MTP head'));
@@ -518,6 +521,7 @@ function renderCatalog() {
     box.append(btn);
   }
   renderPrecision();
+  renderConvert();
 }
 
 function renderPrecision() {
@@ -745,6 +749,78 @@ function pollDownload() {
   }, 1500);
 }
 
+// ---------------------------------------------------------------- convert float weights to MLX (quanteeze.convert)
+function renderConvert() {
+  const box = $('convert');
+  if (CONVERTING) return;
+  const pick = CATALOG && CATALOG.models.find(x => x.path === pickedModel);
+  box.hidden = !(pick && (pick.unquantized || pick.converted_from));
+  box.replaceChildren();
+  if (box.hidden) return;
+  if (!pick.unquantized) {
+    box.append(el('p', {class: 'note', style: 'margin:0'}, `Converted to MLX here from ${pick.converted_from}.`));
+    return;
+  }
+  box.append(el('div', {class: 'ask'},
+    el('div', {}, `Its weights are ${pick.unquantized.dtype}, not quantized: loaded so, they take all ${fmt(pick.gb)} GB. Converted to MLX at 4 or 8 bits, they take about a quarter or half of their bfloat16 size.`),
+    el('div', {class: 'bar', style: 'margin-top:10px'},
+      el('button', {onclick: () => askConvert(pick, 4)}, 'Convert to 4 bits…'),
+      el('button', {onclick: () => askConvert(pick, 8)}, 'Convert to 8 bits…'))));
+}
+
+async function askConvert(m, bits) {
+  const box = $('convert');
+  box.replaceChildren(el('div', {class: 'ask'}, el('p', {class: 'note', style: 'margin:0'}, 'Looking at what it would write…')));
+  let p;
+  try { p = await call('POST', '/v1/quanteeze/home/convert/info', {path: m.path, bits}); }
+  catch (e) { box.replaceChildren(el('div', {class: 'ask'}, el('p', {class: 'err', style: 'margin:0'}, e.message))); return; }
+  const tool = p.tool === 'mlx_vlm' ? 'mlx-vlm' : 'mlx-lm';
+  const lines = [el('div', {}, el('b', {}, `${bits} bits`), ` — about ${fmt(p.gb, 1)} GB written by ${tool}, ${fmt(p.free_gb, 0)} GB free there.`)];
+  if (p.dest) lines.push(el('div', {class: 'note mono'}, `into ${p.dest}`));
+  lines.push(el('div', {class: 'note'}, "Nothing of the repository's own code is run. The original stays as it is."));
+  if (p.why) lines.push(el('p', {class: 'err'}, `Not now: ${p.why}.`));
+  lines.push(el('div', {class: 'bar', style: 'margin-top:10px'},
+    p.why ? '' : el('button', {class: 'primary', onclick: () => startConvert(m, bits, p)}, `Convert, writing ${fmt(p.gb, 1)} GB`),
+    el('button', {onclick: () => { renderConvert(); }}, 'Cancel')));
+  box.replaceChildren(el('div', {class: 'ask'}, ...lines));
+}
+
+async function startConvert(m, bits, p) {
+  try { await call('POST', '/v1/quanteeze/home/convert', {path: m.path, bits}); }
+  catch (e) { $('convert').replaceChildren(el('div', {class: 'ask'}, el('p', {class: 'err', style: 'margin:0'}, e.message))); return; }
+  watchConvert();
+}
+
+async function watchConvert() {
+  let s;
+  try { s = await call('GET', '/v1/quanteeze/home/convert'); } catch (e) { CONVERTING = false; return; }
+  const box = $('convert');
+  const name = (s.dest || '').split('/').pop();
+  if (s.state === 'converting') {
+    CONVERTING = true; box.hidden = false;
+    box.replaceChildren(el('div', {class: 'ask'},
+      el('div', {}, `Converting to ${name}: ${fmt((s.bytes || 0) / 1e9, 1)} of about ${fmt(s.told / 1e9, 1)} GB`),
+      el('div', {class: 'meter'}, el('div', {style: `width:${Math.min(100, 100 * (s.bytes || 0) / Math.max(s.told, 1))}%`})),
+      el('div', {class: 'note'}, 'No model loads until it ends.')));
+    setTimeout(watchConvert, 2000);
+    return;
+  }
+  const was = CONVERTING; CONVERTING = false;
+  if (!was) return;
+  box.hidden = false;
+  if (s.state === 'done') {
+    box.replaceChildren(el('div', {class: 'ask'}, el('p', {class: 'ok', style: 'margin:0'}, `${name} is here: ${s.dest}`)));
+    CATALOG = await call('GET', '/v1/quanteeze/home/catalog');
+    const made = CATALOG.models.find(x => x.path === s.dest);
+    if (made) {
+      pickedModel = made.path; pickedBits = '';
+      renderCatalog(); renderPresets();
+    }
+  } else if (s.state === 'failed') {
+    box.replaceChildren(el('div', {class: 'ask'}, el('p', {class: 'err', style: 'margin:0'}, `${name}: ${s.error}`)));
+  }
+}
+
 // ---------------------------------------------------------------- try a prompt (SSE streaming + live tok/s)
 async function streamPrompt(body) {
   const r = await fetch('/v1/chat/completions', {
@@ -937,6 +1013,8 @@ async function init() {
     $('app').hidden = false;
     renderNow(); renderCatalog(); renderPresets(); renderConnect(conn);
     schedulePoll();
+    const conv = await call('GET', '/v1/quanteeze/home/convert').catch(() => null);
+    if (conv && conv.state === 'converting') { CONVERTING = true; watchConvert(); }
   } catch (e) {
     $('locked').hidden = false;
     $('app').hidden = true;
@@ -1078,6 +1156,15 @@ init();
     'OpenAI base URL': 'OpenAI 互換 URL',
     'Anthropic base URL': 'Anthropic 互換 URL',
     'Copy': 'コピー', 'Copied': 'コピー済み',
+    'Cancel': 'キャンセル',
+    'converted here': 'ここで変換',
+    'Convert to 4 bits…': '4 ビットに変換…',
+    'Convert to 8 bits…': '8 ビットに変換…',
+    'Looking at what it would write…': '書き込む内容を調べています…',
+    '4 bits': '4 ビット',
+    '8 bits': '8 ビット',
+    "Nothing of the repository's own code is run. The original stays as it is.": 'リポジトリ付属のコードは動かしません。元の重みはそのまま残ります。',
+    'No model loads until it ends.': '終わるまで、モデルは読み込めません。',
   };
 
   const PATTERNS = [
@@ -1129,6 +1216,16 @@ init();
       (m, name, host) => `${name} は${JA[host] || host}に未保存のため、取得されるまでモデル同梱の MTP ヘッドで下書きします。`],
     [/^C\+\+ STM on-demand engine is not active \(QUANTEEZE_DEMAND_STM=on\): (.+)\. Python on-demand streaming is serving instead\.$/,
       'C++ STM オンデマンドエンジンは有効になっていません（QUANTEEZE_DEMAND_STM=on）：$1。Python 版のオンデマンド配信で動作しています。'],
+    [/^(.+) · not quantized$/, '$1 · 量子化なし'],
+    [/^Converted to MLX here from (.+)\.$/, 'ここで $1 から MLX に変換したものです。'],
+    [/^Its weights are (.+), not quantized: loaded so, they take all (.+) GB\. Converted to MLX at 4 or 8 bits, they take about a quarter or half of their bfloat16 size\.$/,
+      '重みは $1 で、量子化されていません：このまま読み込むと $2 GB 全部を使います。MLX の 4 ビットか 8 ビットに変換すると、bfloat16 のときのおよそ 4 分の 1 か半分になります。'],
+    [/^— about (.+) GB written by (.+), (.+) GB free there\.$/, '— $2 で約 $1 GB を書き込みます。書き込み先の空きは $3 GB です。'],
+    [/^into (.+)$/, '保存先：$1'],
+    [/^Not now: (.+)\.$/, '今はできません：$1。'],
+    [/^Convert, writing (.+) GB$/, '変換する（$1 GB を書き込み）'],
+    [/^Converting to (.+): (.+) of about (.+) GB$/, '$1 に変換中：約 $3 GB のうち $2 GB'],
+    [/^(.+) is here: (.+)$/, '$1 はここにあります：$2'],
   ];
 
   const FRAGMENTS = [

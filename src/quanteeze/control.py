@@ -52,6 +52,9 @@ HOME_ROUTES = {
     ('POST', 'download/info'),
     ('POST', 'download'),
     ('GET', 'download'),
+    ('POST', 'convert/info'),
+    ('POST', 'convert'),
+    ('GET', 'convert'),
     ('GET', 'live'),
     ('GET', 'connect'),
     ('POST', 'ple'),
@@ -88,6 +91,7 @@ CHOICES = {
     'QUANTEEZE_BITS': ('1', '2', '3', '4', '8', 'mxfp4', 'q3_k', 'q2_k', 'iq2_xs', 'off'),
     'QUANTEEZE_LOAD_WHOLE': ('on', 'off'),
     'QUANTEEZE_APC_ENCRYPT': ('on', 'off'),
+    'QUANTEEZE_APC_READ_BACK_PLAIN': ('on', 'off'),
     'QUANTEEZE_CONTEXT_COMPRESS': ('off', 'recent', 'similar', 'h2o', 'snapkv'),
     'QUANTEEZE_CONTEXT_LAYERS': ('uniform', 'pyramid'),
     'QUANTEEZE_KV_BITS': ('8', 'off'),
@@ -430,6 +434,11 @@ def switch_model(path, wait=0.2, undo=None):
         raise ValueError(
             f'unloading {_SWITCH["held"]} already' if _SWITCH['state'] == 'unloading'
             else f'loading {_SWITCH["target"]} already'
+        )
+    from . import convert
+    if convert.running():
+        raise ValueError(
+            f'converting {Path(convert.state().get("source") or "").name} to MLX: load a model when it ends'
         )
     target = str(target.resolve())
     _checked(target)

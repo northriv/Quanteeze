@@ -94,6 +94,7 @@ Web UI は上から順番に使っていきます。ブラウザの言語設定�
 
 1. **モデルと量子化精度**（Model & expert precision）
    このマシンで見つかったローカルモデルの一覧から使いたいモデルを選びます。まだ手元にないモデルを使う場合は、`org/model-name` を入力して **サイズ確認**（Check size）を押し、表示された合計ファイル数と容量（GB）を確認してから **Download ... GB** で取得できます。
+   - **量子化されていない元の重み（`f32` / `bf16` / `f16`）の MLX 変換**：未量子化の `safetensors` チェックポイントには **`not quantized`** バッジが付きます。モデルを読み込んでいない状態であれば、**4 ビットに変換…** / **8 ビットに変換…** から使用ツール（`mlx-lm` または `mlx-vlm`）、保存先（LM Studio フォルダの隣または `~/.quanteeze/models`）、予想書き込みサイズ・空き容量を確認したうえで、リポジトリ付属コードを実行しない隔離プロセスで変換できます。
 2. **ルーティング・エキスパートの精度**（Routed expert precision）
    MoE モデルを選ぶと、元の精度や各量子化形式（**4・3・2・1 ビット（最小二乗）**、**MXFP4 / Q3_K / Q2_K / IQ2_XS**）ごとに、エキスパートが使う容量と **メモリに収まる**（fits in memory）/ **SSD からオンデマンド読込**（streams from SSD）が表示されます。
    - **迷ったときの選び方**：まずは **メモリに収まる**（fits in memory）と表示される選択肢の中で一番ビット数の高いものを選ぶのがおすすめです（元の精度のままでも収まる場合は **元の精度** でそのまま高速に動きます）。メモリに入りきらないモデルを試したい場合は **SSD からオンデマンド読込** でもそのまま動きます。
@@ -179,6 +180,27 @@ model = "local"
 codex -c model_provider="quanteeze" -c model="local" \
   -c 'model_providers.quanteeze={name="Quanteeze",base_url="http://127.0.0.1:8765/v1",wire_api="responses",requires_openai_auth=false,stream_idle_timeout_ms=7200000}'
 ```
+
+- **（任意）画像生成 MCP ツール（`quanteeze.image_mcp`）**：Quanteeze の推論サーバー自体は画像を返さないため、Codex や各種 MCP クライアントからローカルの画像生成モデルを呼び出せる独立した stdio MCP サーバー `quanteeze.image_mcp`（ツール名 `generate_image(prompt, model, width, height, seed, path)`）を用意しています。配置済みのモデルを引数 `model` で選択でき、既定値は下表の上側で見つかったもの（商用利用可能な Apache-2.0 モデルが優先）になります。
+
+  | `model` | モデル | ライセンス | 配置するモデルフォルダ | 1 枚（1024×1024）目安 |
+  |---|---|---|---|---|
+  | `z-image-turbo` | Z-Image-Turbo（Tongyi-MAI, 6B） | Apache-2.0（商用可。リポジトリに LICENSE ファイルは無くモデルカード表記） | `mlx-community/Z-Image-Turbo-bf16`（20.5 GB） | 約 12 秒（9 ステップ） |
+  | `flux2-klein` | FLUX.2-klein-4B（Black Forest Labs） | Apache-2.0（商用可） | `black-forest-labs/FLUX.2-klein-4B` の元重み（約 16 GB、`mlx-community` 4〜8 ビット版は mflux 形式のため `mlx-vlm` 不可） | 配置時に自動認識 |
+  | `qwen-image` | Qwen-Image-2.1 | Qwen Research License（研究・評価用途のみ） | `mlx-community/Qwen-Image-2.1-MLX-4bit`（10.5 GB） | 約 44 秒（30 ステップ） |
+  | `nemotron-image` | Nemotron-Labs-Image-30B-A3B | NVIDIA License（研究・評価用途のみ） | MLX 4/8 ビット変換済み（UI の **4 ビットに変換…** 等）＋元リポジトリの `Nemotron-Labs-Image-Tokenizer` | 約 23 秒 |
+
+  上 3 つは `mlx-vlm` の画像生成パイプライン（`quanteeze.vlm_image`、解像度 256〜2048 px・16 刻み）、`nemotron-image` は `quanteeze.nemotron_image`（512〜1536 px・64 刻み）で描画します。いずれかをモデルフォルダ（`~/.lmstudio/models`・`/Volumes/*/lmstudio`・`~/.quanteeze/models`）に置き、`~/.codex/config.toml` に次を足します。
+
+  ```toml
+  [mcp_servers.images]
+  command = "/path/to/Quanteeze/.venv/bin/python"   # このリポジトリの .venv の python（絶対パス）
+  args = ["-m", "quanteeze.image_mcp"]               # 既定モデルを固定する場合は "--default", "flux2-klein" 等を指定
+  tool_timeout_sec = 300
+  ```
+
+  - **モデル別ライセンスへの注意（Qwen-Image-2.1 / Nemotron は研究・評価目的限定・非商用）：** `Qwen-Image-2.1`（Qwen Research License）および `Nemotron-Labs-Image-30B-A3B`（NVIDIA License §3.3 — 変換済み重み・生成 PNG 画像・任意コンポーネント [`src/quanteeze/vendor/nemotron_image/l24sq.py`](src/quanteeze/vendor/nemotron_image/l24sq.py) / [`LICENSE`](src/quanteeze/vendor/nemotron_image/LICENSE) / [`NOTICE.md`](src/quanteeze/vendor/nemotron_image/NOTICE.md) を含む）は**研究または評価の目的限定（非商用）**です。商用製品や受託業務には `z-image-turbo` または `flux2-klein`（Apache-2.0）をご利用ください。MCP ツールもツール説明と応答に各モデルのライセンスを明示します（重みはこのリポジトリに含まれません）。
+  - 呼び出しごとに空きメモリ（モデル容量 + 6 GB）を確認してから読み込み、1 枚描くたびに解放します。画像は既定で `~/.quanteeze/images/` に保存され、総保持容量・プロセスごとの書き込み量（既定各 2 GB、`--keep-gb` / `--write-gb`）を超えると書き込みを拒否します。
 
 **Python（OpenAI SDK）**
 
@@ -437,6 +459,7 @@ uv run python -m quanteeze.variables --markdown
 | `QUANTEEZE_EMBED_SSD` | `off` | 非共有トークン埋め込みを `mmap` で行単位に読み込む。 |
 | `QUANTEEZE_APC_ENCRYPT` | `on` | ディスク上のプレフィックスキャッシュ（APC）を AES-256-GCM で暗号化保護する（`on` / `off`）。 |
 | `QUANTEEZE_APC_DISK_SECRET` | `~/.quanteeze/apc-secret` | APC ディスク階層の名義と鍵へ HMAC-SHA-256 で混合する 32 バイトのマシン固有シークレット（0600・macOS は Time Machine 除外、`off` で平文トークン由来ハッシュのみ）。 |
+| `QUANTEEZE_APC_READ_BACK_PLAIN` | `on` | APC から復元した 1 行・パディング無しのキャッシュ（KV 量子化・ドラフター併用なし）を通常リクエストと同じ `KVCache` / `ArraysCache` へ戻し（`quanteeze.apc_plain`）、Qwen3.5 / Qwen3.8-27B のデコード毎トークンのバッチ配列抽出・コピーを省く（`off`: `mlx-vlm` のバッチキャッシュのまま）。 |
 | `QUANTEEZE_KV_BITS` | 未設定 | フルアテンション層の KV キャッシュ精度（Web UI の「KV キャッシュ」からも切替可。未設定 / `off`: bfloat16、`8`: 64 要素ごとのアフィン 8 ビット量子化。Qwen3.8 Flash-Next で 24.6 → 13.1 kB/tok の約 0.53 倍、Qwen3.8-27B など通常 `KVCache` モデルで `mlx-vlm` 8 ビットキャッシュにより 65.5 → 36.7 kB/tok の約 0.56 倍に省メモリ化、APC 保存・バッチ対応）。 |
 | `QUANTEEZE_KV_BITS_SELECTED` | `on` | `QUANTEEZE_KV_BITS=8` 時、インデクサ予算を超えたデコード（1〜2 トークン）で選択されたキーのみを集めてスパース計算する（`on` / `off`）。 |
 | `QUANTEEZE_KV_BITS_UNPACKED` | `auto` | `QUANTEEZE_KV_BITS=8` 時、プリフィルでは各層の 8 ビット KV をクエリ型へ展開して MLX 高速アテンションおよび Metal の QSA スパースプリフィルカーネルへ渡し、デコード・MTP 検証（1〜2 トークン）では `mlx-vlm` の量子化アテンションを 1 回で呼び出す（`auto`: Metal で有効・CUDA で無効、`on` / `off`）。 |
@@ -544,7 +567,7 @@ Quanteeze は以下のいずれかを選択できるデュアルライセンス�
 - **GNU General Public License, version 2 only**（`GPL-2.0-only`） — [LICENSE-GPL-2.0](LICENSE-GPL-2.0) を参照、または
 - **PolyForm Shield License 1.0.0**（`LicenseRef-PolyForm-Shield-1.0.0`） — [LICENSE-POLYFORM-SHIELD](LICENSE-POLYFORM-SHIELD) を参照。
 
-詳細は [LICENSE](LICENSE) をご確認ください。`src/quanteeze/vendor/deepseek_v4/`・`src/quanteeze/vendor/deepseek_v41/`・`src/quanteeze/iq_grids.py`・`bench/llamacpp/` 配下のサードパーティコンポーネントは元の MIT License 表記を保持します。[`src/quanteeze/vendor/kamepoolalloc/`](src/quanteeze/vendor/kamepoolalloc/README.md) 配下の同梱 [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) および [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) ソース（Copyright (C) 2002–2026 Kentaro Kitagawa）は `Apache-2.0 OR GPL-2.0-or-later` のデュアルライセンスです（[`LICENSE-APACHE-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0) および [`LICENSE-GPL-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0) を参照）。
+詳細は [LICENSE](LICENSE) をご確認ください。`src/quanteeze/vendor/deepseek_v4/`・`src/quanteeze/vendor/deepseek_v41/`・`src/quanteeze/iq_grids.py`・`bench/llamacpp/` 配下のサードパーティコンポーネントは元の MIT License 表記を保持します。[`src/quanteeze/vendor/kamepoolalloc/`](src/quanteeze/vendor/kamepoolalloc/README.md) 配下の同梱 [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) および [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) ソース（Copyright (C) 2002–2026 Kentaro Kitagawa）は `Apache-2.0 OR GPL-2.0-or-later` のデュアルライセンスです（[`LICENSE-APACHE-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0) および [`LICENSE-GPL-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0) を参照）。なお、[`src/quanteeze/vendor/nemotron_image/`](src/quanteeze/vendor/nemotron_image/NOTICE.md) 配下の任意サードパーティファイル（`l24sq.py`）のみは Quanteeze の `GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0` ではなく、同フォルダの NVIDIA License（[`LICENSE`](src/quanteeze/vendor/nemotron_image/LICENSE)：**研究・評価目的限定・非商用**）のみが適用されます。通常の Quanteeze 推論サーバーからは一切 import されず、上記の任意画像ツールを使用しない場合や、`GPL-2.0-only` 条件・商用目的で Quanteeze を再配布・利用する場合は `src/quanteeze/vendor/nemotron_image/` ディレクトリを除外してください。
 
 Quanteeze はモデルの重みを配布しません。利用する各モデル固有のライセンス（`--host` で `127.0.0.1` 以外に公開する場合の MaaS / サービス提供条項を含む）については利用者の責任で遵守してください。
 

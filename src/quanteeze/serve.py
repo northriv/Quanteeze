@@ -41,6 +41,7 @@ from . import (
     allocator,
     apc_disk,
     apc_images,
+    apc_plain,
     arch,
     context_compress,
     control,
@@ -1709,6 +1710,13 @@ def main():
         atexit.register(
             lambda: print(f'quanteeze: APC disk sealing, {apc_disk.summary()}', file=sys.stderr, flush=True)
             if any(apc_disk.STATS.values()) else None
+        )
+    if not variables.off('QUANTEEZE_APC_READ_BACK_PLAIN'):
+        apc_plain.install(PromptProcessingBatch)
+        atexit.register(
+            lambda: print(f'quanteeze: prompts read back onto plain caches, {apc_plain.STATS}',
+                          file=sys.stderr, flush=True)
+            if any(apc_plain.STATS.values()) else None
         )
     _checkpoints_a_prompt()
     _cut_prefills_kept()
