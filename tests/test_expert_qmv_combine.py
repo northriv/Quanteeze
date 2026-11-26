@@ -4,6 +4,7 @@ import copy
 
 import mlx.core as mx
 import mlx.nn as nn
+import pytest
 from mlx_vlm.models.glm5_next.config import TextConfig
 from mlx_vlm.models.glm5_next.language import LanguageModel
 from mlx_vlm.models.switch_layers import SwitchGLU
@@ -96,6 +97,9 @@ def test_install_switch_stock_fallback_preserves_combine(monkeypatch):
     assert mx.array_equal(exp, act)
 
 
+@pytest.mark.skipif(not mx.metal.is_available(),
+                    reason="MLX CUDA's quantized_matmul has no implementation for this tiny model's products "
+                           '(5 rows of 64 by 64 at 4 bits, transposed or not, float32 or bfloat16)')
 def test_glm5_next_mtp_installed_switches_return_2d_draft_tokens():
     """Tiny quantized `Glm5NextMTPDraftModel` produces 2D drafts and runs `_mtp_rounds_batch`."""
     mx.random.seed(31)
