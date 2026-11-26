@@ -100,7 +100,9 @@ def test_rows_with_padding_or_of_other_kinds_are_left_as_they_are():
     mx.eval(lm(mx.concatenate([prompt, prompt]), cache=two).logits)
     assert apc_plain.plain(lm, two) is None
     quantized = _make_cache(lm, [0], kv_bits=8, kv_group_size=64)
-    mx.eval(lm(prompt, cache=quantized).logits)
+    if mx.metal.is_available():                        # (MLX CUDA's quantized_matmul has no implementation for mlx-vlm's
+        mx.eval(lm(prompt, cache=quantized).logits)    # 8-bit attention in one call: there the caches are left empty,
+    assert any(type(c) not in (cache.BatchKVCache, cache.ArraysCache) for c in quantized)   # and their kind decides)
     assert apc_plain.plain(lm, quantized) is None
     assert apc_plain.plain(lm, _warm(lm, prompt)[:-1]) is None
 

@@ -351,6 +351,20 @@ Across 3 fixed prompts (English explanation, Python code generation, Japanese ex
 - **Engram-only GGUF shards can be omitted**: When a split GGUF places Engram tables alone in the final shard (e.g., shard `00005` of a 5-shard DeepSeek V4.1 GGUF), shards `00001`–`00004` suffice to serve all 40 MoE layers while Engram reads from the MLX checkpoint.
 - **Avoid running two servers on one Mac**: Default Unified Memory budgeting assumes a single server (~71 GB expert bank on a 128 GB Mac) and logs `WARNING another MLX server process is already running` if another MLX server is detected. If running side by side intentionally, cap `QUANTEEZE_FROM_SSD_GB` and `QUANTEEZE_KEEP_GB` explicitly.
 
+### Linux / NVIDIA GPU Example (RTX 5060 Ti 16 GB, CUDA 13) & Tuning Notes
+
+Measured on a Linux machine with an **RTX 5060 Ti (16 GB VRAM)**, **62 GB host RAM**, and **CUDA 13** (`mlx-cuda-13` 0.32.4, `QUANTEEZE_QUANT_CACHE` unset, `temperature=0`, `max_tokens=320`, 0 kernel mismatches):
+
+| Model & Setting | Placement | Decode Speed | Notes |
+|---|---|---|---|
+| `Qwen3.6-35B-A3B` (`bf16`, 66 GB) + `QUANTEEZE_BITS=2` | Auto SSD streaming (`175–178 / 256` experts/layer in VRAM; 9.1 GB experts) | **15.1–15.8 tok/s** | 16/16 requests succeeded cleanly |
+| `Qwen3.6-35B-A3B` + `QUANTEEZE_BITS=2 QUANTEEZE_LOAD_WHOLE=on` | Forced whole in 16 GB VRAM (14.9 GB MLX / 15.4 GB GPU) | **77.4 tok/s** | OOM (`cudaMallocAsync`) on longer prompt prefills (9/16 succeeded) |
+| `Qwen3.8-Flash-Next` (4-bit, 67.9 GB experts, `MTP=auto`) | Auto (`43 / 512` experts/layer in VRAM + 42.1 GB in host RAM) | **2.6–2.8 tok/s** | 61% of VRAM misses served from host RAM; `QUANTEEZE_BITS=2`/`3` without `QUANTEEZE_QUANT_CACHE` drops to **1.6–1.9 tok/s** |
+
+- **Use `QUANTEEZE_BITS` when the lowered model fits in VRAM, or with `QUANTEEZE_QUANT_CACHE`**: When experts still exceed VRAM and `QUANTEEZE_QUANT_CACHE` is unset, host-RAM caching (`HostCopy`) is skipped and every SSD miss is re-quantized on the fly — slower than serving original checkpoint precision (with host-RAM caching) or `--experts-gguf`.
+- **Keep VRAM headroom for prefills and avoid `QUANTEEZE_BITS=1` for general use**: Forcing `QUANTEEZE_LOAD_WHOLE=on` when weights fill nearly all VRAM causes prefill OOMs; `QUANTEEZE_BITS=1` fits in smaller VRAM (5.0 GB on 35B) but severely degrades output coherence (prefer 2-bit+ or `--experts-gguf`).
+- **CUDA 13 & CPU offload**: `QUANTEEZE_NVRTC_PCH=on` detects loaded `libnvrtc.so.12` / `libnvrtc.so.13` automatically. `QUANTEEZE_CPU_EXPERTS=auto` currently offloads 1-token decode misses (multi-token MTP verify passes run on GPU).
+
 ---
 
 ## Architecture & Features

@@ -353,6 +353,20 @@ Apple Silicon MacBook Pro（128 GB Unified Memory / M5 Max / 内蔵 SSD）で、
 - **Engram 専用シャードは省略可能**：DeepSeek V4.1 の 5 分割 GGUF のように末尾シャード（`00005`）が Engram テーブル専用の場合、エキスパートを含む `00001`〜`00004` の 4 シャードだけで全 40 層を自動認識します（Engram は MLX チェックポイント側を参照します）。
 - **同一 Mac での二重起動は非推奨**：macOS の Unified Memory 環境では単独稼働を前提にエキスパート枠（128 GB 機で約 71 GB）を確保するため、複数の MLX サーバーを既定設定のまま同時起動するとメモリ不足・スワップ逼迫を招きます（起動時に別サーバーを検知すると `WARNING another MLX server process is already running` を出力します）。基本的には 1 本ずつ起動し、どうしても並走させる場合は `QUANTEEZE_FROM_SSD_GB` と `QUANTEEZE_KEEP_GB` でメモリ上限を明示的に絞ってください。
 
+### Linux / NVIDIA GPU での実測例（RTX 5060 Ti 16 GB・CUDA 13）と運用のポイント
+
+**RTX 5060 Ti（16 GB VRAM）**・**ホストメモリ 62 GB**・**CUDA 13**（`mlx-cuda-13` 0.32.4、`QUANTEEZE_QUANT_CACHE` 未指定、`temperature=0`、`max_tokens=320`、カーネル不一致 0 件）での実測例です：
+
+| モデルと設定 | 配置 | デコード速度 | 備考 |
+|---|---|---|---|
+| `Qwen3.6-35B-A3B`（`bf16`・66 GB）＋ `QUANTEEZE_BITS=2` | 自動 SSD ストリーミング（各層 `175〜178 / 256` 個を VRAM 保持、エキスパート 9.1 GB） | **15.1〜15.8 tok/s** | 16/16 リクエスト正常完了 |
+| `Qwen3.6-35B-A3B` ＋ `QUANTEEZE_BITS=2 QUANTEEZE_LOAD_WHOLE=on` | 16 GB VRAM へ強制全保持（MLX 14.9 GB / GPU 15.4 GB） | **77.4 tok/s** | 長めのプロンプト取り込み時に OOM（`cudaMallocAsync`、成功 9/16） |
+| `Qwen3.8-Flash-Next`（4 ビット・エキスパート 67.9 GB、`MTP=auto`） | 自動（各層 `43 / 512` 個を VRAM ＋ 42.1 GB をホスト RAM 保持） | **2.6〜2.8 tok/s** | VRAM ミスの 61% をホスト RAM から供給。`QUANTEEZE_QUANT_CACHE` 無しで `QUANTEEZE_BITS=2`/`3` に下げると **1.6〜1.9 tok/s** に低下 |
+
+- **VRAM に収まらないモデルでは `QUANTEEZE_QUANT_CACHE` 無しの `QUANTEEZE_BITS` を使わない**：ディスクキャッシュ未指定のまま均一再量子化するとホスト RAM キャッシュ（`HostCopy`）が使われず、ミスのたびに SSD から読み直して再量子化するため、元精度のまま（ホスト RAM キャッシュ併用）や `--experts-gguf` より遅くなります。`QUANTEEZE_BITS` は VRAM に収まる場合、または `QUANTEEZE_QUANT_CACHE` 併用時に使ってください。
+- **プリフィル用の VRAM 余裕と 1 ビット量子化の注意**：空き VRAM がほとんど残らない状態で `QUANTEEZE_LOAD_WHOLE=on` を強制するとプリフィル時に OOM になります。また `QUANTEEZE_BITS=1` は 16 GB VRAM に収まりますが（35B で 5.0 GB）、出力が大きく崩れるため通常は 2 ビット以上または `--experts-gguf` を推奨します。
+- **CUDA 13 と CPU オフロード**：`QUANTEEZE_NVRTC_PCH=on` は読み込み済みの `libnvrtc.so.12` / `libnvrtc.so.13` を自動検出します。`QUANTEEZE_CPU_EXPERTS=auto` は現在 1 トークンずつのデコードパスで動作します（マルチトークンの MTP 検証パスは GPU 側で実行されます）。
+
 ---
 
 ## 主な特徴・仕組み
