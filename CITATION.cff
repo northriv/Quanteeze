@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use Quanteeze in academic or research work, please cite both Quanteeze and the underlying kamestm / kamepoolalloc papers as applicable."
 type: software
 title: "Quanteeze: Fast Uniform Quantization and On-Demand MoE Serving on Apple Silicon and CUDA"
-version: 0.1.10
+version: 0.8.0
 authors:
   - family-names: Kitagawa
     given-names: Kentaro

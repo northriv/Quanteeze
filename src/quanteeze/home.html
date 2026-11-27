@@ -1224,8 +1224,8 @@ init();
     '8 bits': '8 ビット',
     "the default: the full attention layers' keys and values kept as the model computes them, 24.6 kB a token (1.7 GB at 70k tokens, 6.4 GB at 262k)":
       '既定：フルアテンション層のキーと値をモデルが計算した bfloat16 のまま保持します（1トークン 24.6 kB：70k トークンで 1.7 GB、262k で 6.4 GB）',
-    "the full attention layers' keys and values at 8 bits, 0.53 of the memory (0.9 GB at 70k tokens, 3.4 GB at 262k): more room for long conversations and the experts. Not the same bits -- a key off by ~0.7% -- though the served KL showed no difference on a CUDA GPU or a Mac, nor did long-prompt prefill or decode speed":
-      'フルアテンション層のキーと値を 8 ビットで保持し、メモリ使用量を約 0.53 倍に抑えます（70k トークンで 0.9 GB、262k で 3.4 GB）。長い会話やエキスパートにより多くの余裕を残せます。ビット完全一致ではありませんが（キーあたり約 0.7% の差）、Mac と CUDA GPU のいずれでも配信 KL や長文プリフィル・デコード速度に差は見られませんでした',
+    "the full attention layers' keys and values at 8 bits, 0.53 of the memory (0.9 GB at 70k tokens, 3.4 GB at 262k): more room for long conversations and the experts. Not the same bits -- a key off by ~0.7% -- with no noticeable difference in output quality, long-prompt prefill, or decode speed on a CUDA GPU or a Mac":
+      'フルアテンション層のキーと値を 8 ビットで保持し、メモリ使用量を約 0.53 倍に抑えます（70k トークンで 0.9 GB、262k で 3.4 GB）。長い会話やエキスパートにより多くの余裕を残せます。ビット完全一致ではありませんが（キーあたり約 0.7% の差）、Mac と CUDA GPU のいずれでも出力品質や長文プリフィル・デコード速度に目立った差は見られませんでした',
     "the default: the full attention layers' keys and values kept as the model computes them (Qwen3.8-27B: 65.5 kB a token, 8.6 GB at 128k tokens)":
       '既定：フルアテンション層のキーと値をモデルが計算した bfloat16 のまま保持します（Qwen3.8-27B：1トークン 65.5 kB、128k トークンで 8.6 GB）',
     "the full attention layers' keys and values at 8 bits in mlx-vlm's own cache, the last of them left at bfloat16: 0.56 of the memory (Qwen3.8-27B: 36.7 kB a token, 4.8 GB at 128k tokens). Not the same bits; on a Mac decode is 1-3% slower":

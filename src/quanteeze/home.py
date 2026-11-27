@@ -111,8 +111,8 @@ PRESETS = {
             'label': '8 bits',
             'about': "the full attention layers' keys and values at 8 bits, 0.53 of the memory (0.9 GB at 70k "
                      'tokens, 3.4 GB at 262k): more room for long conversations and the experts. Not the same bits '
-                     '-- a key off by ~0.7% -- though the served KL showed no difference on a CUDA GPU or a Mac, '
-                     'nor did long-prompt prefill or decode speed',
+                     '-- a key off by ~0.7% -- with no noticeable difference in output quality, long-prompt prefill, '
+                     'or decode speed on a CUDA GPU or a Mac',
             'plain': "the full attention layers' keys and values at 8 bits in mlx-vlm's own cache, the last of them "
                      'left at bfloat16: 0.56 of the memory (Qwen3.8-27B: 36.7 kB a token, 4.8 GB at 128k tokens). '
                      'Not the same bits; on a Mac decode is 1-3% slower',

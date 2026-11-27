@@ -1731,7 +1731,7 @@ wheels = [
 
 [[package]]
 name = "quanteeze"
-version = "0.1.10"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

@@ -436,10 +436,10 @@ def test_why_alone_says_what_keeps_requests_apart_and_state_tells_the_page(monke
     monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS_ANY', 'off')
     assert 'GGUF' in request_threads.why_alone() and not request_threads.together_ok()
     class Reader:                                         # (demand._LIVE is a set)
-        _stm, _stm_why = None, 'a GGUF tier'
+        _stm, _stm_why = None, 'native SSD readers disabled'
     reader = Reader()
     monkeypatch.setattr(demand, '_LIVE', {reader})
-    assert request_threads.why_alone() == 'the C++ STM does not serve the on-demand reads (a GGUF tier)'
+    assert request_threads.why_alone() == 'the C++ STM does not serve the on-demand reads (native SSD readers disabled)'
     reader._stm = SimpleNamespace(started=False)
     assert request_threads.why_alone() == "the C++ STM starts at the first request's pass"
     reader._stm.started = True

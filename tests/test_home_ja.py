@@ -86,7 +86,7 @@ def test_requests_at_once_in_japanese():
     why = next(f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == 'why_alone')
     reasons = [r.value.value for r in ast.walk(why) if isinstance(r, ast.Return) and isinstance(r.value, ast.Constant)
                and isinstance(r.value.value, str)]
-    reasons += [r.value.left.value + ' (a GGUF tier)' for r in ast.walk(why)
+    reasons += [r.value.left.value + ' (native SSD readers disabled)' for r in ast.walk(why)
                 if isinstance(r, ast.Return) and isinstance(r.value, ast.BinOp)]
     assert len(reasons) == 5
     shown = ['Requests at once', 'Requests served at once, at most', 'Save', 'Reload the model now', 'A whole number, 1 or more.',
