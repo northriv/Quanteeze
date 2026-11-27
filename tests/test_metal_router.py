@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0
-"""Tests for `quanteeze.metal_router`: single-kernel Metal decode routing and weighted expert sum."""
+"""Tests for `quanteeze.metal_router`: Metal decode and verify-pass routing and weighted expert sum."""
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -72,15 +72,21 @@ def test_metal_routed_checks_declines_and_compile_trace(monkeypatch):
 
     # Shape / batch / dtype / toggle guards
     two_tok = mx.array(rng.normal(0, 2, (1, 2, 512)).astype(np.float32)).astype(mx.bfloat16)
+    nine_tok = mx.array(rng.normal(0, 2, (1, 9, 512)).astype(np.float32)).astype(mx.bfloat16)
+    zero_tok = mx.zeros((1, 0, 512), mx.bfloat16)
     batch_two = mx.array(rng.normal(0, 2, (2, 1, 512)).astype(np.float32)).astype(mx.bfloat16)
     too_many_experts = mx.zeros((1, 1, metal_router.MOST + 1), mx.bfloat16)
-    assert not metal_router.takes(two_tok, 10)
+    assert metal_router.takes(two_tok, 10)
+    assert metal_router.pending(512, 10, mx.bfloat16, two_tok)
+    assert not metal_router.takes(nine_tok, 10)
+    assert not metal_router.takes(zero_tok, 10)
     assert not metal_router.takes(batch_two, 10)
     assert not metal_router.takes(logits.astype(mx.float32), 10)
     assert not metal_router.takes(logits, 17)
     assert not metal_router.takes(logits, 0)
     assert not metal_router.takes(too_many_experts, 10)
-    assert not metal_router.pending(512, 10, mx.bfloat16, two_tok)
+    assert not metal_router.pending(512, 10, mx.bfloat16, nine_tok)
+    assert not metal_router.pending(512, 10, mx.bfloat16, zero_tok)
     assert not metal_router.pending(512, 10, mx.bfloat16, batch_two)
 
     monkeypatch.setattr(metal_router, 'ON', [False])
@@ -88,20 +94,66 @@ def test_metal_routed_checks_declines_and_compile_trace(monkeypatch):
     assert not metal_router.pending(512, 10, mx.bfloat16, logits)
 
 
+@pytest.mark.parametrize('rows', [2, 3, 5, 8])
+@pytest.mark.parametrize('dtype', [mx.bfloat16, mx.float16])
+def test_metal_route_verify_rows_match_mlx_ops_bit_for_bit(rows, dtype):
+    rng = np.random.default_rng(rows * 19)
+    for e in (10, 128, 380, 512):
+        for k in (8, 10):
+            for trial in range(4):
+                logits = mx.array(rng.normal(0, 2.0, (1, rows, e)).astype(np.float32)).astype(dtype)
+                got = metal_router.route(logits, k)
+                want = _theirs(logits, k)
+                assert got[0].shape == (1, rows, k) and _same(got, want), (rows, e, k, dtype, trial)
+
+
+def test_metal_verify_rows_served_with_separate_keys(monkeypatch):
+    r_choice, r_checked = kernel_checks.tables('test_metal_router_rows')
+    w_choice, w_checked = kernel_checks.tables('test_metal_weighted_rows')
+    monkeypatch.setattr(metal_router, 'CHOICE', r_choice)
+    monkeypatch.setattr(metal_router, 'CHECKED', r_checked)
+    monkeypatch.setattr(metal_router, 'STATS', dict(served=0, checked=0, mismatched=0))
+    monkeypatch.setattr(metal_router, 'SAID', [])
+    monkeypatch.setattr(metal_router._Weighed, 'CHOICE', w_choice)
+    monkeypatch.setattr(metal_router._Weighed, 'CHECKED', w_checked)
+    monkeypatch.setattr(metal_router._Weighed, 'STATS', dict(served=0, checked=0, mismatched=0))
+    monkeypatch.setattr(metal_router._Weighed, 'SAID', [])
+    monkeypatch.setattr(metal_router, 'ON', [True])
+
+    rng = np.random.default_rng(31)
+    probe = mx.zeros((1, 4, 128), mx.bfloat16)
+    assert metal_router.pending(512, 10, mx.bfloat16, probe)
+    for _ in range(metal_router.CHECKS + 2):
+        logits = mx.array(rng.normal(0, 2, (1, 4, 512)).astype(np.float32)).astype(mx.bfloat16)
+        assert _same(metal_router.routed(logits, 10, lambda l=logits: _theirs(l, 10)), _theirs(logits, 10))
+        out = mx.array(rng.normal(0, 1, (1, 4, 10, 128)).astype(np.float32)).astype(mx.bfloat16)
+        sc = mx.array(rng.dirichlet(np.ones(10), size=4)[None].astype(np.float32)).astype(mx.bfloat16)
+        sh = mx.array(rng.normal(0, 1, (1, 4, 128)).astype(np.float32)).astype(mx.bfloat16)
+        assert _same(
+            metal_router.weighted(out, sc, sh, lambda o=out, s=sc, r=sh: _weighted_graph(o, s, r)),
+            _weighted_graph(out, sc, sh),
+        )
+    assert not metal_router.pending(512, 10, mx.bfloat16, probe)
+    assert metal_router.STATS == dict(served=2, checked=metal_router.CHECKS, mismatched=0)
+    assert metal_router._Weighed.STATS == dict(served=2, checked=metal_router.CHECKS, mismatched=0)
+    assert (4, 512, 10, str(mx.bfloat16)) in metal_router.CHOICE
+    assert (4, 10, 128, str(mx.bfloat16)) in metal_router._Weighed.CHOICE
+
+
 @pytest.mark.parametrize('k', [6, 8, 10, 16])
 @pytest.mark.parametrize('dtype', [mx.bfloat16, mx.float16])
 def test_metal_weighted_matches_compiled_and_eager_bit_for_bit(k, dtype):
     rng = np.random.default_rng(k)
-    for d in (64, 100, 2048, 2560):
+    for rows, d in ((1, 64), (1, 100), (1, 2560), (2, 2048), (5, 100), (8, 2560)):
         for _ in range(4):
-            output = mx.array(rng.normal(0, 1, (1, 1, k, d)).astype(np.float32)).astype(dtype)
-            scores = mx.array(rng.dirichlet(np.ones(k))[None, None].astype(np.float32)).astype(dtype)
-            shared = mx.array(rng.normal(0, 1, (1, 1, d)).astype(np.float32)).astype(dtype)
+            output = mx.array(rng.normal(0, 1, (1, rows, k, d)).astype(np.float32)).astype(dtype)
+            scores = mx.array(rng.dirichlet(np.ones(k), size=rows)[None].astype(np.float32)).astype(dtype)
+            shared = mx.array(rng.normal(0, 1, (1, rows, d)).astype(np.float32)).astype(dtype)
             got = metal_router.weigh(output, scores, shared)
             want_compiled = _weighted_graph(output, scores, shared)
             want_eager = (output * scores[..., None]).sum(axis=-2) + shared
-            assert _same(got, want_compiled), (k, d, dtype)
-            assert _same(got, want_eager), (k, d, dtype)
+            assert _same(got, want_compiled), (k, rows, d, dtype)
+            assert _same(got, want_eager), (k, rows, d, dtype)
 
 
 def test_metal_weighted_service_and_guards(monkeypatch):
@@ -121,6 +173,14 @@ def test_metal_weighted_service_and_guards(monkeypatch):
         assert _same(got, _weighted_graph(out, sc, sh))
     assert metal_router._Weighed.STATS == dict(served=2, checked=metal_router.CHECKS, mismatched=0)
 
-    assert not metal_router.weighs(mx.zeros((1, 2, 10, 128), mx.bfloat16), sc, sh)
+    sc2 = mx.zeros((1, 2, 10), mx.bfloat16)
+    sh2 = mx.zeros((1, 2, 128), mx.bfloat16)
+    assert metal_router.weighs(mx.zeros((1, 2, 10, 128), mx.bfloat16), sc2, sh2)
+    assert not metal_router.weighs(
+        mx.zeros((1, 9, 10, 128), mx.bfloat16), mx.zeros((1, 9, 10), mx.bfloat16), mx.zeros((1, 9, 128), mx.bfloat16)
+    )
+    assert not metal_router.weighs(
+        mx.zeros((2, 1, 10, 128), mx.bfloat16), mx.zeros((2, 1, 10), mx.bfloat16), mx.zeros((2, 1, 128), mx.bfloat16)
+    )
     assert not metal_router.weighs(out, sc.astype(mx.float16), sh)
     assert not metal_router.weighs(mx.zeros((1, 1, 17, 128), mx.bfloat16), mx.zeros((1, 1, 17), mx.bfloat16), sh)

@@ -359,9 +359,10 @@ _TABLE = [
      'on MLX\'s CUDA backend, a decode token\'s 4-bit or 2-bit affine or MXFP4 routed experts in two kernels '
      '(gate+up+swiglu; down) where mlx-vlm runs four, checked bit for bit first (off: mlx-vlm\'s)'),
     ('QUANTEEZE_METAL_ROUTER', 'on', 'speed', 'start',
-     'on Metal, a decode token\'s routing (softmax, top k, and renormalized weights) in one kernel where MLX runs '
-     'seven ops, and routed outputs weighted, summed, and combined with the shared expert in one kernel where '
-     'MLX runs three (quanteeze.metal_router), each shape checked bit for bit first (off: MLX\'s ops)'),
+     'on Metal, 1-token decode and 2-to-8-token verify-pass routing (softmax, top k, and renormalized weights) in '
+     'one kernel where MLX runs seven ops, and routed outputs weighted, summed, and combined with the shared expert '
+     'in one kernel where MLX runs three (quanteeze.metal_router), each shape checked bit for bit first '
+     '(off: MLX\'s ops)'),
     ('QUANTEEZE_CUDA_ROUTER', 'on', 'speed', 'start',
      'on MLX\'s CUDA backend, a decode token\'s routing in one kernel where MLX runs six, checked bit for bit '
      'first (off: MLX\'s ops)'),

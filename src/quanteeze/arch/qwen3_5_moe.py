@@ -34,8 +34,10 @@ def _install_block(block):
         _quanteeze_moe_fast = True
 
         def __call__(self, x):
-            if self.norm_topk_prob and x.ndim == 3 and x.shape[1] == 1:
-                from .. import cuda_router, metal_router
+            from .. import cuda_router, metal_router
+            if self.norm_topk_prob and x.ndim == 3 and (
+                x.shape[1] == 1 or (x.shape[0] == 1 and 1 < x.shape[1] <= metal_router.ROWS_MOST)
+            ):
                 logits = self.gate(x)
                 inds, scores = metal_router.routed(logits, self.top_k, lambda: cuda_router.routed(logits, self.top_k))
                 y = self.switch_mlp(x, inds)

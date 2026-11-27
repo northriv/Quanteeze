@@ -228,20 +228,14 @@ class _BatchInvariantForward(Qwen4ExpBatchInvariantForward):
         graph = graphs.get(key)
         if graph is False:
             return super()._feed_forward(block, x)
-        if x.shape[1] > 1 and (graph is None or isinstance(graph, int)):
-            seen = graph or 0
-            if seen < verify_qmv.CHECKS:
-                graphs[key] = seen + 1
-                indices, scores, shared = _router_and_shared(self, block, x)
-                return _weighted(self._experts(block, x, indices), scores, shared)
-            ref = weakref.ref(block)
-            graphs[key] = graph = mx.compile(lambda h: _router_and_shared(self, ref(), h))
-        elif graph is None or isinstance(graph, int):
+        if graph is None or isinstance(graph, int):
             gate = block['gate'] if isinstance(block, dict) and 'gate' in block else block.gate
             gw = gate['weight'] if isinstance(gate, dict) and 'weight' in gate else getattr(gate, 'weight', None)
             experts = int(gw.shape[0]) if gw is not None else 0
-            if graph is None or metal_router.pending(experts, block.top_k, x.dtype, x):
-                graphs[key] = (graph or 0) + 1
+            seen = graph or 0
+            wait = seen < verify_qmv.CHECKS if x.shape[1] > 1 else graph is None
+            if wait or metal_router.pending(experts, block.top_k, x.dtype, x):
+                graphs[key] = seen + 1
                 indices, scores, shared = _router_and_shared(self, block, x)
                 return _weighted(self._experts(block, x, indices), scores, shared)
             ref = weakref.ref(block)

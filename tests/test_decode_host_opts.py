@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0
 """Tests for decode host/kernel optimizations (`expert_qmv._plan`, `linear_attn._in_proj`/Metal `SLIDE`,
-`QUANTEEZE_EVAL_LAYERS=auto`, and tiny `qwen4_exp` / `qwen3_5_moe` decode parity with `metal_router`)."""
+`QUANTEEZE_EVAL_LAYERS=auto`, and tiny `qwen4_exp` / `qwen3_5_moe` decode/verify parity with `metal_router`)."""
 import gc
 from types import SimpleNamespace
 import weakref
@@ -222,6 +222,60 @@ def test_eval_layers_auto_policy_and_settings(monkeypatch):
     assert eval_fn(many_tok) == 1
 
 
+def _make_qwen4_text_config(num_layers=4):
+    return Q4TextConfig(
+        model_type='qwen4_exp',
+        hidden_size=128,
+        num_hidden_layers=num_layers,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=128,
+        linear_num_value_heads=4,
+        linear_num_key_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+        num_experts=16,
+        num_experts_per_tok=4,
+        shared_expert_intermediate_size=128,
+        moe_intermediate_size=128,
+        rms_norm_eps=1e-6,
+        vocab_size=512,
+        max_position_embeddings=256,
+        hc_count=4,
+        hc_lowrank=64,
+        full_attention_interval=3,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=64,
+        indexer_budget=64,
+        indexer_compress_ratio=4,
+        rope_parameters={
+            'type': 'default',
+            'mrope_section': [11, 11, 10],
+            'rope_theta': 10_000,
+            'partial_rotary_factor': 0.5,
+        },
+    )
+
+
+def _make_qwen4_lm(seed):
+    mx.random.seed(seed)
+    q4_cfg = _make_qwen4_text_config(num_layers=4)
+    q4_lm = Q4LanguageModel(
+        q4_cfg, Q4ModelConfig(text_config=q4_cfg, vision_config=Q4VisionConfig(), model_type=q4_cfg.model_type)
+    )
+    q4_lm.set_dtype(mx.bfloat16)
+    for layer in q4_lm.model.layers:
+        sw = layer.mlp.switch_mlp
+        for proj in ('gate_proj', 'up_proj', 'down_proj'):
+            setattr(sw, proj, getattr(sw, proj).to_quantized(group_size=64, bits=4))
+    q4_lm.eval()
+    mx.eval(q4_lm.parameters())
+    qwen4_exp.install(q4_lm)
+    return q4_lm
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason='Metal backend required')
 def test_tiny_qwen4_exp_and_qwen3_5_moe_decode_parity_with_metal_router(monkeypatch):
     from mlx_vlm.models.qwen3_5_moe.config import (
@@ -233,42 +287,6 @@ def test_tiny_qwen4_exp_and_qwen3_5_moe_decode_parity_with_metal_router(monkeypa
     from quanteeze.arch.qwen4_exp import _weighted_graph  # ensure compiled graph exists
 
     assert callable(_weighted_graph)
-
-    def _make_qwen4_text_config(num_layers=4):
-        return Q4TextConfig(
-            model_type='qwen4_exp',
-            hidden_size=128,
-            num_hidden_layers=num_layers,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=128,
-            linear_num_value_heads=4,
-            linear_num_key_heads=4,
-            linear_key_head_dim=32,
-            linear_value_head_dim=32,
-            linear_conv_kernel_dim=4,
-            num_experts=16,
-            num_experts_per_tok=4,
-            shared_expert_intermediate_size=128,
-            moe_intermediate_size=128,
-            rms_norm_eps=1e-6,
-            vocab_size=512,
-            max_position_embeddings=256,
-            hc_count=4,
-            hc_lowrank=64,
-            full_attention_interval=3,
-            indexer_n_heads=2,
-            indexer_kv_heads=1,
-            indexer_head_dim=64,
-            indexer_budget=64,
-            indexer_compress_ratio=4,
-            rope_parameters={
-                'type': 'default',
-                'mrope_section': [11, 11, 10],
-                'rope_theta': 10_000,
-                'partial_rotary_factor': 0.5,
-            },
-        )
 
     # Isolate kernel check tables for clean stats observation.
     m_choice, m_checked = kernel_checks.tables('test_e2e_metal_router')
@@ -291,23 +309,7 @@ def test_tiny_qwen4_exp_and_qwen3_5_moe_decode_parity_with_metal_router(monkeypa
     monkeypatch.setattr(qwen4_exp, 'COMPILE_STATS', dict(compiled=0, hyper=0, refused=0))
 
     # 1. Tiny qwen4_exp model
-    mx.random.seed(21)
-    q4_cfg = _make_qwen4_text_config(num_layers=4)
-    q4_cfg.num_experts = 16
-    q4_cfg.num_experts_per_tok = 4
-    q4_cfg.moe_intermediate_size = 128
-    q4_cfg.shared_expert_intermediate_size = 128
-    q4_lm = Q4LanguageModel(
-        q4_cfg, Q4ModelConfig(text_config=q4_cfg, vision_config=Q4VisionConfig(), model_type=q4_cfg.model_type)
-    )
-    q4_lm.set_dtype(mx.bfloat16)
-    for layer in q4_lm.model.layers:
-        sw = layer.mlp.switch_mlp
-        for proj in ('gate_proj', 'up_proj', 'down_proj'):
-            setattr(sw, proj, getattr(sw, proj).to_quantized(group_size=64, bits=4))
-    q4_lm.eval()
-    mx.eval(q4_lm.parameters())
-    qwen4_exp.install(q4_lm)
+    q4_lm = _make_qwen4_lm(21)
 
     prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
     steps = [mx.array([[4 + i]], dtype=mx.int32) for i in range(6)]
@@ -401,3 +403,48 @@ def test_tiny_qwen4_exp_and_qwen3_5_moe_decode_parity_with_metal_router(monkeypa
     assert metal_router._Weighed.STATS['served'] > 0
     assert metal_router.STATS['mismatched'] == 0
     assert metal_router._Weighed.STATS['mismatched'] == 0
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason='Metal backend required')
+def test_tiny_qwen4_exp_verify_rows_parity_with_metal_router(monkeypatch):
+    """Multi-token verify (`T=4`) settles `metal_router` checks before `mx.compile` and matches MLX ops bit for bit."""
+    m_choice, m_checked = kernel_checks.tables('test_e2e_verify_metal_router')
+    w_choice, w_checked = kernel_checks.tables('test_e2e_verify_metal_weighted')
+    monkeypatch.setattr(metal_router, 'CHOICE', m_choice)
+    monkeypatch.setattr(metal_router, 'CHECKED', m_checked)
+    monkeypatch.setattr(metal_router, 'STATS', dict(served=0, checked=0, mismatched=0))
+    monkeypatch.setattr(metal_router._Weighed, 'CHOICE', w_choice)
+    monkeypatch.setattr(metal_router._Weighed, 'CHECKED', w_checked)
+    monkeypatch.setattr(metal_router._Weighed, 'STATS', dict(served=0, checked=0, mismatched=0))
+    monkeypatch.setattr(qwen4_exp, 'COMPILE_STATS', dict(compiled=0, hyper=0, refused=0))
+
+    q4_lm = _make_qwen4_lm(29)
+
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    verify_chunks = [mx.array([[4 + 4 * i, 5 + 4 * i, 6 + 4 * i, 7 + 4 * i]], dtype=mx.int32) for i in range(6)]
+
+    def run_verify(router_on):
+        per_thread.PASS.memo.clear()
+        qwen4_exp.COMPILE_STATS.update(compiled=0, hyper=0, refused=0)
+        monkeypatch.setattr(metal_router, 'ON', [router_on])
+        cache = q4_lm.make_cache()
+        mx.eval(q4_lm(prompt, cache=cache).logits)
+        outs = []
+        for chunk in verify_chunks:
+            out = q4_lm(chunk, cache=cache, speculative_verify=True)
+            mx.eval(out.logits)
+            outs.append(out.logits)
+        return outs
+
+    ref = run_verify(False)
+    got = run_verify(True)
+    for step_idx, (got_logits, ref_logits) in enumerate(zip(got, ref)):
+        assert kernel_checks.same_bits(got_logits, ref_logits), f'qwen4_exp verify step {step_idx} diverged'
+    assert metal_router.STATS['served'] > 0
+    assert metal_router._Weighed.STATS['served'] > 0
+    assert metal_router.STATS['mismatched'] == 0
+    assert metal_router._Weighed.STATS['mismatched'] == 0
+    assert (4, 16, 4, str(mx.bfloat16)) in metal_router.CHOICE
+    assert (4, 4, 128, str(mx.bfloat16)) in metal_router._Weighed.CHOICE
+    assert qwen4_exp.COMPILE_STATS['compiled'] > 0
+    assert qwen4_exp.COMPILE_STATS['refused'] == 0

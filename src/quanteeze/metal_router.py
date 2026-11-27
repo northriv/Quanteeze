@@ -1,20 +1,23 @@
 # SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0
-"""Single-kernel Metal decode routing and MoE weighted summation (`quanteeze.metal_router`).
+"""Metal decode and speculative-verify routing and MoE weighted summation (`quanteeze.metal_router`).
 
-Replaces MLX's multi-op decode routing chain (Softmax, ArgPartition, Slice, StopGradient,
-GatherAxis, Sum, Divide) with one Metal kernel (`quanteeze_metal_route`), and replaces the compiled
-output combination graph `(output * scores[..., None]).sum(axis=-2) + shared` with a second kernel
-(`quanteeze_metal_weighted`), cutting Python graph-building and MLX Metal command encoding overhead.
+Replaces MLX's multi-op routing chain (Softmax, ArgPartition, Slice, StopGradient, GatherAxis, Sum,
+Divide) with one Metal kernel (`quanteeze_metal_route` for 1-token decode; `quanteeze_metal_route_rows`
+for 2..`ROWS_MOST` verify tokens), and replaces the compiled output combination graph
+`(output * scores[..., None]).sum(axis=-2) + shared` with a second kernel (`quanteeze_metal_weighted` /
+`quanteeze_metal_weighted_rows`), reducing Python graph-building overhead and small-kernel GPU launch gaps.
 
-Both kernels match MLX's arithmetic order bit-for-bit:
-- `quanteeze_metal_route`: MLX's `softmax_single_row` (`precise=True`), stable ascending
-  `(gate, index)` top-k selection matching `argpartition`, and sequential `T` reduction + division
-  for weight renormalization.
-- `quanteeze_metal_weighted`: column-wise float32 product rounded to `T`, pairwise row `j` + `j + 8`
-  column reduction in `T` matching MLX's `sum(axis=-2)`, and residual `shared` addition in `T`.
+Both paths match MLX's per-row arithmetic order bit-for-bit:
+- Routing kernels: MLX's `softmax_single_row` (`precise=True`), stable ascending `(gate, index)`
+  top-k selection matching `argpartition`, and sequential `T` reduction + division for weight
+  renormalization (one threadgroup per token row).
+- Weighted-sum kernels: column-wise float32 product rounded to `T`, pairwise row `j` + `j + 8`
+  column reduction in `T` matching MLX's `sum(axis=-2)`, and residual `shared` addition in `T`
+  (one grid row of threads per token row).
 
-Every tensor shape is verified bit-for-bit against the MLX reference for the first `CHECKS`
-invocations (`kernel_checks`) before serving that shape. `QUANTEEZE_METAL_ROUTER=off` disables both.
+Every shape is verified bit-for-bit against the MLX reference for the first `CHECKS` invocations
+(`kernel_checks`) before serving that shape, with verify-pass shapes keyed separately by row count.
+1-token decode keeps its dedicated single-row kernels. `QUANTEEZE_METAL_ROUTER=off` disables all of them.
 """
 import sys
 from functools import lru_cache
@@ -26,9 +29,10 @@ from . import kernel_checks, per_thread
 CHECKS = 3
 ON = [True]                     # QUANTEEZE_METAL_ROUTER
 STATS = dict(served=0, checked=0, mismatched=0)
-CHOICE, CHECKED = kernel_checks.tables('metal_router')  # (experts, k, dtype): whether it matched MLX ops
+CHOICE, CHECKED = kernel_checks.tables('metal_router')  # (experts, k, dtype) or (rows, experts, k, dtype)
 SAID = []
 MOST = 4096                     # maximum expert count: MLX's softmax_single_row limit (SOFTMAX_LOOPED_LIMIT)
+ROWS_MOST = 8                   # maximum verify token rows per call (`arch.qwen4_exp.VERIFY_ROWS_MOST`)
 
 _SOURCE = r"""
     constexpr int N_READS = 4;
@@ -139,24 +143,86 @@ def _kernel():
     )
 
 
-def takes(logits, k):
-    """Whether `route()` supports `logits`: Metal, single-row bf16/f16 logits, `0 < k <= 16`, `k <= E <= MOST`."""
+def _rows_source(source, replaced, head):
+    """Derive a multi-row Metal kernel source from a single-row source."""
+    for old, new in [*replaced, (head[0], head[0] + head[1].lstrip('\n'))]:
+        if source.count(old) < 1 or (old != head[0] and source.count(old) != 1):
+            raise ValueError(f'metal_router: {old!r} expected once in single-row source')
+        source = source.replace(old, new, 1)
+    return source
+
+
+_ROWS_SOURCE = _rows_source(
+    _SOURCE,
+    [
+        ('const int E = int(logits_shape[0]);', 'const int E = int(logits_shape[1]);'),
+        ('float(logits[c])', 'float(row_logits[c])'),
+        ('ids[K - 1 - j] =', 'row_ids[K - 1 - j] ='),
+        ('gates[K - 1 - j] =', 'row_gates[K - 1 - j] ='),
+    ],
+    (
+        'const int E = int(logits_shape[1]);\n',
+        r"""
+    const int row = int(threadgroup_position_in_grid.y);
+    auto row_logits = logits + size_t(row) * size_t(E);
+    auto row_ids = ids + size_t(row) * K;
+    auto row_gates = gates + size_t(row) * K;
+""",
+    ),
+)
+
+
+@lru_cache(maxsize=None)
+def _rows_kernel():
+    return mx.fast.metal_kernel(
+        name='quanteeze_metal_route_rows',
+        input_names=['logits'],
+        output_names=['ids', 'gates'],
+        source=_ROWS_SOURCE,
+    )
+
+
+def _rows(logits, k):
+    """Return token row count (`1..ROWS_MOST`) supported by `route()`, or `0` when unsupported."""
     if not ON[0] or not mx.metal.is_available() or logits.ndim < 1 or logits.dtype not in (mx.bfloat16, mx.float16):
-        return False
+        return 0
     e = logits.shape[-1]
-    return logits.size == e and 0 < k <= 16 and k <= e <= MOST
+    if not (0 < k <= 16 and k <= e <= MOST):
+        return 0
+    if logits.size == e:
+        return 1
+    if logits.ndim == 3 and logits.shape[0] == 1 and 1 < logits.shape[1] <= ROWS_MOST:
+        return int(logits.shape[1])
+    return 0
+
+
+def takes(logits, k):
+    """Whether `route()` supports `logits`: Metal bf16/f16 1-row or single-batch 2..`ROWS_MOST` verify rows."""
+    return _rows(logits, k) > 0
 
 
 def route(logits, k):
     """Return `(ids uint32 [..., k], scores [..., k])`: top-k softmax gates and renormalized weights."""
-    n = logits.shape[-1]
-    threads = 32 * ((-(-n // 4) + 31) // 32)
+    e = logits.shape[-1]
+    rows = logits.size // e
+    threads = 32 * ((-(-e // 4) + 31) // 32)
     shape = (*logits.shape[:-1], k)
+    if rows == 1:
+        return tuple(
+            _kernel()(
+                inputs=[mx.contiguous(logits).reshape(-1)],
+                template=[('T', logits.dtype), ('K', int(k))],
+                grid=(threads, 1, 1),
+                threadgroup=(threads, 1, 1),
+                output_shapes=[shape, shape],
+                output_dtypes=[mx.uint32, logits.dtype],
+            )
+        )
     return tuple(
-        _kernel()(
-            inputs=[mx.contiguous(logits).reshape(-1)],
+        _rows_kernel()(
+            inputs=[mx.contiguous(logits).reshape(rows, e)],
             template=[('T', logits.dtype), ('K', int(k))],
-            grid=(threads, 1, 1),
+            grid=(threads, rows, 1),
             threadgroup=(threads, 1, 1),
             output_shapes=[shape, shape],
             output_dtypes=[mx.uint32, logits.dtype],
@@ -165,26 +231,31 @@ def route(logits, k):
 
 
 def pending(experts, k, dtype, x):
-    """Return True while decode shape `(experts, k, dtype)` still needs eager bit-for-bit verification."""
+    """Return True while decode or verify shape (`1..ROWS_MOST` rows) still needs eager bit-for-bit verification."""
     if not (
         ON[0]
         and mx.metal.is_available()
         and x.ndim >= 2
-        and x.shape[:2] == (1, 1)
+        and x.shape[0] == 1
+        and 0 < x.shape[1] <= ROWS_MOST
         and dtype in (mx.bfloat16, mx.float16)
         and 0 < k <= 16
         and k <= experts <= MOST
     ):
         return False
-    choice, seen = kernel_checks.read(CHOICE, CHECKED, (int(experts), int(k), str(dtype)))
+    rows = int(x.shape[1])
+    key = (int(experts), int(k), str(dtype))
+    choice, seen = kernel_checks.read(CHOICE, CHECKED, key if rows == 1 else (rows,) + key)
     return choice is None or seen < CHECKS
 
 
 def routed(logits, k, theirs):
     """Compute `(ids, scores)` with `route()` once verified bit-for-bit `CHECKS` times against `theirs()`."""
-    if not takes(logits, k):
+    rows = _rows(logits, k)
+    if not rows:
         return theirs()
     key = (int(logits.shape[-1]), int(k), str(logits.dtype))
+    key = key if rows == 1 else (rows,) + key
     choice, seen = kernel_checks.read(CHOICE, CHECKED, key)
     if choice is not None and seen >= CHECKS:
         if choice:
@@ -243,28 +314,67 @@ def _weighted_kernel():
     )
 
 
-def weighs(output, scores, shared):
-    """Whether `weigh()` supports `[1, 1, k, D]` output, `[1, 1, k]` scores, and `[1, 1, D]` shared tensors."""
-    if not ON[0] or not mx.metal.is_available() or output.ndim != 4 or output.shape[:2] != (1, 1):
-        return False
-    k, d = output.shape[2], output.shape[3]
-    return (
-        output.dtype in (mx.bfloat16, mx.float16)
-        and scores.dtype == output.dtype == shared.dtype
-        and 0 < k <= 16
-        and tuple(scores.shape) == (1, 1, k)
-        and tuple(shared.shape) == (1, 1, d)
+_WEIGHTED_ROWS = _rows_source(
+    _WEIGHTED,
+    [
+        ('float(output[j * D + d]) * float(scores[j])', 'float(row_output[j * D + d]) * float(row_scores[j])'),
+        (
+            'float(output[(j + 8) * D + d]) * float(scores[j + 8])',
+            'float(row_output[(j + 8) * D + d]) * float(row_scores[j + 8])',
+        ),
+        ('out[d] = T(float(total) + float(shared[d]));', 'out[row * D + d] = T(float(total) + float(shared[row * D + d]));'),
+    ],
+    (
+        '    }\n',
+        r"""
+    const size_t row = size_t(thread_position_in_grid.y);
+    auto row_output = output + row * K * D;
+    auto row_scores = scores + row * K;
+""",
+    ),
+)
+
+
+@lru_cache(maxsize=None)
+def _weighted_rows_kernel():
+    return mx.fast.metal_kernel(
+        name='quanteeze_metal_weighted_rows',
+        input_names=['output', 'scores', 'shared'],
+        output_names=['out'],
+        source=_WEIGHTED_ROWS,
     )
 
 
+def _weighs(output, scores, shared):
+    """Return token row count (`1..ROWS_MOST`) supported by `weigh()`, or `0` when unsupported."""
+    if not ON[0] or not mx.metal.is_available() or output.ndim != 4:
+        return 0
+    one, t, k, d = output.shape
+    if (
+        one != 1
+        or not 0 < t <= ROWS_MOST
+        or output.dtype not in (mx.bfloat16, mx.float16)
+        or not scores.dtype == output.dtype == shared.dtype
+        or not 0 < k <= 16
+    ):
+        return 0
+    return t if tuple(scores.shape) == (1, t, k) and tuple(shared.shape) == (1, t, d) else 0
+
+
+def weighs(output, scores, shared):
+    """Whether `weigh()` supports `[1, T, k, D]` output, `[1, T, k]` scores, and `[1, T, D]` shared tensors."""
+    return _weighs(output, scores, shared) > 0
+
+
 def weigh(output, scores, shared):
-    """Return `(output * scores[..., None]).sum(axis=-2) + shared` (`[1, 1, D]`) in one Metal kernel."""
-    k, d = output.shape[2], output.shape[3]
+    """Return `(output * scores[..., None]).sum(axis=-2) + shared` (`[1, T, D]`) in one Metal kernel."""
+    t, k, d = output.shape[1], output.shape[2], output.shape[3]
     threads = min(256, 32 * -(-d // 32))
-    return _weighted_kernel()(
+    kernel = _weighted_kernel() if t == 1 else _weighted_rows_kernel()
+    return kernel(
         inputs=[mx.contiguous(output), mx.contiguous(scores), mx.contiguous(shared)],
         template=[('T', output.dtype), ('K', int(k))],
-        grid=(32 * -(-d // 32), 1, 1),
+        grid=(32 * -(-d // 32), t, 1),
         threadgroup=(threads, 1, 1),
         output_shapes=[shared.shape],
         output_dtypes=[output.dtype],
@@ -285,11 +395,13 @@ class _Weighed:
 
 def weighted(output, scores, shared, theirs):
     """Compute weighted expert sum + `shared` via `weigh()` once verified bit-for-bit against `theirs()`."""
-    if not weighs(output, scores, shared):
+    t = _weighs(output, scores, shared)
+    if not t:
         return theirs()
+    key = (int(output.shape[2]), int(output.shape[3]), str(output.dtype))
     return kernel_checks.served(
         _Weighed,
-        (int(output.shape[2]), int(output.shape[3]), str(output.dtype)),
+        key if t == 1 else (t,) + key,
         lambda: weigh(output, scores, shared),
         theirs,
         'the Metal weighted-sum kernel',
