@@ -6,10 +6,10 @@
   </picture>
 </h1>
 
-[![License: GPL-2.0 OR PolyForm-Shield](https://img.shields.io/badge/License-GPL--2.0_OR_PolyForm--Shield-blue.svg)](#ライセンスlicense)
+[![License: GPL-2.0-only OR PolyForm Shield 1.0.0](https://img.shields.io/badge/License-GPL--2.0--only_OR_PolyForm_Shield_1.0.0-blue.svg)](#ライセンスlicense)
 [![GitHub](https://img.shields.io/badge/GitHub-northriv%2FQuanteeze-181717?logo=github)](https://github.com/northriv/Quanteeze)
-[![Python 3.12+ | C++20](https://img.shields.io/badge/Python_3.12%2B_%7C_C%2B%2B-20-3776AB)]()
-[![Platform: macOS (Metal) | Linux (CUDA)](https://img.shields.io/badge/platform-macOS_(Metal)_%7C_Linux_(CUDA)-lightgrey)]()
+![Python 3.12+ | C++20](https://img.shields.io/badge/Python-3.12%2B_%7C_C%2B%2B20-3776AB)
+![Platform: macOS (Metal) | Linux (CUDA)](https://img.shields.io/badge/platform-macOS_%28Metal%29_%7C_Linux_%28CUDA%29-lightgrey)
 [![kamestm: arXiv 2608.12024](https://img.shields.io/badge/kamestm-arXiv%3A2608.12024-b31b1b.svg)](https://arxiv.org/abs/2608.12024)
 
 **[English](README.md)** | **日本語**
@@ -434,7 +434,7 @@ Apple Silicon MacBook Pro（128 GB Unified Memory / M5 Max / 内蔵 SSD）で、
 ### 各機能の詳細
 
 - **エキスパート量子化（`QUANTEEZE_BITS`）**
-  - ルーティング・エキスパートを GPU 上の閉形式最小二乗フィッティングで **8 / 4 / 3 / 2 / 1 ビット** へ量子化、または **MXFP4**（`mxfp4`）・GGML K-quant / importance-grid（**`q3_k`** / **`q2_k`** / **`iq2_xs`**）へ変換、もしくは元精度のまま配信できます。
+  - ルーティング・エキスパートを GPU 上の交互最小二乗フィッティング（グループごとに 8 回）で **8 / 4 / 3 / 2 / 1 ビット** へ量子化、または **MXFP4**（`mxfp4`）・GGML K-quant / importance-grid（**`q3_k`** / **`q2_k`** / **`iq2_xs`**）へ変換、もしくは元精度のまま配信できます。
   - 下位ビットへの量子化は、モデルがメモリに収まる場合はメモリ上で、収まらない場合は SSD から読み込みながらオンザフライで実行し、`QUANTEEZE_QUANT_CACHE` でディスクに保存して再起動時の変換を省略できます。
 - **配布済み GGUF（`UD-IQ*` 等）からのエキスパート直接配信（`--experts-gguf` / `QUANTEEZE_EXPERTS_GGUF`）**
   - モデル本体・Attention・PLE / Engram・Vision・MTP は元の MLX チェックポイントのまま保持しつつ、ルーティング・エキスパート重みだけを配布済みの GGUF（単一ファイル、分割シャード `*-00001-of-0000N.gguf`、またはフォルダ）から直接読み込みます。
@@ -604,7 +604,7 @@ Quanteeze は以下のいずれかを選択できるデュアルライセンス�
 - **GNU General Public License, version 2 only**（`GPL-2.0-only`） — [LICENSE-GPL-2.0](LICENSE-GPL-2.0) を参照、または
 - **PolyForm Shield License 1.0.0**（`LicenseRef-PolyForm-Shield-1.0.0`） — [LICENSE-POLYFORM-SHIELD](LICENSE-POLYFORM-SHIELD) を参照。
 
-詳細は [LICENSE](LICENSE) をご確認ください。`src/quanteeze/vendor/deepseek_v4/`・`src/quanteeze/vendor/deepseek_v41/`・`src/quanteeze/iq_grids.py`・`bench/llamacpp/` 配下のサードパーティコンポーネントは元の MIT License 表記を保持します。[`src/quanteeze/vendor/kamepoolalloc/`](src/quanteeze/vendor/kamepoolalloc/README.md) 配下の同梱 [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) および [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) ソース（Copyright (C) 2002–2026 Kentaro Kitagawa）は `Apache-2.0 OR GPL-2.0-or-later` のデュアルライセンスです（[`LICENSE-APACHE-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0) および [`LICENSE-GPL-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0) を参照）。なお、[`src/quanteeze/vendor/nemotron_image/`](src/quanteeze/vendor/nemotron_image/NOTICE.md) 配下の任意サードパーティファイル（`l24sq.py`）のみは Quanteeze の `GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0` ではなく、同フォルダの NVIDIA License（[`LICENSE`](src/quanteeze/vendor/nemotron_image/LICENSE)：**研究・評価目的限定・非商用**）のみが適用されます。通常の Quanteeze 推論サーバーからは一切 import されず、上記の任意画像ツールを使用しない場合や、`GPL-2.0-only` 条件・商用目的で Quanteeze を再配布・利用する場合は `src/quanteeze/vendor/nemotron_image/` ディレクトリを除外してください。
+詳細は [LICENSE](LICENSE) をご確認ください。`src/quanteeze/vendor/deepseek_v4/`・`src/quanteeze/vendor/deepseek_v41/`・`src/quanteeze/iq_grids.py`・`bench/llamacpp/` 配下のサードパーティコンポーネントは元の MIT License 表記を保持します。[Apple MLX](https://github.com/ml-explore/mlx)・[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)・[ggml](https://github.com/ggml-org/llama.cpp) から移植・改変した部分も、それぞれの MIT License のもとにあります（対象と許諾文は [LICENSE](LICENSE) に記載）。[`src/quanteeze/vendor/kamepoolalloc/`](src/quanteeze/vendor/kamepoolalloc/README.md) 配下の同梱 [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) および [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) ソース（Copyright (C) 2002–2026 Kentaro Kitagawa）は `Apache-2.0 OR GPL-2.0-or-later` のデュアルライセンスです（[`LICENSE-APACHE-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0) および [`LICENSE-GPL-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0) を参照）。なお、[`src/quanteeze/vendor/nemotron_image/`](src/quanteeze/vendor/nemotron_image/NOTICE.md) 配下の任意サードパーティファイル（`l24sq.py`）のみは Quanteeze の `GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0` ではなく、同フォルダの NVIDIA License（[`LICENSE`](src/quanteeze/vendor/nemotron_image/LICENSE)：**研究・評価目的限定・非商用**）のみが適用されます。通常の Quanteeze 推論サーバーからは一切 import されず、上記の任意画像ツールを使用しない場合や、`GPL-2.0-only` 条件・商用目的で Quanteeze を再配布・利用する場合は `src/quanteeze/vendor/nemotron_image/` ディレクトリを除外してください。
 
 Quanteeze はモデルの重みを配布しません。利用する各モデル固有のライセンス（`--host` で `127.0.0.1` 以外に公開する場合の MaaS / サービス提供条項を含む）については利用者の責任で遵守してください。
 

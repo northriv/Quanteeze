@@ -6,10 +6,10 @@
   </picture>
 </h1>
 
-[![License: GPL-2.0 OR PolyForm-Shield](https://img.shields.io/badge/License-GPL--2.0_OR_PolyForm--Shield-blue.svg)](#license)
+[![License: GPL-2.0-only OR PolyForm Shield 1.0.0](https://img.shields.io/badge/License-GPL--2.0--only_OR_PolyForm_Shield_1.0.0-blue.svg)](#license)
 [![GitHub](https://img.shields.io/badge/GitHub-northriv%2FQuanteeze-181717?logo=github)](https://github.com/northriv/Quanteeze)
-[![Python 3.12+ | C++20](https://img.shields.io/badge/Python_3.12%2B_%7C_C%2B%2B-20-3776AB)]()
-[![Platform: macOS (Metal) | Linux (CUDA)](https://img.shields.io/badge/platform-macOS_(Metal)_%7C_Linux_(CUDA)-lightgrey)]()
+![Python 3.12+ | C++20](https://img.shields.io/badge/Python-3.12%2B_%7C_C%2B%2B20-3776AB)
+![Platform: macOS (Metal) | Linux (CUDA)](https://img.shields.io/badge/platform-macOS_%28Metal%29_%7C_Linux_%28CUDA%29-lightgrey)
 [![kamestm: arXiv 2608.12024](https://img.shields.io/badge/kamestm-arXiv%3A2608.12024-b31b1b.svg)](https://arxiv.org/abs/2608.12024)
 
 **English** | **[日本語](README.ja.md)**
@@ -392,8 +392,8 @@ Measured on the same **Apple M5 Max (128 GB Unified Memory / internal NVMe SSD)*
 | Model | Placement on 128 GB Mac | Load Time | Decode Speed (`temperature=0`) | Kernel Checks |
 |---|---|---|---|---|
 | `Qwen3.8-Flash-Next-4bit-mtp-plemmap` (`dflash2` / `MTP=off`, `KV=8bit`) | In-memory (**75.5 GB** experts) | 11.5–15.5 s | **70.2–70.8 tok/s** (`MTP=off` mean **70.45**) / up to **110.0 tok/s** (`dflash2` mean **84.05**, warm 43k–47k: **54.3–68.2 tok/s**) | **0 mismatches** |
-| `DeepSeek-V4.1-Flash-1017` + `--experts-gguf UD-IQ1_M` (`DSpark`) | On-demand SSD (**71.6 / 132.2 GB**, `208/384` layers) | 31.1 s | **10.9–15.4 tok/s** sustained (mean **13.15**, `88.57%` accept, `92.67%` SSD hit; **16.5 / max 22.2 tok/s** in 2026-11-15 run) | **0 mismatches** |
-| `GLM-5.3-Flash-MLX-4bit-MTP` (`glm5_next`) | On-demand SSD (**75.5 / 171.2 GB**, `127/288` layers) | 52.4–60.2 s | **6.7–7.1 tok/s** (`MTP=off`, mean **6.90**, `82.31%` hit); **6.3–6.7 tok/s** (`MTP=auto`, `68.05%` accept / `1.681 tok/round`) | **0 mismatches** (`expert_qmv`, `glm_hyper`, `glm_linear_attn`, `sigmoid_router`, `verify`) |
+| `DeepSeek-V4.1-Flash-1017` + `--experts-gguf UD-IQ1_M` (`DSpark`) | On-demand SSD (**71.6 / 132.2 GB**, `208/384` experts/layer) | 31.1 s | **10.9–15.4 tok/s** sustained (mean **13.15**, `88.57%` accept, `92.67%` SSD hit; **16.5 / max 22.2 tok/s** in 2026-11-15 run) | **0 mismatches** |
+| `GLM-5.3-Flash-MLX-4bit-MTP` (`glm5_next`) | On-demand SSD (**75.5 / 171.2 GB**, `127/288` experts/layer) | 52.4–60.2 s | **6.7–7.1 tok/s** (`MTP=off`, mean **6.90**, `82.31%` hit); **6.3–6.7 tok/s** (`MTP=auto`, `68.05%` accept / `1.681 tok/round`) | **0 mismatches** (`expert_qmv`, `glm_hyper`, `glm_linear_attn`, `sigmoid_router`, `verify`) |
 
 > When `GLM-5.3-Flash`'s 171.2 GB 4-bit experts stream at 44.1% residency on a 128 GB Mac, `QUANTEEZE_MTP=off` leaves slightly more room and avoids extra SSD misses (`82.31%` vs `78.71%` hit rate), outperforming `QUANTEEZE_MTP=auto` (`6.90` vs `6.50 tok/s`).
 
@@ -432,7 +432,7 @@ Measured on a Linux machine with an **RTX 5060 Ti (16 GB VRAM)**, **62 GB host R
 ### Feature Details
 
 - **Expert Quantization (`QUANTEEZE_BITS`)**
-  - Quantize all routed MoE experts to **8 / 4 / 3 / 2 / 1 bit** via closed-form GPU least-squares fitting, convert to **MXFP4** (`mxfp4`) or GGML K-quant / importance-grid (**`q3_k`** / **`q2_k`** / **`iq2_xs`**), or keep original precision.
+  - Quantize all routed MoE experts to **8 / 4 / 3 / 2 / 1 bit** via alternating least-squares fitting on the GPU (8 rounds per group), convert to **MXFP4** (`mxfp4`) or GGML K-quant / importance-grid (**`q3_k`** / **`q2_k`** / **`iq2_xs`**), or keep original precision.
   - Lowering runs in memory when the lowered model fits, or on the fly as experts stream from SSD when it does not, and can be persisted via `QUANTEEZE_QUANT_CACHE` to skip conversion on subsequent startups.
 - **Direct Expert Serving from Pre-Distributed GGUF (`--experts-gguf` / `QUANTEEZE_EXPERTS_GGUF`)**
   - Keep the model trunk, Attention, PLE / Engram, Vision, and MTP in the MLX checkpoint while reading routed expert weights directly from a pre-distributed GGUF (single `.gguf`, split `*-00001-of-0000N.gguf` shards, or shard directory).
@@ -601,7 +601,7 @@ Quanteeze is dual-licensed under your choice of either:
 - **GNU General Public License, version 2 only** (`GPL-2.0-only`) — see [LICENSE-GPL-2.0](LICENSE-GPL-2.0), OR
 - **PolyForm Shield License 1.0.0** (`LicenseRef-PolyForm-Shield-1.0.0`) — see [LICENSE-POLYFORM-SHIELD](LICENSE-POLYFORM-SHIELD).
 
-See [LICENSE](LICENSE) for full details. Third-party components under `src/quanteeze/vendor/deepseek_v4/`, `src/quanteeze/vendor/deepseek_v41/`, `src/quanteeze/iq_grids.py`, and `bench/llamacpp/` retain their original MIT License notices. Bundled [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) and [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) sources under [`src/quanteeze/vendor/kamepoolalloc/`](src/quanteeze/vendor/kamepoolalloc/README.md) (Copyright (C) 2002–2026 Kentaro Kitagawa) are dual-licensed under `Apache-2.0 OR GPL-2.0-or-later` (see [`LICENSE-APACHE-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0) and [`LICENSE-GPL-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0)). Optional third-party decoder files under [`src/quanteeze/vendor/nemotron_image/`](src/quanteeze/vendor/nemotron_image/NOTICE.md) (`l24sq.py`) are governed solely by the NVIDIA License ([`LICENSE`](src/quanteeze/vendor/nemotron_image/LICENSE): **research or evaluation purposes only, non-commercial**) and not by Quanteeze's `GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0` terms; they are never imported by the core inference server unless the optional `Nemotron-Labs-Image` tool is invoked, and must be omitted if redistributing or using Quanteeze under pure `GPL-2.0-only` or for commercial purposes.
+See [LICENSE](LICENSE) for full details. Third-party components under `src/quanteeze/vendor/deepseek_v4/`, `src/quanteeze/vendor/deepseek_v41/`, `src/quanteeze/iq_grids.py`, and `bench/llamacpp/` retain their original MIT License notices. Portions adapted from [Apple MLX](https://github.com/ml-explore/mlx), [mlx-vlm](https://github.com/Blaizzy/mlx-vlm), and [ggml](https://github.com/ggml-org/llama.cpp) remain under their MIT Licenses (listed with their notices in [LICENSE](LICENSE)). Bundled [`kamestm`](https://github.com/northriv/KAME/tree/master/kamestm) and [`kamepoolalloc`](https://github.com/northriv/kamepoolalloc) sources under [`src/quanteeze/vendor/kamepoolalloc/`](src/quanteeze/vendor/kamepoolalloc/README.md) (Copyright (C) 2002–2026 Kentaro Kitagawa) are dual-licensed under `Apache-2.0 OR GPL-2.0-or-later` (see [`LICENSE-APACHE-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0) and [`LICENSE-GPL-2.0`](src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0)). Optional third-party decoder files under [`src/quanteeze/vendor/nemotron_image/`](src/quanteeze/vendor/nemotron_image/NOTICE.md) (`l24sq.py`) are governed solely by the NVIDIA License ([`LICENSE`](src/quanteeze/vendor/nemotron_image/LICENSE): **research or evaluation purposes only, non-commercial**) and not by Quanteeze's `GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0` terms; they are never imported by the core inference server unless the optional `Nemotron-Labs-Image` tool is invoked, and must be omitted if redistributing or using Quanteeze under pure `GPL-2.0-only` or for commercial purposes.
 
 Quanteeze distributes no model weights; users are responsible for complying with each model's own license (including any MaaS / service-offering terms when binding beyond `127.0.0.1` via `--host`).
 

@@ -9,6 +9,8 @@
   with 7 explicit signs + 8th by even parity, 4-bit scale per 16 values `d * (0.5 + l) * 0.25`.
 
 All packed outputs match `quanteeze.iq_experts.decode` bit-for-bit in float32."""
+# ggml's block formats and reference quantization and dequantization are followed below
+# (Copyright (c) 2023-2026 The ggml authors, MIT License — see LICENSE).
 import mlx.core as mx
 import numpy as np
 

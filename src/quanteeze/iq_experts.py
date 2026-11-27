@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0
 """Standard ggml K-quant and IQ codebook tables and block decoders (`dequantize_row_*` in MLX array
 ops, exact in float32).  Codebooks come from `quanteeze.iq_grids`."""
+# ggml's block formats and reference dequantization are followed below
+# (Copyright (c) 2023-2026 The ggml authors, MIT License — see LICENSE).
 import mlx.core as mx
 import numpy as np
 

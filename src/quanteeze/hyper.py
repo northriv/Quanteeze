@@ -13,6 +13,8 @@ None is taken on trust: the first CHECKS times a shape is met, the kernel's outp
 bit for bit with the original's, and it serves the shape only if they are the same.  Only a step of
 one token (a decode); QUANTEEZE_HC_KERNELS=off keeps the forward's own path.
 """
+# Portions of the Metal kernel ports below are adapted from Apple MLX
+# (Copyright © 2023-2026 Apple Inc., MIT License — see LICENSE).
 import sys
 import weakref
 from functools import lru_cache

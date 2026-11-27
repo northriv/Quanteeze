@@ -7,6 +7,8 @@ serves the shape only if they are the same (where MLX goes another way, as gathe
 experts or another GPU's kernel, they would not be).  QUANTEEZE_CUDA_EXPERTS=off keeps mlx-vlm's.
 A warp's rows are qz_expert_rows in HEADER, which quanteeze.cuda_moe's last kernel computes too.
 """
+# Portions of the CUDA kernel arithmetic below are adapted from Apple MLX
+# (Copyright © 2023-2026 Apple Inc., MIT License — see LICENSE).
 import sys
 from functools import lru_cache
 

@@ -9,6 +9,11 @@ license-files = [
     "LICENSE-GPL-2.0",
     "LICENSE-POLYFORM-SHIELD",
     "docs/images/Montserrat-OFL.txt",
+    "bench/llamacpp/LICENSE",
+    "src/quanteeze/vendor/deepseek_v4/LICENSE",
+    "src/quanteeze/vendor/deepseek_v41/LICENSE",
+    "src/quanteeze/vendor/kamepoolalloc/LICENSE-APACHE-2.0",
+    "src/quanteeze/vendor/kamepoolalloc/LICENSE-GPL-2.0",
 ]
 authors = [{ name = "Kentaro Kitagawa" }]
 requires-python = ">=3.12"

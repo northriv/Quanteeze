@@ -12,6 +12,8 @@ expert-sorted rows (`simdgroup_matrix` on Metal, 128-thread register-tiled FP32 
 Every shape & ggml type is checked against `unpacked()` for the first `CHECKS` calls
 (`TOLERANCE = 1e-2`) before serving directly.
 """
+# ggml's block formats and reference dequantization are followed below
+# (Copyright (c) 2023-2026 The ggml authors, MIT License — see LICENSE).
 import sys
 from functools import lru_cache
 

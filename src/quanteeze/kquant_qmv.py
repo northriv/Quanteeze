@@ -8,6 +8,8 @@ Prefill (`takes_rows` / `gather_rows`): tiled 32x32 threadgroup `simdgroup_matri
 expert-sorted rows.
 Each shape is verified against `unpacked()` for the first `CHECKS` calls (`TOLERANCE = 1e-2`) before
 the fused kernel serves it."""
+# ggml's block formats and reference dequantization are followed below
+# (Copyright (c) 2023-2026 The ggml authors, MIT License — see LICENSE).
 import sys
 from functools import lru_cache
 
