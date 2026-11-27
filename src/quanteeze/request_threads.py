@@ -59,6 +59,7 @@ EVALUATE_AT_MOST = 8e9
 
 
 _LOADED = dict(threads=None, any=False)
+_LOOP_THREAD = [None]
 
 
 def _count(key, n=1):
@@ -72,12 +73,11 @@ def running():
         return len(_RUNNING)
 
 
-def _load_settings():
-    """Snapshot QUANTEEZE_REQUEST_THREADS and _ANY from the load snapshot into `_LOADED`."""
-    snap = variables.at_load()
+def _load_settings(environ=None):
+    """Snapshot QUANTEEZE_REQUEST_THREADS and _ANY into `_LOADED` (live env when `environ is None`)."""
     _LOADED.update(
-        threads=max(1, variables.integer('QUANTEEZE_REQUEST_THREADS', snap)),
-        any=(variables.get('QUANTEEZE_REQUEST_THREADS_ANY', snap) or 'off').strip().lower() == 'on',
+        threads=max(1, variables.integer('QUANTEEZE_REQUEST_THREADS', environ)),
+        any=(variables.get('QUANTEEZE_REQUEST_THREADS_ANY', environ) or 'off').strip().lower() == 'on',
     )
     return _LOADED['threads']
 
@@ -102,12 +102,13 @@ def request_lanes():
 
 @per_load.on_let_go
 def reset():
-    """Reset per-load request-thread counters and loaded settings snapshot when unloading."""
+    """Reset per-load request-thread counters (and `_LOADED` when not inside the active loop's own load)."""
     with _RUNNING_LOCK:
         for k in STATS:
             STATS[k] = 0
     _SAID_ALONE[0] = False
-    _LOADED.update(threads=None, any=False)
+    if threading.current_thread() is not _LOOP_THREAD[0]:
+        _LOADED.update(threads=None, any=False)
 
 
 def _turns():
@@ -1007,9 +1008,16 @@ def install(generator_cls):
 
     def _run_impl(self):
         n = _load_settings()
-        if n <= 1:
-            return original(self)
-        return _dispatch(self, n)
+        me = threading.current_thread()
+        _LOOP_THREAD[0] = me
+        try:
+            if n <= 1:
+                return original(self)
+            return _dispatch(self, n)
+        finally:
+            if _LOOP_THREAD[0] is me:
+                _LOOP_THREAD[0] = None
+                _LOADED.update(threads=None, any=False)
 
     generator_cls._run_impl = _run_impl
     generator_cls._quanteeze_request_threads = True

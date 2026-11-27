@@ -479,3 +479,102 @@ def test_the_home_page_gets_requests_at_once(monkeypatch):
     monkeypatch.setattr(control, '_LOADED', [object()])
     monkeypatch.setattr(request_threads, 'state', lambda: {'set': 3, 'loaded': 1, 'why_alone': None})
     assert home.live()['request_threads']['loaded'] == 1
+
+
+def test_run_impl_reads_fresh_setting_and_keeps_loaded_across_let_go(monkeypatch):
+    """`_run_impl` reads live `QUANTEEZE_REQUEST_THREADS` rather than a stale `at_load()` snapshot, and
+    `serve._let_go()` inside the loop's own load preserves `request_threads._LOADED` until exit."""
+    from quanteeze import control, mtp, serve, variables
+
+    monkeypatch.setattr(variables, '_AT_LOAD', [None])
+    monkeypatch.setattr(control, '_LOADED', [None])
+    monkeypatch.setattr(request_threads, '_LOADED', dict(threads=None, any=False))
+    monkeypatch.setattr(request_threads, '_LOOP_THREAD', [None])
+    monkeypatch.setattr(request_threads, 'WHOLE', [True])
+    monkeypatch.setattr(request_threads, 'why_alone', lambda: None)
+    monkeypatch.setattr(mtp, 'ACTIVE', [None])
+
+    seen = {'original': 0, 'states': []}
+    dispatched = []
+
+    class FakeGen:
+        def __init__(self, on_ready):
+            self.on_ready = on_ready
+
+        def _initialize_model(self):
+            serve._let_go()
+            control.loaded()
+
+        def _run_impl(self):
+            seen['original'] += 1
+            self._initialize_model()
+            self.on_ready()
+
+    request_threads.install(FakeGen)
+    monkeypatch.setattr(
+        request_threads,
+        '_dispatch',
+        lambda self, n: (dispatched.append(n), self._initialize_model(), self.on_ready()),
+    )
+
+    # Case 1: previous load had 1, user changed to 3 and reloaded while at_load() was still 1.
+    variables.take_load_snapshot({'QUANTEEZE_REQUEST_THREADS': '1'})
+    control._LOADED[0] = {'QUANTEEZE_REQUEST_THREADS': '1'}
+    monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS', '3')
+
+    def on_ready_1():
+        assert request_threads._LOADED['threads'] == 3
+        assert variables.at_load()['QUANTEEZE_REQUEST_THREADS'] == '3'
+        monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS', '1')
+        seen['states'].append(request_threads.state())
+
+    FakeGen(on_ready_1)._run_impl()
+    assert dispatched == [3] and seen['original'] == 0
+    assert seen['states'][0]['set'] == 1 and seen['states'][0]['loaded'] == 3
+    assert request_threads._LOADED['threads'] is None and request_threads._LOOP_THREAD[0] is None
+
+    # Case 2: previous load had 3, user changed to 1 while at_load() still held 3.
+    variables.take_load_snapshot({'QUANTEEZE_REQUEST_THREADS': '3'})
+    control._LOADED[0] = {'QUANTEEZE_REQUEST_THREADS': '3'}
+    monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS', '1')
+
+    def on_ready_2():
+        assert request_threads._LOADED['threads'] == 1
+        monkeypatch.setenv('QUANTEEZE_REQUEST_THREADS', '4')
+        seen['states'].append(request_threads.state())
+
+    FakeGen(on_ready_2)._run_impl()
+    assert seen['original'] == 1 and dispatched == [3]
+    assert seen['states'][1]['set'] == 4 and seen['states'][1]['loaded'] == 1
+    assert request_threads._LOADED['threads'] is None and request_threads._LOOP_THREAD[0] is None
+
+
+def test_load_from_page_clears_stale_snapshot_before_reload(monkeypatch):
+    """`serve._load_from_page` unloads prior model state and clears stale load snapshots before reloading."""
+    import importlib
+    from quanteeze import control, serve, variables
+
+    monkeypatch.setattr(variables, '_AT_LOAD', [None])
+    monkeypatch.setattr(control, '_LOADED', [None])
+    control.loaded()
+    assert variables.at_load() is not None and control._LOADED[0] is not None
+
+    events = []
+    fake_vlm = SimpleNamespace(
+        _unload_model_cache_group=lambda group: events.append(('unload', group)),
+        get_cached_model=lambda path, model_kind=None: events.append(
+            ('get_cached_model', path, model_kind, variables.at_load(), control._LOADED[0])
+        ),
+    )
+    orig_import = importlib.import_module
+    monkeypatch.setattr(
+        importlib,
+        'import_module',
+        lambda name, *a, **kw: fake_vlm if name == 'mlx_vlm.server.app' else orig_import(name, *a, **kw),
+    )
+
+    serve._load_from_page('/tmp/model')
+    assert events == [
+        ('unload', 'text_generation'),
+        ('get_cached_model', '/tmp/model', 'text_generation', None, None),
+    ]

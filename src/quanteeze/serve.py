@@ -1075,6 +1075,9 @@ def _load_from_page(path):
         unload('text_generation')
     else:
         vlm.unload_model_sync()
+    mtp.disable()
+    _let_go()
+    control.unloaded()
     vlm.get_cached_model(path, model_kind='text_generation')
 
 

@@ -988,7 +988,9 @@ function renderConnect(c) {
 
 // ---------------------------------------------------------------- requests at once (QUANTEEZE_REQUEST_THREADS)
 function renderRequestThreads() {
-  if (PRESETS && document.activeElement !== $('request-threads')) $('request-threads').value = PRESETS.request_threads || '';
+  if (PRESETS && PRESETS.request_threads != null && document.activeElement !== $('request-threads')) {
+    $('request-threads').value = PRESETS.request_threads;
+  }
 }
 function showRequestThreads(R) {              // home.live's request_threads: as the load read them, and why apart
   const box = $('request-threads-now');
@@ -1014,8 +1016,13 @@ $('save-request-threads').addEventListener('click', async () => {
     msg.textContent = bad.length ? bad.map(([, why]) => why).join('; ')
       : served ? 'Saved. It takes effect when the model is next loaded.' : 'Saved. It takes effect when a model is loaded.';
     $('request-threads-reload').hidden = !!bad.length || !served;
-    PRESETS = await call('GET', '/v1/quanteeze/home/presets');
+    const [pre, live] = await Promise.all([
+      call('GET', '/v1/quanteeze/home/presets'),
+      call('GET', '/v1/quanteeze/home/live'),
+    ]);
+    PRESETS = pre; LIVE = live;
     renderRequestThreads();
+    showRequestThreads(LIVE && LIVE.request_threads);
   } catch (e) { msg.className = 'note err grow'; msg.textContent = e.message; }
 });
 $('request-threads-reload').addEventListener('click', async () => {
@@ -1051,8 +1058,13 @@ async function pollOnce() {
         $('start-msg').className = 'note err';
         $('start-msg').textContent = mod.error || 'Model load failed.';
       }
-      const [cat, conn] = await Promise.all([call('GET', '/v1/quanteeze/home/catalog'), call('GET', '/v1/quanteeze/home/connect')]);
-      CATALOG = cat;
+      const [cat, pre, conn] = await Promise.all([
+        call('GET', '/v1/quanteeze/home/catalog'),
+        call('GET', '/v1/quanteeze/home/presets'),
+        call('GET', '/v1/quanteeze/home/connect'),
+      ]);
+      CATALOG = cat; PRESETS = pre;
+      $('request-threads-msg').textContent = '';
       renderCatalog(); renderPresets(); renderConnect(conn);
     }
     wasBusy = busyNow;
