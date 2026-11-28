@@ -348,12 +348,16 @@ def install_prepost():
 
 ROUTE_ON = [True]               # QUANTEEZE_CUDA_ROUTER
 ROUTE = [False]
+ROUTE_ROWS_BIAS = [False]       # route() with a correction bias a row (a pass with an image mask: bias_vl where the
+                                # mask is set), matched at install on random masks.  The model makes the mask from the
+                                # ids of every pass unless its vision is let go (no_vision), so a route() that took
+                                # only the gate's own bias [E] served no pass under QUANTEEZE_V41_READS_IMAGES=on
 ROUTE_SOURCE = r"""
   constexpr float INF = cuda::std::numeric_limits<float>::infinity();
   const int row = blockIdx.x, e = threadIdx.x, lane = e % 32, w = e / 32;
   const float score = Sqrt{}(LogAddExp{}(static_cast<float>(logits[row * E + e]), 0.0f));
   scores[row * E + e] = score;
-  float key = -Add{}(score, static_cast<float>(bias[e]));
+  float key = -Add{}(score, static_cast<float>(bias[(bias_ndim > 1 ? row * E : 0) + e]));
   __shared__ float best_key[32];
   __shared__ int best_idx[32];
   __shared__ int chosen[K];
@@ -397,7 +401,17 @@ def takes_route(logits, k):
     return logits.dtype == mx.float32 and E % 32 == 0 and 32 <= E <= 1024 and 1 < k <= 8 and logits.size > 0
 
 
+def takes_bias(logits, bias):
+    """Whether route() takes this correction bias: the gate's own [E]; or a row's each in the logits' shape (a pass
+    with an image mask), once that matched at install (ROUTE_ROWS_BIAS)."""
+    if bias.ndim == 1:
+        return bias.size == logits.shape[-1]
+    return bool(ROUTE_ROWS_BIAS[0]) and tuple(bias.shape) == tuple(logits.shape)
+
+
 def route(logits, bias, scale, k):
+    """(inds, weights, scores) of RowGate from its logits.  bias [E], or a row's each in the logits' shape (more than
+    one dimension: the kernel reads it by row)."""
     if not _ROUTE:
         _ROUTE.append(
             cuda_kernels.kernel('quanteeze_v41_route', ['logits', 'bias', 'scale'], ['inds', 'weights', 'scores'], ROUTE_SOURCE)
@@ -418,7 +432,7 @@ def route(logits, bias, scale, k):
 
 
 def install_route(gates, rows=(1, 7, 33), seed=0):
-    ROUTE[0] = False
+    ROUTE[0] = ROUTE_ROWS_BIAS[0] = False
     if not (ROUTE_ON[0] and _gpu()) or not gates:
         return False
     rng = np.random.default_rng(seed)
@@ -435,14 +449,37 @@ def install_route(gates, rows=(1, 7, 33), seed=0):
         if not ok:
             break
     ROUTE[0] = ok
+    ROUTE_ROWS_BIAS[0] = ok and _route_masked_matches(gates, rows, rng)
     print(
         'quanteeze: DeepSeek V4.1 router CUDA kernel: '
         + ('bit-exact match across all gates' if ok else 'mismatch; keeping MLX ops')
+        + ((', with an image mask\'s bias a row too' if ROUTE_ROWS_BIAS[0] else ', not with an image mask')
+           if ok else '')
         + ' (QUANTEEZE_CUDA_ROUTER)',
         file=sys.stderr,
         flush=True,
     )
     return ok
+
+
+def _route_masked_matches(gates, rows, rng):
+    """Whether route() with a correction bias a row (bias_vl where a random image mask is set: half the tokens, none
+    and all) gives each gate's by_ops with that bias -- the picks, the weights, the scores."""
+    for gate in gates:
+        if getattr(gate, 'bias_vl', None) is None:
+            return False
+        for n, share in zip(rows, (0.5, 0.0, 1.0)):
+            x = mx.array(rng.normal(0, 1, (1, n, gate.weight.shape[-1])).astype(np.float32)).astype(mx.bfloat16)
+            logits = gate.logits(x)
+            mask = mx.array(rng.random((1, n)) < share)
+            bias = mx.where(mask[..., None], gate.bias_vl, gate.bias)
+            if tuple(bias.shape) != tuple(logits.shape):
+                return False
+            want = gate.by_ops(logits, bias)
+            got = route(logits, bias, gate.routed_scaling_factor, gate.top_k)
+            if not kernel_checks.same_bits(got, want):
+                return False
+    return True
 
 
 ATTN_ON = [True]                # QUANTEEZE_CUDA_ATTN

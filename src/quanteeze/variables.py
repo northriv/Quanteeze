@@ -372,7 +372,8 @@ _TABLE = [
     ('QUANTEEZE_EVAL_LAYERS', 'auto', 'speed', 'start',
      'Flash-Next\'s decode token handed to the GPU this many layers at a time, not one by one (mlx-vlm\'s): '
      'auto uses 4 on Apple Silicon (Metal) and 12 on CUDA to preserve CUDA graph batching (positive int overrides; '
-     '1: mlx-vlm\'s)'),
+     '1: mlx-vlm\'s).  DeepSeek V4.1 on Metal too: a pass of up to 8 tokens (a decode, an MTP verify pass) handed '
+     'to the GPU this many layers at a time as it is built, not whole at its end; auto 1 there'),
     ('QUANTEEZE_VERIFY_LEAD_LAYERS', 'auto', 'speed', 'start',
      'layers the host may build ahead of the GPU in a Flash-Next MTP verify pass: before building a layer, wait '
      'for the input to the layer this many steps behind so freed buffers do not pile up in the driver pool and '

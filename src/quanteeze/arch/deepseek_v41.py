@@ -525,6 +525,11 @@ def fp8_projections(model, path):
 
 
 ROWS = 8                        # a pass of at most this many tokens multiplies its float32 rows one at a time
+PLAIN_EVAL_DEFAULT = 1          # QUANTEEZE_EVAL_LAYERS auto for V4.1 on Metal: hand each layer on as it is built
+PLAIN_EVAL = [0]                # quanteeze.serve: a pass of up to ROWS tokens (a decode, an MTP verify pass) handed to
+                                # the GPU this many layers at a time as it is built, on Metal (0: the whole pass at its
+                                # end, mlx-vlm's).  Its token's SSD embedding and Engram rows wait for the last token,
+                                # so the GPU otherwise stands idle while the host builds the whole pass
 
 
 def by_rows(x, w):
@@ -597,8 +602,8 @@ class RowGate(DeepseekV41MoEGate):
         from .. import cuda_v41
         if bias is None:
             bias = self.bias
-        if (self.norm_topk_prob and self.top_k > 1 and bias.ndim == 1
-                and cuda_v41.ROUTE[0] and cuda_v41.takes_route(logits, self.top_k)):
+        if (self.norm_topk_prob and self.top_k > 1 and cuda_v41.ROUTE[0] and cuda_v41.takes_bias(logits, bias)
+                and cuda_v41.takes_route(logits, self.top_k)):
             inds, weights, _ = cuda_v41.route(logits, bias, self.routed_scaling_factor, self.top_k)
             return inds, weights
         inds, weights, _ = self.by_ops(logits, bias)
@@ -1193,6 +1198,8 @@ class SpecLanguageModel(LanguageModel):
         host_engram_ids = host_hashes
         if one_decode and host_engram_ids is not None:
             _engram_ahead(self, engram_hashes, -1, host_engram_ids)
+        plain = PLAIN_EVAL[0] if seqlen <= ROWS and mx.metal.is_available() else 0
+        last = len(self.layers) - 1
         try:
             for i, layer in enumerate(self.layers):
                 if layer.engram is not None and (engram_hashes is not None or host_engram_ids is not None):
@@ -1209,6 +1216,8 @@ class SpecLanguageModel(LanguageModel):
                     tail = h if speculative_verify else h[:, -CONTEXT:]
                     captured.append(tail.astype(mx.float32).mean(axis=2).astype(h.dtype))
                 h, pre_mix = layer(h, pre_mix, image_mask, entry)
+                if plain and (i + 1) % plain == 0 and i < last:
+                    mx.async_eval(h, pre_mix)                 # the GPU on what is built (PLAIN_EVAL)
         finally:
             VERIFYING[0] = per_thread.PASS.verify = False
             for row, _ in state or ():

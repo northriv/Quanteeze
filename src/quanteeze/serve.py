@@ -1801,6 +1801,9 @@ def main():
     qwen4_exp.EVAL_LAYERS[0] = (
         0 if ev == 'auto' else max(1, variables.integer('QUANTEEZE_EVAL_LAYERS', variables.at_start()))
     )
+    from .arch import deepseek_v41 as _v41
+    _v41.PLAIN_EVAL[0] = (_v41.PLAIN_EVAL_DEFAULT if ev == 'auto'
+                          else max(1, variables.integer('QUANTEEZE_EVAL_LAYERS', variables.at_start())))
     lead = (variables.get('QUANTEEZE_VERIFY_LEAD_LAYERS', variables.at_start()) or 'auto').strip().lower()
     qwen4_exp.VERIFY_LEAD[0] = (-1 if lead == 'auto' else 0 if lead == 'off'
                                 else max(0, variables.integer('QUANTEEZE_VERIFY_LEAD_LAYERS', variables.at_start())))

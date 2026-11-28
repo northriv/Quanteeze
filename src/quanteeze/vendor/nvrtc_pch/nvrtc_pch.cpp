@@ -8,7 +8,10 @@
 //   whose compile follows on the same thread; MLX's own PTX kernels (which are cached on disk and can
 //   require >268 MB PCH heaps) compile unmodified.
 // - PCH files go to a per-process directory set once via qz_nvrtc_pch_dir (never cwd), skipped in forked
-//   children, skipped if NVRTC < 12.8 lacks nvrtcGetPCHCreateStatus, and capped at MOST_MADE files.
+//   children, skipped if NVRTC < 12.8 lacks nvrtcGetPCHCreateStatus, and capped at MOST_MADE files and MOST_BYTES:
+//   a PCH file is at most the heap it was made in, so each made is counted at the heap then (nvrtcGetPCHHeapSize),
+//   and --pch is added only while they stay within MOST_BYTES -- the heap may grow to HEAP_MOST (a PCH that did not
+//   fit), and MOST_MADE files of HEAP_MOST each would be 8 GiB on disk.
 #include <dlfcn.h>
 #include <link.h>
 #include <unistd.h>
@@ -30,11 +33,14 @@ using Create = Result (*)(Program *, const char *, const char *, int, const char
 using Status = Result (*)(Program);                  // nvrtcGetPCHCreateStatus
 using Needed = Result (*)(Program, size_t *);        // nvrtcGetPCHHeapSizeRequired
 using Resize = Result (*)(size_t);                   // nvrtcSetPCHHeapSize
+using Heap = Result (*)(size_t *);                   // nvrtcGetPCHHeapSize
 constexpr Result INTERNAL_ERROR = 11;                // NVRTC_ERROR_INTERNAL_ERROR
 constexpr Result HEAP_EXHAUSTED = 14;                // NVRTC_ERROR_PCH_CREATE_HEAP_EXHAUSTED
 constexpr size_t HEAP_MOST = size_t(1) << 30;        // the PCH heap is never grown past this
 constexpr char CUSTOM[] = "custom_kernel_";
 constexpr uint64_t MOST_MADE = 8;
+constexpr uint64_t HEAP_KNOWN = 268435456;           // NVRTC's PCH heap where it cannot be read (nvrtcGetPCHHeapSize)
+constexpr uint64_t MOST_BYTES = MOST_MADE * HEAP_KNOWN;   // the PCH files' bytes at most, each counted by its heap
 constexpr size_t PATH_MOST = 4096;                   // a loaded library's path, with its end
 
 atomic<Compile> real_compile{nullptr};
@@ -42,7 +48,8 @@ atomic<Create> real_create{nullptr};
 atomic<Status> real_status{nullptr};
 atomic<Needed> real_needed{nullptr};
 atomic<Resize> real_resize{nullptr};
-atomic<uint64_t> grown{0};
+atomic<Heap> real_heap{nullptr};
+atomic<uint64_t> grown{0}, made_bytes{0};
 atomic<uint64_t> compiles{0}, added{0}, made{0};
 
 struct Place {
@@ -105,6 +112,13 @@ bool asks_pch(int n, const char *const *options) noexcept {
     return false;
 }
 
+// NVRTC's PCH heap now, in bytes (HEAP_KNOWN where it cannot be read).
+uint64_t heap_now() noexcept {
+    Heap get = own(real_heap, "nvrtcGetPCHHeapSize");
+    size_t bytes = 0;
+    return get && get(&bytes) == 0 && bytes > 0 ? uint64_t(bytes) : HEAP_KNOWN;
+}
+
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) Result nvrtcCreateProgram(Program *program, const char *src,
@@ -133,7 +147,9 @@ extern "C" __attribute__((visibility("default"))) Result nvrtcCompileProgram(Pro
         return f(program, n, options);
     const local_shared_ptr<const Place> at(place);
     Status status = own(real_status, "nvrtcGetPCHCreateStatus");
-    if(!at || at->pid != getpid() || !status || made.load(std::memory_order_relaxed) >= MOST_MADE)
+    const uint64_t heap = heap_now();
+    if(!at || at->pid != getpid() || !status || made.load(std::memory_order_relaxed) >= MOST_MADE ||
+       made_bytes.load(std::memory_order_relaxed) + heap > MOST_BYTES)
         return f(program, n, options);
     std::vector<const char *> with;
     try {
@@ -148,9 +164,10 @@ extern "C" __attribute__((visibility("default"))) Result nvrtcCompileProgram(Pro
     added.fetch_add(1, std::memory_order_relaxed);
     const Result r = f(program, static_cast<int>(with.size()), with.data());
     const Result created = status(program);
-    if(created == 0)
+    if(created == 0) {                               // this compile made a PCH file: counted at the heap it was made in
         made.fetch_add(1, std::memory_order_relaxed);
-    else if(created == HEAP_EXHAUSTED) {             // the heap NVRTC set aside was too small for this program's
+        made_bytes.fetch_add(heap, std::memory_order_relaxed);
+    } else if(created == HEAP_EXHAUSTED) {             // the heap NVRTC set aside was too small for this program's
         Needed needed = own(real_needed, "nvrtcGetPCHHeapSizeRequired");     // headers: grown to what it asks, for
         Resize resize = own(real_resize, "nvrtcSetPCHHeapSize");             // the custom kernels compiled after
         size_t bytes = 0;
@@ -184,4 +201,9 @@ extern "C" __attribute__((visibility("default"))) void qz_nvrtc_pch_counts(uint6
 // How many times the PCH heap was grown to what a compile asked for.
 extern "C" __attribute__((visibility("default"))) uint64_t qz_nvrtc_pch_grown() noexcept {
     return grown.load(std::memory_order_relaxed);
+}
+
+// The PCH files made, counted at the heap each was made in (their bytes at most; MOST_BYTES bounds them).
+extern "C" __attribute__((visibility("default"))) uint64_t qz_nvrtc_pch_bytes() noexcept {
+    return made_bytes.load(std::memory_order_relaxed);
 }

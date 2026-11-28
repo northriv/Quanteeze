@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0
+import shutil
+import sys
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -222,3 +224,71 @@ def test_nvrtc_pch_library_builds_and_exports_counts(monkeypatch):
     handle.qz_nvrtc_pch_counts(counts)
     assert (counts[0], counts[1], counts[2]) == (0, 0, 0)
     assert 'QUANTEEZE_NVRTC_PCH' in quanteeze.control.CHOICES
+
+
+_STAND_IN_NVRTC = r"""
+#include <stddef.h>
+#include <string.h>
+static int pch_options = 0, status_calls = 0;
+static size_t heap = 268435456;
+int nvrtcCreateProgram(void **p, const char *src, const char *name, int n, const char *const *c, const char *const *h) {
+    *p = (void *)0x1234; return 0;
+}
+int nvrtcCompileProgram(void *p, int n, const char *const *options) {
+    for (int i = 0; i < n; ++i) if (strcmp(options[i], "--pch") == 0) ++pch_options;
+    return 0;
+}
+int nvrtcGetPCHCreateStatus(void *p) { return status_calls++ == 0 ? 14 : 0; }   /* first: heap exhausted */
+int nvrtcGetPCHHeapSizeRequired(void *p, size_t *out) { *out = 1073741824; return 0; }
+int nvrtcGetPCHHeapSize(size_t *out) { *out = heap; return 0; }
+int nvrtcSetPCHHeapSize(size_t bytes) { heap = bytes; return 0; }
+int stand_in_pch_options(void) { return pch_options; }
+"""
+
+_PCH_PROBE = r"""
+import ctypes, json, sys
+nvrtc = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)
+shim = ctypes.CDLL(sys.argv[2])
+assert shim.qz_nvrtc_pch_dir(sys.argv[3].encode()) == 1
+seen = []
+for i in range(5):
+    program = ctypes.c_void_p()
+    assert shim.nvrtcCreateProgram(ctypes.byref(program), b'', b'custom_kernel_%d' % i, 0, None, None) == 0
+    assert shim.nvrtcCompileProgram(program, 0, None) == 0
+    seen.append(nvrtc.stand_in_pch_options())
+counts = (ctypes.c_uint64 * 3)()
+shim.qz_nvrtc_pch_counts(counts)
+shim.qz_nvrtc_pch_bytes.restype = ctypes.c_uint64
+shim.qz_nvrtc_pch_grown.restype = ctypes.c_uint64
+print(json.dumps({'pch': seen, 'counts': list(counts), 'bytes': shim.qz_nvrtc_pch_bytes(),
+                  'grown': shim.qz_nvrtc_pch_grown()}))
+"""
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux') or not (shutil.which('cc') or shutil.which('gcc')),
+                    reason='Linux (dl_iterate_phdr) and a C compiler')
+def test_nvrtc_pch_files_stay_within_their_bytes_once_the_heap_grows(tmp_path, monkeypatch):
+    """Against a stand-in libnvrtc.so.13: the heap grown to 1 GiB for a PCH that did not fit, each PCH made after is
+    counted at that heap, and --pch is no longer added once the next would pass MOST_BYTES (8 x 256 MiB)."""
+    import json
+    import subprocess
+
+    monkeypatch.setenv('QUANTEEZE_NATIVE', 'on')
+    shim = native_ext.library('nvrtc_pch', quiet=True)
+    if shim is None:
+        pytest.skip('no C++20 compiler available')
+    source = tmp_path / 'nvrtc.c'
+    source.write_text(_STAND_IN_NVRTC)
+    library = tmp_path / 'libnvrtc.so.13'
+    subprocess.run([shutil.which('cc') or shutil.which('gcc'), '-shared', '-fPIC', '-o', str(library), str(source)],
+                   check=True)
+    pch = tmp_path / 'pch'
+    pch.mkdir()
+    done = subprocess.run([sys.executable, '-c', _PCH_PROBE, str(library), str(shim), str(pch)], capture_output=True,
+                          text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    got = json.loads(done.stdout.strip().splitlines()[-1])
+    assert got['grown'] == 1                                   # the first PCH did not fit: grown to 1 GiB
+    assert got['pch'] == [1, 2, 3, 3, 3]                       # made two at 1 GiB; a third would pass 2 GiB
+    assert got['counts'] == [5, 3, 2]
+    assert got['bytes'] == 2 * (1 << 30)
