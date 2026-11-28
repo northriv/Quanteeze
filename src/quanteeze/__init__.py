@@ -141,6 +141,16 @@ def nvrtc_pch_counts():
     return int(out[0]), int(out[1]), int(out[2])
 
 
+def nvrtc_pch_heap():
+    """Return `(grown, heap_bytes, made_bytes)` recorded by `nvrtc_pch`, or None when not loaded."""
+    if NVRTC_PCH[0] is None:
+        return None
+    import ctypes
+    out = (ctypes.c_uint64 * 3)()
+    NVRTC_PCH[0].qz_nvrtc_pch_heap(out)
+    return int(out[0]), int(out[1]), int(out[2])
+
+
 if sys.platform != 'darwin' and _gpu_model():
     _nvrtc_pch()
 

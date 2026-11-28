@@ -147,6 +147,7 @@ CHOICES = {
     'QUANTEEZE_V41_ATTENTION_NATIVE': ('auto', 'on', 'off', 'compare'),
     'QUANTEEZE_DSPARK_NATIVE': ('auto', 'on', 'off'),
     'QUANTEEZE_DEMAND_STM': ('auto', 'on', 'shadow', 'off'),
+    'QUANTEEZE_RESPONSES_IN_PLACE': ('on', 'off'),
     'QUANTEEZE_REQUEST_THREADS_ANY': ('on', 'off'),
     'QUANTEEZE_REQUEST_THREADS_DRAFT_TOGETHER': ('on', 'off'),
 }

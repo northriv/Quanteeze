@@ -223,6 +223,13 @@ def test_nvrtc_pch_library_builds_and_exports_counts(monkeypatch):
     counts = (ctypes.c_uint64 * 3)(99, 99, 99)
     handle.qz_nvrtc_pch_counts(counts)
     assert (counts[0], counts[1], counts[2]) == (0, 0, 0)
+    handle.qz_nvrtc_pch_grown.restype = ctypes.c_uint64
+    assert handle.qz_nvrtc_pch_grown() == 0
+    handle.qz_nvrtc_pch_bytes.restype = ctypes.c_uint64
+    assert handle.qz_nvrtc_pch_bytes() == 0
+    heap = (ctypes.c_uint64 * 3)(99, 99, 99)
+    handle.qz_nvrtc_pch_heap(heap)
+    assert (heap[0], heap[1], heap[2]) == (0, 268435456, 0)
     assert 'QUANTEEZE_NVRTC_PCH' in quanteeze.control.CHOICES
 
 

@@ -277,17 +277,24 @@ def test_native_ext_cache_trim_room_and_load_snapshot(tmp_path, monkeypatch):
 def test_nvrtc_pch_dir_sweeps_dead_and_preserves_live(tmp_path, monkeypatch):
     if quanteeze.NVRTC_PCH[0] is None:
         assert quanteeze.nvrtc_pch_counts() is None
+        assert quanteeze.nvrtc_pch_heap() is None
     else:
         counts = quanteeze.nvrtc_pch_counts()
         assert isinstance(counts, tuple) and len(counts) == 3 and all(isinstance(v, int) for v in counts)
+        heap = quanteeze.nvrtc_pch_heap()
+        assert isinstance(heap, tuple) and len(heap) == 3 and all(isinstance(v, int) for v in heap)
 
     class _CountsLib:
         def qz_nvrtc_pch_counts(self, arr):
             arr[0], arr[1], arr[2] = 5, 4, 2
 
+        def qz_nvrtc_pch_heap(self, arr):
+            arr[0], arr[1], arr[2] = 1, 402653184, 402653184
+
     with monkeypatch.context() as mp:
         mp.setattr(quanteeze, 'NVRTC_PCH', [_CountsLib()])
         assert quanteeze.nvrtc_pch_counts() == (5, 4, 2)
+        assert quanteeze.nvrtc_pch_heap() == (1, 402653184, 402653184)
 
     host = socket.gethostname().split('.')[0]
     prefix = f'{quanteeze._PCH_PREFIX}{host}-'

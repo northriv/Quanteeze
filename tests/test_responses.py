@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0-only OR LicenseRef-PolyForm-Shield-1.0.0
 """Tests for `quanteeze.responses` (`/v1/responses` prefix stability and tool-call grouping)."""
+import copy
 import json
 
 import jinja2
 
-from quanteeze import responses
+from quanteeze import control, responses, variables
 
 QWEN_TEMPLATE = """\
 {%- macro render_content(content) -%}
@@ -74,41 +75,101 @@ def _render_qwen(messages, tools=None, add_generation_prompt=True):
     )
 
 
-def test_normalize_instruction_messages_keeps_mid_conversation_developer_in_place():
-    chat = [
+def _call(name, call_id):
+    return {
+        'role': 'assistant',
+        'content': None,
+        'tool_calls': [{'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': {}}}],
+    }
+
+
+def test_in_place_keeps_mid_conversation_developer_without_mutating_inputs():
+    messages = [
         {'role': 'developer', 'content': 'Base context.'},
         {'role': 'system', 'content': 'System rule.'},
         {'role': 'user', 'content': 'Inspect the repository.'},
-        {'role': 'assistant', 'content': 'Running checks.', 'tool_calls': [{'function': {'name': 'run', 'arguments': {'cmd': 'ls'}}}]},
+        _call('view_image', 'c1'),
         {'role': 'tool', 'tool_call_id': 'c1', 'content': '[Image output attached in the next message]'},
         {'role': 'user', 'content': [{'type': 'image'}]},
         {'role': 'developer', 'content': '<image_resize_notice>Resized image 1.</image_resize_notice>'},
         {'role': 'developer', 'content': ''},
         {'role': 'system', 'content': 'Mid-turn note.'},
     ]
+    snapshot = copy.deepcopy(messages)
 
-    merged = responses.normalize_instruction_messages(chat, instructions='Global instructions.')
+    out = responses.in_place(messages)
 
-    assert merged == 'Global instructions.\n\nBase context.\n\nSystem rule.'
-    assert chat[0] == {'role': 'system', 'content': 'Global instructions.\n\nBase context.\n\nSystem rule.'}
-    assert [m['role'] for m in chat] == ['system', 'user', 'assistant', 'tool', 'user', 'user', 'user']
-    assert chat[1]['content'] == 'Inspect the repository.'
-    assert chat[-2] == {'role': 'user', 'content': '<image_resize_notice>Resized image 1.</image_resize_notice>'}
-    assert chat[-1] == {'role': 'user', 'content': 'Mid-turn note.'}
+    assert messages == snapshot
+    assert [m['role'] for m in out] == ['developer', 'system', 'user', 'assistant', 'tool', 'user', 'user', 'user']
+    assert out[0]['content'] == 'Base context.'
+    assert out[1]['content'] == 'System rule.'
+    assert out[-2] == {'role': 'user', 'content': '<image_resize_notice>Resized image 1.</image_resize_notice>'}
+    assert out[-1] == {'role': 'user', 'content': 'Mid-turn note.'}
 
 
-def test_install_patches_all_server_modules_and_merges_assistant_calls():
+def test_in_place_merges_commentary_or_reasoned_assistant_calls_and_respects_boundaries():
+    # Preceding commentary + reasoning merge with subsequent call-only turns cleanly.
+    assistant_with_commentary = {'role': 'assistant', 'content': 'Reading files.', 'reasoning_content': 'need context'}
+    messages = [
+        {'role': 'user', 'content': 'Fix it.'},
+        assistant_with_commentary,
+        _call('read', 'c1'),
+        _call('grep', 'c2'),
+        {'role': 'tool', 'tool_call_id': 'c1', 'content': 'x'},
+        _call('write', 'c3'),
+    ]
+    snapshot = copy.deepcopy(messages)
+    out = responses.in_place(messages)
+
+    assert messages == snapshot
+    assert [m['role'] for m in out] == ['user', 'assistant', 'tool', 'assistant']
+    assert out[1]['content'] == 'Reading files.'
+    assert out[1]['reasoning_content'] == 'need context'
+    assert [tc['id'] for tc in out[1]['tool_calls']] == ['c1', 'c2']
+    assert [tc['id'] for tc in out[3]['tool_calls']] == ['c3']
+
+    # Consecutive call-only turns without commentary merge and normalize None content to ''.
+    no_commentary = [_call('a', 'c1'), _call('b', 'c2')]
+    merged = responses.in_place(no_commentary)
+    assert len(merged) == 1
+    assert merged[0]['content'] == ''
+    assert [tc['id'] for tc in merged[0]['tool_calls']] == ['c1', 'c2']
+
+    # Call messages that carry their own text or reasoning are not merged into the previous assistant turn.
+    own_text = {**_call('a', 'c1'), 'content': 'and now'}
+    own_reasoning = {**_call('b', 'c2'), 'reasoning': 'because'}
+    separate = [
+        {'role': 'user', 'content': 'q'},
+        {'role': 'assistant', 'content': 'x'},
+        own_text,
+        own_reasoning,
+    ]
+    assert responses.in_place(separate) == separate
+
+
+def test_install_patches_all_server_modules_and_leaves_instruction_normalizer_stock(monkeypatch):
     from mlx_vlm.server import compaction, openai, request_normalization, responses_state
 
+    assert 'QUANTEEZE_RESPONSES_IN_PLACE' in variables.SETTINGS
+    assert variables.SETTINGS['QUANTEEZE_RESPONSES_IN_PLACE'].default == 'on'
+    assert variables.SETTINGS['QUANTEEZE_RESPONSES_IN_PLACE'].when == 'request'
+    assert control.CHOICES['QUANTEEZE_RESPONSES_IN_PLACE'] == ('on', 'off')
+
     assert responses.install() is True
     assert responses.install() is True
-    assert request_normalization._normalize_instruction_messages is responses.normalize_instruction_messages
-    assert openai._normalize_instruction_messages is responses.normalize_instruction_messages
-    assert compaction._normalize_instruction_messages is responses.normalize_instruction_messages
-    assert getattr(responses_state._append_response_item_to_prompt, '_quanteeze_responses', False) is True
+
+    wrapped = responses_state._response_items_to_chat
+    assert getattr(wrapped, '_quanteeze_responses', False) is True
+    assert openai._response_items_to_chat is wrapped
+    assert compaction._response_items_to_chat is wrapped
+
+    # Stock _normalize_instruction_messages is untouched so /v1/chat/completions behavior never changes.
+    assert request_normalization._normalize_instruction_messages.__module__ == 'mlx_vlm.server.request_normalization'
+    assert openai._normalize_instruction_messages is request_normalization._normalize_instruction_messages
+    assert compaction._normalize_instruction_messages is request_normalization._normalize_instruction_messages
 
     # 1. Commentary + single call -> single assistant turn
-    msgs, imgs = responses_state._response_items_to_chat([
+    msgs, imgs = wrapped([
         {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Checking files next.'}]},
         {'type': 'function_call', 'call_id': 'c1', 'name': 'exec_command', 'arguments': '{"cmd":"ls"}'},
     ])
@@ -120,7 +181,7 @@ def test_install_patches_all_server_modules_and_merges_assistant_calls():
     }]
 
     # 2. Commentary + parallel calls -> single assistant turn preserving call order
-    msgs, _ = responses_state._response_items_to_chat([
+    msgs, _ = wrapped([
         {'type': 'reasoning', 'summary': [{'type': 'summary_text', 'text': 'plan'}]},
         {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Running two tools.'}]},
         {'type': 'function_call', 'call_id': 'c1', 'name': 'exec_command', 'arguments': '{"cmd":"pwd"}'},
@@ -132,25 +193,26 @@ def test_install_patches_all_server_modules_and_merges_assistant_calls():
     assert [tc['id'] for tc in msgs[0]['tool_calls']] == ['c1', 'c2']
     assert msgs[0]['tool_calls'][1]['function']['name'] == 'shell'
 
-    # 3. Parallel calls without commentary -> single assistant turn with empty content
-    msgs, _ = responses_state._response_items_to_chat([
-        {'type': 'function_call', 'call_id': 'c1', 'name': 'exec_command', 'arguments': '{"cmd":"a"}'},
-        {'type': 'apply_patch_call', 'call_id': 'c2', 'patch': '*** Begin Patch'},
-    ])
-    assert len(msgs) == 1
-    assert msgs[0]['role'] == 'assistant'
-    assert msgs[0]['content'] == ''
-    assert [tc['id'] for tc in msgs[0]['tool_calls']] == ['c1', 'c2']
-
-    # 4. User message in between prevents merging an unrelated subsequent call
-    msgs, _ = responses_state._response_items_to_chat([
+    # 3. User message in between prevents merging an unrelated subsequent call
+    items = [
         {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Done.'}]},
         {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Next step.'}]},
         {'type': 'function_call', 'call_id': 'c3', 'name': 'exec_command', 'arguments': '{"cmd":"id"}'},
-    ])
+    ]
+    msgs, _ = wrapped(items)
     assert [m['role'] for m in msgs] == ['assistant', 'user', 'assistant']
     assert 'tool_calls' not in msgs[0]
     assert [tc['id'] for tc in msgs[2]['tool_calls']] == ['c3']
+
+    # 4. Per-request toggle QUANTEEZE_RESPONSES_IN_PLACE=off returns stock mlx-vlm output.
+    dev_items = [
+        {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'hi'}]},
+        {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Looking.'}]},
+        {'type': 'function_call', 'call_id': 'c1', 'name': 'ls', 'arguments': '{}'},
+        {'type': 'message', 'role': 'developer', 'content': [{'type': 'input_text', 'text': 'a notice'}]},
+    ]
+    monkeypatch.setenv('QUANTEEZE_RESPONSES_IN_PLACE', 'off')
+    assert wrapped(dev_items) == wrapped._quanteeze_original(dev_items)
 
 
 def test_qwen_rendered_prompt_prefix_and_image_positions_stay_stable_across_turns():

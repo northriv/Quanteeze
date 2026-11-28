@@ -397,6 +397,11 @@ _TABLE = [
      'directory where compiled C++20 nanobind extensions are cached (quanteeze.native_ext)'),
     # -- each request (quanteeze.loops, reask, dsml)
     ('QUANTEEZE_LOOPS', 'on', 'requests', 'start', 'stop a generation stuck in a repetition loop (off: disabled)'),
+    ('QUANTEEZE_RESPONSES_IN_PLACE', 'on', 'requests', 'request',
+     'keep /v1/responses prompt messages in client order: leave mid-conversation system/developer messages in '
+     'place as user messages (avoiding APC prefix invalidation) and merge tool-call items onto the immediately '
+     'preceding assistant turn (quanteeze.responses; off: stock mlx-vlm). Chat Completions and Anthropic '
+     'Messages are untouched'),
     ('QUANTEEZE_REASK', '2', 'requests', 'start',
      'times a broken DSML tool-call block is written again before the client sees it, at temperature 1.0 '
      '(quanteeze.reask: one that does not parse, names a tool or parameter not there, or repeats a call; off: never)'),
